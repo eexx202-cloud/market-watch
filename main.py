@@ -18,7 +18,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=10
             )
 
-            msg = "네이버 응답 길이 : " + str(len(r.text))
+            msg = r.text[:3000]
 
         except Exception as e:
             msg = "ERROR : " + str(e)
