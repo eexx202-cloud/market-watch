@@ -15,15 +15,7 @@ class Handler(BaseHTTPRequestHandler):
 
             r = requests.get(url, headers=headers, timeout=10)
 
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            title = soup.title.text if soup.title else "없음"
-
-            msg = f"""
-TITLE
-
-{title}
-"""
+            msg = r.text[:3000]
 
         except Exception as e:
 
