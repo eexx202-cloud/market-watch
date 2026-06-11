@@ -1,7 +1,6 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import requests
-from bs4 import BeautifulSoup
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -13,12 +12,16 @@ class Handler(BaseHTTPRequestHandler):
                 "User-Agent": "Mozilla/5.0"
             }
 
-            r = requests.get(url, headers=headers, timeout=10)
+            r = requests.get(
+                url,
+                headers=headers,
+                timeout=10
+            )
 
-            msg = r.text[:1000]
+            msg = "네이버 응답 길이 : " + str(len(r.text))
 
         except Exception as e:
-            msg = f"ERROR : {e}"
+            msg = "ERROR : " + str(e)
 
         self.send_response(200)
         self.end_headers()
