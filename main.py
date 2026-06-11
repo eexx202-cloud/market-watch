@@ -18,7 +18,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=10
             )
 
-            msg = r.text[:3000]
+            msg = r.text[:500]
 
         except Exception as e:
             msg = "ERROR : " + str(e)
