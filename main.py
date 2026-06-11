@@ -5,7 +5,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"KOSPI KOSDAQ WATCH")
+
+        msg = """
+KOSPI WATCH
+KOSDAQ WATCH
+
+Next Step Ready
+"""
+        self.wfile.write(msg.encode())
 
 port = int(os.environ.get("PORT", 10000))
 
