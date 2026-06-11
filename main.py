@@ -43,3 +43,5 @@ server = HTTPServer(("0.0.0.0", port), Handler)
 print(f"Server started on {port}")
 
 server.serve_forever()
+import requests
+from bs4 import BeautifulSoup
