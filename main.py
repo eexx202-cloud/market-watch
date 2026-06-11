@@ -1,6 +1,7 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import requests
+from bs4 import BeautifulSoup
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -14,10 +15,14 @@ class Handler(BaseHTTPRequestHandler):
 
             r = requests.get(url, headers=headers, timeout=10)
 
-            msg = f"""
-네이버 응답 길이 : {len(r.text)}
+            soup = BeautifulSoup(r.text, "html.parser")
 
-상태코드 : {r.status_code}
+            title = soup.title.text if soup.title else "없음"
+
+            msg = f"""
+TITLE
+
+{title}
 """
 
         except Exception as e:
