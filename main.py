@@ -1,16 +1,24 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
+import requests
+from bs4 import BeautifulSoup
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
 
-        msg = """
-KOSPI WATCH
+        try:
+            url = "https://finance.naver.com/sise/"
 
-KOSDAQ WATCH
+            headers = {
+                "User-Agent": "Mozilla/5.0"
+            }
 
-Next Step Ready
-"""
+            r = requests.get(url, headers=headers, timeout=10)
+
+            msg = r.text[:1000]
+
+        except Exception as e:
+            msg = f"ERROR : {e}"
 
         self.send_response(200)
         self.end_headers()
