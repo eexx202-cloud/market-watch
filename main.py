@@ -12,16 +12,21 @@ class Handler(BaseHTTPRequestHandler):
                 "User-Agent": "Mozilla/5.0"
             }
 
-            r = requests.get(
-                url,
-                headers=headers,
-                timeout=10
-            )
+            r = requests.get(url, headers=headers, timeout=10)
 
-            msg = r.text[:500]
+            msg = f"""
+네이버 응답 길이 : {len(r.text)}
+
+상태코드 : {r.status_code}
+"""
 
         except Exception as e:
-            msg = "ERROR : " + str(e)
+
+            msg = f"""
+ERROR
+
+{e}
+"""
 
         self.send_response(200)
         self.end_headers()
