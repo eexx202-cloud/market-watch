@@ -38,15 +38,14 @@ try:
         timeout=10
     )
 
-    # 주문내역 조회
-    orders_response = requests.get(
-        "https://openapi.tossinvest.com/api/v1/orders",
+    # 삼성전자 현재가 조회
+    price_response = requests.get(
+        "https://openapi.tossinvest.com/api/v1/prices",
         headers={
-            "Authorization": f"Bearer {access_token}",
-            "X-Tossinvest-Account": "1"
+            "Authorization": f"Bearer {access_token}"
         },
         params={
-            "status": "OPEN"
+            "symbol": "005930"
         },
         timeout=10
     )
@@ -58,9 +57,9 @@ ACCOUNT_STATUS={account_response.status_code}
 
 HOLDING_STATUS={holding_response.status_code}
 
-ORDERS_STATUS={orders_response.status_code}
+PRICE_STATUS={price_response.status_code}
 
-{orders_response.text}
+{price_response.text}
 """
 
 except Exception as e:
