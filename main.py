@@ -1,8 +1,7 @@
-import requests
-import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+import requests
 
-ACCOUNT = os.environ["TOSS_ACCOUNT"]
 CLIENT_ID = os.environ["TOSS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TOSS_CLIENT_SECRET"]
 
@@ -39,6 +38,16 @@ try:
         timeout=10
     )
 
+    # 주문가능금액 조회
+    cash_response = requests.get(
+        "https://openapi.tossinvest.com/api/v1/order-cash",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "X-Tossinvest-Account": "1"
+        },
+        timeout=10
+    )
+
     RESULT = f"""
 TOKEN_STATUS={token_response.status_code}
 
@@ -46,12 +55,13 @@ ACCOUNT_STATUS={account_response.status_code}
 
 HOLDING_STATUS={holding_response.status_code}
 
-{holding_response.text}
+CASH_STATUS={cash_response.status_code}
+
+{cash_response.text}
 """
 
 except Exception as e:
     RESULT = str(e)
-
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -67,7 +77,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
-
 
 port = int(os.environ.get("PORT", 10000))
 HTTPServer(("0.0.0.0", port), Handler).serve_forever()
