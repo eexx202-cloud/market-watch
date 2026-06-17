@@ -10,7 +10,10 @@ TOKEN_RESULT = "아직 테스트 안함"
 try:
     r = requests.post(
         "https://openapi.tossinvest.com/oauth2/token",
-        json={
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        data={
             "grant_type": "client_credentials",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
@@ -18,7 +21,11 @@ try:
         timeout=10
     )
 
-    TOKEN_RESULT = f"STATUS={r.status_code}<br>{r.text[:500]}"
+    TOKEN_RESULT = f"""
+    STATUS={r.status_code}
+    <br><br>
+    {r.text}
+    """
 
 except Exception as e:
     TOKEN_RESULT = str(e)
@@ -28,6 +35,7 @@ class Handler(BaseHTTPRequestHandler):
         html = f"""
         <html>
         <body>
+
         <h1>80억 프로젝트</h1>
 
         <p>ACCOUNT : {bool(os.environ.get('TOSS_ACCOUNT'))}</p>
@@ -36,7 +44,8 @@ class Handler(BaseHTTPRequestHandler):
 
         <hr>
 
-        <h3>토큰 테스트</h3>
+        <h2>토큰 테스트</h2>
+
         <p>{TOKEN_RESULT}</p>
 
         </body>
@@ -44,8 +53,13 @@ class Handler(BaseHTTPRequestHandler):
         """
 
         self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
 
 port = int(os.environ.get("PORT", 10000))
+
 HTTPServer(("0.0.0.0", port), Handler).serve_forever()
