@@ -6,7 +6,8 @@ CLIENT_ID = os.environ.get("TOSS_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("TOSS_CLIENT_SECRET")
 
 try:
-    r = requests.post(
+    # 1. 토큰 발급
+    token_response = requests.post(
         "https://openapi.tossinvest.com/oauth2/token",
         headers={
             "Content-Type": "application/x-www-form-urlencoded"
@@ -19,14 +20,23 @@ try:
         timeout=10
     )
 
+    access_token = token_response.json().get("access_token")
+
+    # 2. 계좌 조회
+    account_response = requests.get(
+        "https://openapi.tossinvest.com/api/v1/accounts",
+        headers={
+            "Authorization": f"Bearer {access_token}"
+        },
+        timeout=10
+    )
+
     RESULT = f"""
-CLIENT_ID_PREFIX={CLIENT_ID[:15] if CLIENT_ID else 'NONE'}
+TOKEN_STATUS={token_response.status_code}
 
-CLIENT_SECRET_PREFIX={CLIENT_SECRET[:15] if CLIENT_SECRET else 'NONE'}
+ACCOUNT_STATUS={account_response.status_code}
 
-STATUS={r.status_code}
-
-{r.text}
+{account_response.text}
 """
 
 except Exception as e:
@@ -42,7 +52,6 @@ class Handler(BaseHTTPRequestHandler):
 </body>
 </html>
 """
-
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
