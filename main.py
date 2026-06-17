@@ -38,12 +38,15 @@ try:
         timeout=10
     )
 
-    # 주문가능금액 조회
-    cash_response = requests.get(
-        "https://openapi.tossinvest.com/api/v1/order-cash",
+    # 주문내역 조회
+    orders_response = requests.get(
+        "https://openapi.tossinvest.com/api/v1/orders",
         headers={
             "Authorization": f"Bearer {access_token}",
             "X-Tossinvest-Account": "1"
+        },
+        params={
+            "status": "OPEN"
         },
         timeout=10
     )
@@ -55,13 +58,14 @@ ACCOUNT_STATUS={account_response.status_code}
 
 HOLDING_STATUS={holding_response.status_code}
 
-CASH_STATUS={cash_response.status_code}
+ORDERS_STATUS={orders_response.status_code}
 
-{cash_response.text}
+{orders_response.text}
 """
 
 except Exception as e:
     RESULT = str(e)
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -77,6 +81,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
+
 
 port = int(os.environ.get("PORT", 10000))
 HTTPServer(("0.0.0.0", port), Handler).serve_forever()
