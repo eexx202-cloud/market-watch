@@ -2,10 +2,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 import os
 
-print("ACCOUNT:", bool(os.environ.get("TOSS_ACCOUNT")))
-print("CLIENT_ID:", bool(os.environ.get("TOSS_CLIENT_ID")))
-print("CLIENT_SECRET:", bool(os.environ.get("TOSS_CLIENT_SECRET")))
-
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         html = f"""
@@ -17,8 +13,16 @@ class Handler(BaseHTTPRequestHandler):
         </html>
         """
         self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
 
 port = int(os.environ.get("PORT", 10000))
-HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+print(f"서버 시작: {port}")
+
+server = HTTPServer(("0.0.0.0", port), Handler)
+server.serve_forever()
