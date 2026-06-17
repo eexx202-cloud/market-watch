@@ -45,7 +45,7 @@ try:
             "Authorization": f"Bearer {access_token}"
         },
         params={
-            "symbols": "005930"
+            "symbols": "005930,000660,122630,252670"
         },
         timeout=10
     )
