@@ -9,6 +9,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
+        # 토큰 발급
         token_res = requests.post(
             "https://openapi.tossinvest.com/oauth2/token",
             data={
@@ -18,13 +19,29 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
 
-        token_text = token_res.text
+        token = token_res.json()["access_token"]
+
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
+
+        # SK하이닉스 현재가 조회
+        price_res = requests.get(
+            "https://openapi.tossinvest.com/api/v1/prices?symbols=000660",
+            headers=headers
+        )
 
         html = f"""
         <html>
         <body>
-        <h1>TOKEN TEST</h1>
-        <pre>{token_text}</pre>
+        <h1>SK하이닉스 현재가 테스트</h1>
+
+        <h2>토큰</h2>
+        <pre>{token_res.text}</pre>
+
+        <h2>현재가</h2>
+        <pre>{price_res.text}</pre>
+
         </body>
         </html>
         """
