@@ -26,7 +26,7 @@ class Handler(BaseHTTPRequestHandler):
             "Authorization": f"Bearer {token}"
         }
 
-        # SK하이닉스 현재가 조회
+        # 현재가 조회
         price_res = requests.get(
             "https://openapi.tossinvest.com/api/v1/prices?symbols=000660",
             headers=headers
@@ -36,6 +36,19 @@ class Handler(BaseHTTPRequestHandler):
         account_res = requests.get(
             "https://openapi.tossinvest.com/api/v1/accounts",
             headers=headers
+        )
+
+        account_data = account_res.json()
+
+        account_seq = account_data["result"][0]["accountSeq"]
+
+        # 보유주식 조회
+        holding_res = requests.get(
+            "https://openapi.tossinvest.com/api/v1/holdings",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Tossinvest-Account": str(account_seq)
+            }
         )
 
         html = f"""
@@ -48,7 +61,10 @@ class Handler(BaseHTTPRequestHandler):
         <pre>{json.dumps(price_res.json(), indent=2, ensure_ascii=False)}</pre>
 
         <h2>계좌목록</h2>
-        <pre>{json.dumps(account_res.json(), indent=2, ensure_ascii=False)}</pre>
+        <pre>{json.dumps(account_data, indent=2, ensure_ascii=False)}</pre>
+
+        <h2>보유주식</h2>
+        <pre>{json.dumps(holding_res.json(), indent=2, ensure_ascii=False)}</pre>
 
         </body>
         </html>
