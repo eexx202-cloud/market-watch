@@ -1,18 +1,22 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import json
+import html
 import requests
 from datetime import datetime
 from urllib.parse import urlparse
 import pytz
-import html
 
+
+# ============================================================
+# 기본 설정
+# ============================================================
 
 KST = pytz.timezone("Asia/Seoul")
 PORT = int(os.environ.get("PORT", "10000"))
 
-KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "")
-APP_URL = os.environ.get("APP_URL", "")
+KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "").strip()
+APP_URL = os.environ.get("APP_URL", "").strip()
 
 
 def now_text():
@@ -23,7 +27,42 @@ def safe(v):
     return html.escape(str(v))
 
 
-def send_kakao_test():
+def mask_token(token):
+    if not token:
+        return "없음"
+    if len(token) < 16:
+        return f"너무 짧음 / 길이 {len(token)}"
+    return f"{token[:8]} ... {token[-8:]} / 길이 {len(token)}"
+
+
+# ============================================================
+# 카카오 토큰 확인
+# ============================================================
+
+def check_kakao_token():
+    if not KAKAO_TOKEN:
+        return False, "KAKAO_TOKEN 환경변수가 없습니다."
+
+    try:
+        r = requests.get(
+            "https://kapi.kakao.com/v2/user/me",
+            headers={
+                "Authorization": "Bearer " + KAKAO_TOKEN
+            },
+            timeout=10,
+        )
+
+        return r.status_code == 200, f"HTTP {r.status_code}\n{r.text}"
+
+    except Exception as e:
+        return False, "예외 발생\n" + str(e)
+
+
+# ============================================================
+# 카카오톡 나에게 보내기
+# ============================================================
+
+def send_kakao_message():
     if not KAKAO_TOKEN:
         return False, "KAKAO_TOKEN 환경변수가 없습니다."
 
@@ -49,36 +88,15 @@ def send_kakao_test():
             timeout=10,
         )
 
-        if r.status_code == 200:
-            return True, "HTTP 200\n" + r.text
-
-        return False, f"HTTP {r.status_code}\n{r.text}"
+        return r.status_code == 200, f"HTTP {r.status_code}\n{r.text}"
 
     except Exception as e:
         return False, "예외 발생\n" + str(e)
 
 
-def check_kakao_token():
-    if not KAKAO_TOKEN:
-        return False, "KAKAO_TOKEN 환경변수가 없습니다."
-
-    try:
-        r = requests.get(
-            "https://kapi.kakao.com/v2/user/me",
-            headers={
-                "Authorization": "Bearer " + KAKAO_TOKEN
-            },
-            timeout=10,
-        )
-
-        if r.status_code == 200:
-            return True, "HTTP 200\n" + r.text
-
-        return False, f"HTTP {r.status_code}\n{r.text}"
-
-    except Exception as e:
-        return False, "예외 발생\n" + str(e)
-
+# ============================================================
+# 웹 서버
+# ============================================================
 
 class Handler(BaseHTTPRequestHandler):
 
@@ -86,63 +104,11 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/":
-            self.html_response(f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>카카오톡 단독 테스트</title>
-<style>
-body {{
-    background:#080808;
-    color:white;
-    font-family:Arial, sans-serif;
-    padding:30px;
-}}
-.card {{
-    background:#151515;
-    padding:20px;
-    border-radius:12px;
-    max-width:600px;
-}}
-button {{
-    padding:14px 20px;
-    margin:8px;
-    border:0;
-    border-radius:8px;
-    font-weight:bold;
-    cursor:pointer;
-}}
-.yellow {{ background:#ffe812; color:#111; }}
-.gray {{ background:#333; color:white; }}
-pre {{
-    background:#000;
-    color:#0f0;
-    padding:15px;
-    white-space:pre-wrap;
-}}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>카카오톡 단독 테스트</h1>
+            self.home()
+            return
 
-<p>현재 상태</p>
-<pre>KAKAO_TOKEN 있음: {"예" if KAKAO_TOKEN else "아니오"}
-APP_URL: {safe(APP_URL)}
-시간: {now_text()}</pre>
-
-<button class="gray" onclick="location.href='/check_token'">1. 토큰 확인</button>
-<button class="yellow" onclick="location.href='/test_kakao'">2. 카카오톡 보내기</button>
-
-<p>
-먼저 <b>토큰 확인</b> 누르고 HTTP 200 나오면,<br>
-그다음 <b>카카오톡 보내기</b> 눌러.
-</p>
-</div>
-</body>
-</html>
-""")
+        if path == "/env":
+            self.env_page()
             return
 
         if path == "/check_token":
@@ -152,12 +118,99 @@ APP_URL: {safe(APP_URL)}
             return
 
         if path == "/test_kakao":
-            ok, msg = send_kakao_test()
+            ok, msg = send_kakao_message()
             title = "카카오톡 실제 전송 성공" if ok else "카카오톡 실제 전송 실패"
             self.result_page(title, msg)
             return
 
-        self.html_response("<h2>없는 주소</h2><a href='/'>돌아가기</a>")
+        self.html_response("""
+        <h1>없는 주소</h1>
+        <a href="/">돌아가기</a>
+        """)
+
+    def home(self):
+        self.html_response(f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>카카오톡 단독 테스트</title>
+<style>
+body {{
+    background: #080808;
+    color: white;
+    font-family: Arial, sans-serif;
+    padding: 30px;
+}}
+.card {{
+    background: #151515;
+    border: 1px solid #333;
+    border-radius: 14px;
+    padding: 24px;
+    max-width: 760px;
+}}
+h1 {{
+    font-size: 34px;
+}}
+button {{
+    padding: 14px 20px;
+    margin: 8px 6px;
+    border: 0;
+    border-radius: 8px;
+    font-weight: bold;
+    cursor: pointer;
+}}
+.yellow {{
+    background: #ffe812;
+    color: #111;
+}}
+.gray {{
+    background: #333;
+    color: white;
+}}
+pre {{
+    background: #000;
+    color: #00ff66;
+    padding: 16px;
+    white-space: pre-wrap;
+}}
+a {{
+    color: #ffe812;
+}}
+</style>
+</head>
+<body>
+<div class="card">
+    <h1>카카오톡 단독 테스트</h1>
+
+    <pre>시간: {now_text()}
+KAKAO_TOKEN: {safe(mask_token(KAKAO_TOKEN))}
+APP_URL: {safe(APP_URL)}</pre>
+
+    <button class="gray" onclick="location.href='/env'">0. 환경변수 확인</button>
+    <button class="gray" onclick="location.href='/check_token'">1. 토큰 확인</button>
+    <button class="yellow" onclick="location.href='/test_kakao'">2. 카카오톡 보내기</button>
+
+    <p>
+    순서대로 눌러.<br>
+    먼저 <b>환경변수 확인</b> → <b>토큰 확인</b> → <b>카카오톡 보내기</b>.
+    </p>
+
+    <p>
+    성공 기준:<br>
+    토큰 확인: <b>HTTP 200</b><br>
+    카카오톡 보내기: <b>HTTP 200 / {{}}</b>
+    </p>
+</div>
+</body>
+</html>
+""")
+
+    def env_page(self):
+        self.result_page(
+            "환경변수 확인",
+            f"KAKAO_TOKEN: {mask_token(KAKAO_TOKEN)}\nAPP_URL: {APP_URL}\n시간: {now_text()}"
+        )
 
     def result_page(self, title, msg):
         self.html_response(f"""
@@ -168,19 +221,23 @@ APP_URL: {safe(APP_URL)}
 <title>{safe(title)}</title>
 <style>
 body {{
-    background:#080808;
-    color:white;
-    font-family:Arial, sans-serif;
-    padding:30px;
+    background: #080808;
+    color: white;
+    font-family: Arial, sans-serif;
+    padding: 30px;
+}}
+h1 {{
+    font-size: 34px;
 }}
 pre {{
-    background:#000;
-    color:#0f0;
-    padding:15px;
-    white-space:pre-wrap;
+    background: #000;
+    color: #00ff66;
+    padding: 16px;
+    white-space: pre-wrap;
 }}
 a {{
-    color:#ffe812;
+    color: #ffe812;
+    font-size: 22px;
 }}
 </style>
 </head>
@@ -204,4 +261,5 @@ a {{
 
 if __name__ == "__main__":
     print("카카오톡 단독 테스트 서버 시작:", PORT)
+    print("KAKAO_TOKEN:", mask_token(KAKAO_TOKEN))
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
