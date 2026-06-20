@@ -6,7 +6,6 @@ import json
 CLIENT_ID = os.environ["TOSS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TOSS_CLIENT_SECRET"]
 
-
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -21,19 +20,20 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
 
-        token = token_res.json()["access_token"]
+        token_data = token_res.json()
+        token = token_data["access_token"]
 
         headers = {
             "Authorization": f"Bearer {token}"
         }
 
-        # 현재가 조회
+        # 현재가
         price_res = requests.get(
             "https://openapi.tossinvest.com/api/v1/prices?symbols=000660",
             headers=headers
         )
 
-        # 계좌 조회
+        # 계좌
         account_res = requests.get(
             "https://openapi.tossinvest.com/api/v1/accounts",
             headers=headers
@@ -42,12 +42,23 @@ class Handler(BaseHTTPRequestHandler):
         account_data = account_res.json()
         account_seq = account_data["result"][0]["accountSeq"]
 
-        # 보유주식 조회
+        account_headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Tossinvest-Account": str(account_seq)
+        }
+
+        # 보유주식
         holding_res = requests.get(
             "https://openapi.tossinvest.com/api/v1/holdings",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Tossinvest-Account": str(account_seq)
+            headers=account_headers
+        )
+
+        # 매수가능금액
+        buying_res = requests.get(
+            "https://openapi.tossinvest.com/api/v1/buying-power",
+            headers=account_headers,
+            params={
+                "currency": "KRW"
             }
         )
 
@@ -55,16 +66,22 @@ class Handler(BaseHTTPRequestHandler):
         <html>
         <body>
 
-        <h1>토스 API 테스트</h1>
+        <h1>TOSS API TEST</h1>
 
         <h2>현재가</h2>
         <pre>{json.dumps(price_res.json(), indent=2, ensure_ascii=False)}</pre>
 
-        <h2>계좌목록</h2>
+        <h2>계좌</h2>
         <pre>{json.dumps(account_data, indent=2, ensure_ascii=False)}</pre>
 
         <h2>보유주식</h2>
         <pre>{json.dumps(holding_res.json(), indent=2, ensure_ascii=False)}</pre>
+
+        <h2>매수가능금액 상태코드</h2>
+        <pre>{buying_res.status_code}</pre>
+
+        <h2>매수가능금액 응답</h2>
+        <pre>{buying_res.text}</pre>
 
         </body>
         </html>
@@ -77,7 +94,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
-
 
 port = int(os.environ.get("PORT", 10000))
 HTTPServer(("0.0.0.0", port), Handler).serve_forever()
