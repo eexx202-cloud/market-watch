@@ -39,12 +39,20 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         account_data = account_res.json()
-
         account_seq = account_data["result"][0]["accountSeq"]
 
         # 보유주식 조회
         holding_res = requests.get(
             "https://openapi.tossinvest.com/api/v1/holdings",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Tossinvest-Account": str(account_seq)
+            }
+        )
+
+        # 매수가능금액 조회
+        buying_res = requests.get(
+            "https://openapi.tossinvest.com/api/v1/buying-power?market=KR",
             headers={
                 "Authorization": f"Bearer {token}",
                 "X-Tossinvest-Account": str(account_seq)
@@ -65,6 +73,12 @@ class Handler(BaseHTTPRequestHandler):
 
         <h2>보유주식</h2>
         <pre>{json.dumps(holding_res.json(), indent=2, ensure_ascii=False)}</pre>
+
+        <h2>매수가능금액 상태코드</h2>
+        <pre>{buying_res.status_code}</pre>
+
+        <h2>매수가능금액 원본응답</h2>
+        <pre>{buying_res.text}</pre>
 
         </body>
         </html>
