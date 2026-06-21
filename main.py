@@ -789,12 +789,8 @@ def load_sellable_quantities():
         if not sym:
             continue
 
-        # 토스 매도가능수량: /api/v1/sellable 우선 사용
-        code, data = api_get("/api/v1/sellable", params={"symbol": sym}, account=True, timeout=8)
-
-        # 기존 환경/문서 차이 대비 fallback
-        if code != 200:
-            code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
+        # 토스 매도가능수량: /api/v1/sellable-quantity 사용
+        code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
 
         qty = 0
         if code == 200:
@@ -802,12 +798,11 @@ def load_sellable_quantities():
             if isinstance(r, dict):
                 for k in ["sellableQuantity", "sellableQty", "quantity", "qty"]:
                     if k in r:
-                        qty = to_float(r[k])
+                        qty = to_float(r.get(k))
                         break
         sellable[sym] = qty
     with LOCK:
         S["sellable"] = sellable
-    return True
 
 def refresh_account_all():
     with LOCK:
@@ -1396,7 +1391,7 @@ class Handler(BaseHTTPRequestHandler):
                 "app_url": APP_URL,
                 "telegram_configured": telegram_enabled(),
                 "log_root": LOG_ROOT,
-                "sellable_endpoint": "/api/v1/sellable",
+                "sellable_endpoint": "/api/v1/sellable-quantity",
                 "real_holding_management": True,
                 "paper_auto_26_symbols": ENABLE_PAPER_AUTO,
             })
