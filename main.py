@@ -83,6 +83,11 @@ ALL = {**MAIN, **MARKET, **WATCH}
 LEV = "0193T0"
 INV = "0197X0"
 HYNIX = "000660"
+SAM_LEV = "0193W0"
+SAM_INV = "0193L0"
+SAMSUNG = "005930"
+# 알림은 하이닉스/삼성 레버리지+인버스 4개 집중
+ALERT_SYMBOLS = [LEV, INV, SAM_LEV, SAM_INV]
 PRIMARY = [LEV, INV, "122630", "252670", "233740", "251340", "0193W0", "0193L0", "494310", "488080"]
 
 POSITIVE_NEWS_KEYWORDS = [
@@ -227,17 +232,8 @@ def set_status(msg):
         S["updated"] = now_short()
 
 def is_market_watch_time():
-    # 한국장 실시간 판단 시간.
-    # 장외에는 가격 표시/계좌조회만 하고, 신규 AI 판단/알림/가상매매/실주문은 막는다.
     n = now_kst()
-    if n.weekday() >= 5:  # 토/일
-        return False
-    start = n.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = n.replace(hour=15, minute=30, second=0, microsecond=0)
-    return start <= n < end
-
-def market_time_label():
-    return "장중" if is_market_watch_time() else "장외/대기"
+    return 8 <= n.hour < 16
 
 def clean_name(s):
     out = str(s)
@@ -483,6 +479,9 @@ def check_kakao():
         return False, str(e)
 
 def send_alert_once(key, sym, title):
+    # 진입 알림은 하이닉스/삼성 레버리지+인버스 4개만
+    if sym not in ALERT_SYMBOLS:
+        return
     with LOCK:
         last = S["last_alert"].get(key, 0)
         if time.time() - last < ALERT_COOLDOWN_SEC:
@@ -706,10 +705,16 @@ def holding_thresholds():
     # 시장이 약하면 더 민감하게, 시장이 강하면 조금 더 넓게 본다.
     ms = S["market_score"].get("total", 50)
     if ms >= 65:
-        return {"stop": -2.5, "protect_profit": 1.5, "trail_soft": -2.0, "trail_hard": -3.0, "score_warn": 45, "score_sell": 35}
+        # 강세장: 손절 -2.5%, 익절1단계 +2%, 익절2단계 +3%, 수익보호 고점대비 -2%/-3%
+        return {"stop": -2.5, "protect_profit": 1.5, "trail_soft": -2.0, "trail_hard": -3.0,
+                "score_warn": 45, "score_sell": 35, "take_profit1": 2.0, "take_profit2": 3.0, "loss_cut": -1.5}
     if ms >= 45:
-        return {"stop": -2.0, "protect_profit": 1.0, "trail_soft": -1.5, "trail_hard": -2.5, "score_warn": 50, "score_sell": 40}
-    return {"stop": -1.2, "protect_profit": 0.7, "trail_soft": -1.0, "trail_hard": -2.0, "score_warn": 55, "score_sell": 45}
+        # 횡보장: 손절 -2%, 익절1단계 +2%, 익절2단계 +3%
+        return {"stop": -2.0, "protect_profit": 1.0, "trail_soft": -1.5, "trail_hard": -2.5,
+                "score_warn": 50, "score_sell": 40, "take_profit1": 2.0, "take_profit2": 3.0, "loss_cut": -1.5}
+    # 하락장: 손절 -1.5%, 익절1단계 +2%, 익절2단계 +3%
+    return {"stop": -1.2, "protect_profit": 0.7, "trail_soft": -1.0, "trail_hard": -2.0,
+            "score_warn": 55, "score_sell": 45, "take_profit1": 2.0, "take_profit2": 3.0, "loss_cut": -1.5}
 
 def real_watch_detail(sym, item, stage):
     price = S["prices"].get(sym, 0)
@@ -728,9 +733,6 @@ def real_watch_detail(sym, item, stage):
     )
 
 def check_real_holding_management():
-    # 장외에는 보유관리 알림을 보내지 않는다.
-    if not is_market_watch_time():
-        return
     # 내가 실제로 산 종목을 계속 감시한다.
     # 매수가 대비 손실뿐 아니라, 올라갔다가 꺾이는 수익보호/익절 알림도 보낸다.
     with LOCK:
@@ -757,21 +759,42 @@ def check_real_holding_management():
         score = to_float(sig.get("score", 50))
         stage = ""
         title = ""
-        # 1) 손실 위험
-        if profit <= th["stop"] or (score <= th["score_sell"] and profit < 0):
+        now_h = now_kst().hour
+        now_m = now_kst().minute
+        # 장 마감 리밸런싱 구간 (14:50~15:00) 주의
+        is_rebalancing = (now_h == 14 and now_m >= 50)
+
+        # 1) 손절 -1.5% 이하
+        if profit <= th["loss_cut"]:
+            stage = "LOSS_CUT"
+            title = "🚨 실계좌 손절 알림 (-1.5%)"
+        # 2) 더 큰 손실 또는 점수 급락
+        elif profit <= th["stop"] or (score <= th["score_sell"] and profit < 0):
             stage = "LOSS_SELL"
             title = "⛔ 실계좌 보유 매도 후보"
-        # 2) 수익권에서 고점 이탈: 먹고 빠지기/분할익절
+        # 3) 익절 +3% 강한 익절
+        elif profit >= th["take_profit2"]:
+            stage = "TAKE_PROFIT2"
+            title = "💰 실계좌 익절 알림 (+3% 달성!) 강하게 팔기"
+        # 4) 익절 +2% 1차 익절
+        elif profit >= th["take_profit1"]:
+            stage = "TAKE_PROFIT1"
+            title = "💰 실계좌 익절 알림 (+2% 달성) 분할 매도 검토"
+        # 5) 수익권에서 고점 이탈: 수익보호
         elif profit >= th["protect_profit"] and drop_from_high <= th["trail_hard"]:
             stage = "PROFIT_SELL"
             title = "💰 실계좌 수익보호 매도 후보"
         elif profit >= th["protect_profit"] and drop_from_high <= th["trail_soft"]:
             stage = "PROFIT_WARN"
             title = "💰 실계좌 익절/분할매도 검토"
-        # 3) 아직 큰 손실은 아니어도 시장/점수 약화
+        # 6) 아직 큰 손실은 아니어도 시장/점수 약화
         elif score <= th["score_warn"] and high_drop_pct(sym) <= -2:
             stage = "WEAK_WARN"
             title = "⚠️ 실계좌 보유 약화 경고"
+        # 7) 장 마감 리밸런싱 구간 보유 중 주의
+        if is_rebalancing and not stage:
+            stage = "REBAL_WARN"
+            title = "⏰ 장 마감 리밸런싱 구간 (14:50~) 보유 주의"
         # 4) 반대 방향이 훨씬 강하면 교체 후보
         opp = INV if sym != INV else LEV
         opp_score = to_float(signals.get(opp, {}).get("score", 0))
@@ -796,12 +819,15 @@ def check_real_holding_management():
 def load_sellable_quantities():
     with LOCK:
         targets = set(ALL.keys()) | set(S["hold_qty"].keys())
+        holding_qty = dict(S["hold_qty"])
     sellable = {}
     for sym in targets:
         if not sym:
             continue
 
-        # 토스 매도가능수량: /api/v1/sellable-quantity 사용
+        # 토스 공식 문서의 Order 그룹: sellable quantity
+        # endpoint는 /api/v1/sellable-quantity 를 사용한다.
+        # /api/v1/sellable 은 404가 나와서 사용하지 않는다.
         code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
 
         qty = 0
@@ -810,11 +836,17 @@ def load_sellable_quantities():
             if isinstance(r, dict):
                 for k in ["sellableQuantity", "sellableQty", "quantity", "qty"]:
                     if k in r:
-                        qty = to_float(r.get(k))
+                        qty = to_float(r[k])
                         break
+        else:
+            # 매도가능수량 API가 응답하지 않으면 화면/버튼이 0으로 막히지 않도록
+            # 보유수량을 임시 fallback으로 표시한다. 실제 주문은 토스 주문 API가 최종 검증한다.
+            qty = holding_qty.get(sym, 0)
+
         sellable[sym] = qty
     with LOCK:
         S["sellable"] = sellable
+    return True
 
 def refresh_account_all():
     with LOCK:
@@ -1099,26 +1131,6 @@ def build_signal(sym):
     }
 
 def calc_scores():
-    # 장외에는 시장이 실제로 움직이지 않으므로 AI 판단을 고정한다.
-    # 가격/계좌/뉴스 표시는 가능하지만, 진입·매도 신호와 추천수량은 만들지 않는다.
-    if not is_market_watch_time():
-        with LOCK:
-            S["market_score"] = {"kospi": 50, "kosdaq": 50, "total": 50, "label": "장외/대기"}
-            for sym in ALL:
-                S["scores"][sym] = 50 if S["prices"].get(sym, 0) > 0 else 0
-                S["signals"][sym] = {
-                    "label": "장외/대기",
-                    "score": S["scores"].get(sym, 0),
-                    "ratio": 0,
-                    "qty": 0,
-                    "rec_buy_qty": 0,
-                    "rec_sell_qty": 0,
-                    "hdrop": round(high_drop_pct(sym), 2),
-                    "lrise": round(low_rise_pct(sym), 2),
-                    "chg": round(price_change_pct(sym), 2),
-                    "volume_ratio": round(volume_ratio(sym), 2),
-                }
-        return
     calc_market_direction()
     with LOCK:
         for sym in ALL:
@@ -1149,45 +1161,33 @@ def record_order(row):
     with LOCK:
         S["orders"].insert(0, row)
         S["orders"] = S["orders"][:80]
-    write_row(orders_path(), ["time", "symbol", "name", "side", "qty", "order_type", "limit_price", "status", "response"], row)
+    write_row(orders_path(), ["time", "symbol", "name", "side", "qty", "status", "response"], row)
 
-def place_order_manual(sym, side, qty, order_type="MARKET", limit_price=0):
+def place_order_manual(sym, side, qty):
     if sym not in ALL:
         return {"ok": False, "message": "허용되지 않은 종목"}
     if side not in ["BUY", "SELL"]:
         return {"ok": False, "message": "BUY/SELL 오류"}
     qty = to_int(qty)
-    order_type = str(order_type or "MARKET").upper().strip()
-    if order_type not in ["MARKET", "LIMIT"]:
-        order_type = "MARKET"
-    limit_price = to_int(limit_price, 0)
     if qty <= 0:
         return {"ok": False, "message": "수량이 0입니다."}
-    if not is_market_watch_time():
-        row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": "매수" if side == "BUY" else "매도", "qty": qty, "order_type": order_type, "limit_price": limit_price if order_type == "LIMIT" else "", "status": "장외차단", "response": "장외에는 실계좌 주문을 보내지 않음"}
-        record_order(row)
-        return {"ok": False, "message": "장외/주말에는 실계좌 주문을 보내지 않습니다. 장중 09:00~15:30에 실행하세요."}
-    if order_type == "LIMIT" and limit_price <= 0:
-        return {"ok": False, "message": "지정가 주문은 가격을 입력해야 합니다."}
     if side == "SELL":
         sellable = int(S["sellable"].get(sym, 0))
         if sellable <= 0:
             return {"ok": False, "message": "매도가능수량 0"}
         qty = min(qty, sellable)
     if not ENABLE_REAL_ORDER:
-        row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": "매수" if side == "BUY" else "매도", "qty": qty, "order_type": order_type, "limit_price": limit_price if order_type == "LIMIT" else "", "status": "차단", "response": "ENABLE_REAL_ORDER=false"}
+        row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": "매수" if side == "BUY" else "매도", "qty": qty, "status": "차단", "response": "ENABLE_REAL_ORDER=false"}
         record_order(row)
         return {"ok": False, "message": "실계좌 주문이 비활성화되어 있습니다. ENABLE_REAL_ORDER=true 필요"}
-    # Toss clientOrderId는 길이 제한이 있어 짧게 만든다.
+    # Toss clientOrderId: 영문/숫자/하이픈/언더스코어, 최대 36자 제한에 맞춰 짧게 만든다.
     # 예: MW1720000000000A1B  (약 18자)
     client_order_id = f"MW{int(time.time() * 1000)}{uuid.uuid4().hex[:3].upper()}"
-    body = {"clientOrderId": client_order_id, "symbol": sym, "side": side, "orderType": order_type, "quantity": str(qty)}
-    if order_type == "LIMIT":
-        body["price"] = str(limit_price)
+    body = {"clientOrderId": client_order_id, "symbol": sym, "side": side, "orderType": "MARKET", "quantity": str(qty)}
     code, data = api_post("/api/v1/orders", body=body, account=True, timeout=10)
     ok = code == 200
     side_kr = "매수" if side == "BUY" else "매도"
-    row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": side_kr, "qty": qty, "order_type": order_type, "limit_price": limit_price if order_type == "LIMIT" else "", "status": "성공" if ok else "실패", "response": json.dumps(data, ensure_ascii=False)[:500]}
+    row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": side_kr, "qty": qty, "status": "성공" if ok else "실패", "response": json.dumps(data, ensure_ascii=False)[:500]}
     record_order(row)
     if ok:
         # 실제 버튼 주문이 성공하면 즉시 보유감시 목록에 반영한다.
@@ -1292,13 +1292,6 @@ def paper_sell(sym, ratio, reason):
 def run_paper_ai_if_enabled():
     if not ENABLE_PAPER_AUTO:
         update_paper_asset()
-        return
-    # 장외에는 AI 가상계좌도 신규 매수/매도를 하지 않고 평가만 갱신한다.
-    if not is_market_watch_time():
-        with LOCK:
-            S["paper"]["last_action"] = f"{now_short()} 장외 대기"
-        update_paper_asset()
-        save_state()
         return
     # AI 가상 2천만원은 26개 후보 중에서 자동으로 매수/매도한다.
     with LOCK:
@@ -1486,7 +1479,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
         if path == "/order":
-            return self.json_response(place_order_manual(str(body.get("symbol", "")), str(body.get("side", "")), body.get("qty", 0), body.get("orderType", "MARKET"), body.get("price", 0)))
+            return self.json_response(place_order_manual(str(body.get("symbol", "")), str(body.get("side", "")), body.get("qty", 0)))
         if path == "/paper_buy":
             return self.json_response({"ok": paper_buy(str(body.get("symbol", "")), to_float(body.get("ratio", 0.5)), "수동 가상매수")})
         if path == "/paper_sell":
@@ -1503,7 +1496,7 @@ class Handler(BaseHTTPRequestHandler):
 <div class="grid"><div>{self.account_card()}{self.paper_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.signal_card(LEV,'red')}{self.signal_card(INV,'blue')}{self.basic_card(HYNIX)}{self.stock_table()}</div><div>{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}{self.paper_trade_card()}</div></div>
 <script>
 async function postJson(path, body){{const res=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body||{{}})}});return await res.json();}}
-async function order(symbol,side,qtyId,typeId,priceId){{const qty=document.getElementById(qtyId).value;const sideText=side==='BUY'?'매수':'매도';let orderType='MARKET';let price='';if(typeId&&document.getElementById(typeId))orderType=document.getElementById(typeId).value;if(priceId&&document.getElementById(priceId))price=document.getElementById(priceId).value;if(!qty||Number(qty)<=0){{alert('수량이 0입니다.');return;}}if(orderType==='LIMIT'&&(!price||Number(price)<=0)){{alert('지정가 가격을 입력하세요.');return;}}const priceText=orderType==='LIMIT'?(' 지정가 '+Number(price).toLocaleString()+'원'):' 시장가';if(!confirm(symbol+' '+qty+'주 실계좌 '+sideText+priceText+' 주문 전송?'))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty,orderType:orderType,price:price}});alert(JSON.stringify(data));location.reload();}}
+async function order(symbol,side,qtyId){{const qty=document.getElementById(qtyId).value;const sideText=side==='BUY'?'매수':'매도';if(!qty||Number(qty)<=0){{alert('수량이 0입니다.');return;}}if(!confirm(symbol+' '+qty+'주 실계좌 '+sideText+' 주문 전송?'))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty}});alert(JSON.stringify(data));location.reload();}}
 async function paperBuy(symbol){{const data=await postJson('/paper_buy',{{symbol:symbol,ratio:0.5}});alert(data.ok?'가상매수 완료':'가상매수 실패');location.reload();}}
 async function paperSell(symbol){{const data=await postJson('/paper_sell',{{symbol:symbol}});alert(data.ok?'가상매도 완료':'가상매도 실패');location.reload();}}
 async function resetBase(){{if(!confirm('현재 토스 총자산으로 기준금과 AI 가상계좌를 리셋할까요?'))return;const data=await postJson('/reset_base',{{}});alert(JSON.stringify(data));location.reload();}}
@@ -1563,8 +1556,8 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"""<div class='card'><h2>실계좌 보유관리</h2><div class='small'>내가 산 종목의 매수가와 매수 후 최고가를 기준으로 손절/익절/수익보호 알림</div><table><tr><th>종목</th><th>매수가</th><th>최고가</th><th>수익률</th><th>고점대비</th></tr>{rows}</table></div>"""
 
     def signal_card(self, sym, color):
-        name = name_of(sym); price = S["prices"].get(sym, 0); score = S["scores"].get(sym, 0); sig = S["signals"].get(sym, {}); wm = S["wma"].get(sym, {}); sellable = int(S["sellable"].get(sym, 0)); rec_qty = int(sig.get("rec_buy_qty", 0)); rec_sell = int(sig.get("rec_sell_qty", 0)); ratio = int(sig.get("ratio", 0) * 100); qty_id = f"qty_{sym}"; type_id = f"type_{sym}"; price_id = f"price_{sym}"
-        return f"""<div class="card"><h2>{safe(name)}</h2><div class="big {color}">{fmt_won(price)}</div><div class="small">신호</div><div class="mid">{safe(sig.get('label','-'))}</div><div class="small">AI 점수 {score}</div><div class="progress"><div class="bar" style="width:{score}%"></div></div><table><tr><td>WMA5</td><td>{fmt_won(wm.get('wma5',0))}</td></tr><tr><td>WMA20</td><td>{fmt_won(wm.get('wma20',0))}</td></tr><tr><td>WMA60</td><td>{fmt_won(wm.get('wma60',0))}</td></tr><tr><td>등락</td><td>{sig.get('chg',0)}%</td></tr><tr><td>거래량비율</td><td>{sig.get('volume_ratio',0)}배</td></tr><tr><td>고점대비</td><td>{sig.get('hdrop',0)}%</td></tr><tr><td>저점대비</td><td>{sig.get('lrise',0)}%</td></tr><tr><td>추천비중</td><td>{ratio}%</td></tr><tr><td>추천매수</td><td>{rec_qty}주</td></tr><tr><td>추천매도</td><td>{rec_sell}주</td></tr><tr><td>매도가능</td><td>{sellable}주</td></tr></table><div><input id="{qty_id}" type="number" value="{rec_qty}" min="0" title="수량"><select id="{type_id}"><option value="MARKET">시장가</option><option value="LIMIT">지정가</option></select><input id="{price_id}" type="number" value="{int(price) if price else 0}" min="0" title="지정가"><button class="buy" onclick="order('{sym}','BUY','{qty_id}','{type_id}','{price_id}')">실계좌 매수</button><button class="sell" onclick="order('{sym}','SELL','{qty_id}','{type_id}','{price_id}')">실계좌 매도</button><button class="graybtn" onclick="setQty('{qty_id}',{sellable})">전량</button></div></div>"""
+        name = name_of(sym); price = S["prices"].get(sym, 0); score = S["scores"].get(sym, 0); sig = S["signals"].get(sym, {}); wm = S["wma"].get(sym, {}); sellable = int(S["sellable"].get(sym, 0)); rec_qty = int(sig.get("rec_buy_qty", 0)); rec_sell = int(sig.get("rec_sell_qty", 0)); ratio = int(sig.get("ratio", 0) * 100); qty_id = f"qty_{sym}"
+        return f"""<div class="card"><h2>{safe(name)}</h2><div class="big {color}">{fmt_won(price)}</div><div class="small">신호</div><div class="mid">{safe(sig.get('label','-'))}</div><div class="small">AI 점수 {score}</div><div class="progress"><div class="bar" style="width:{score}%"></div></div><table><tr><td>WMA5</td><td>{fmt_won(wm.get('wma5',0))}</td></tr><tr><td>WMA20</td><td>{fmt_won(wm.get('wma20',0))}</td></tr><tr><td>WMA60</td><td>{fmt_won(wm.get('wma60',0))}</td></tr><tr><td>등락</td><td>{sig.get('chg',0)}%</td></tr><tr><td>거래량비율</td><td>{sig.get('volume_ratio',0)}배</td></tr><tr><td>고점대비</td><td>{sig.get('hdrop',0)}%</td></tr><tr><td>저점대비</td><td>{sig.get('lrise',0)}%</td></tr><tr><td>추천비중</td><td>{ratio}%</td></tr><tr><td>추천매수</td><td>{rec_qty}주</td></tr><tr><td>추천매도</td><td>{rec_sell}주</td></tr><tr><td>매도가능</td><td>{sellable}주</td></tr></table><div><input id="{qty_id}" type="number" value="{rec_qty}" min="0"><button class="buy" onclick="order('{sym}','BUY','{qty_id}')">실계좌 매수</button><button class="sell" onclick="order('{sym}','SELL','{qty_id}')">실계좌 매도</button><button class="graybtn" onclick="setQty('{qty_id}',{sellable})">전량</button></div></div>"""
 
     def basic_card(self, sym):
         price = S["prices"].get(sym, 0); chg = price_change_pct(sym); wm = S["wma"].get(sym, {})
@@ -1573,8 +1566,8 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
     def stock_table(self):
         rows = ""
         for sym, name in ALL.items():
-            price = S["prices"].get(sym, 0); chg = price_change_pct(sym); hd = high_drop_pct(sym); sig = S["signals"].get(sym, {}); vr = volume_ratio(sym); qid = f"qty_all_{sym}"; tid = f"type_all_{sym}"; pid = f"price_all_{sym}"; rq = int(sig.get("rec_buy_qty", 0)); sellable = int(S["sellable"].get(sym, 0))
-            rows += f"""<tr><td>{safe(name)}<br><span class='small'>{safe(sym)}</span></td><td>{fmt_won(price)}</td><td class='{color_class(chg)}'>{chg:.2f}%</td><td>{vr:.2f}배</td><td>{hd:.2f}%</td><td>{sig.get('score', S['scores'].get(sym,''))}</td><td>{rq}주</td><td>{sig.get('rec_sell_qty',0)}주</td><td><input id='{qid}' type='number' value='{rq}' min='0' title='수량'><select id='{tid}'><option value='MARKET'>시장가</option><option value='LIMIT'>지정가</option></select><input id='{pid}' type='number' value='{int(price) if price else 0}' min='0' title='지정가'><button class='buy' onclick="order('{sym}','BUY','{qid}','{tid}','{pid}')">매수</button><button class='sell' onclick="order('{sym}','SELL','{qid}','{tid}','{pid}')">매도</button><button class='graybtn' onclick="setQty('{qid}',{sellable})">전량</button></td></tr>"""
+            price = S["prices"].get(sym, 0); chg = price_change_pct(sym); hd = high_drop_pct(sym); sig = S["signals"].get(sym, {}); vr = volume_ratio(sym); qid = f"qty_all_{sym}"; rq = int(sig.get("rec_buy_qty", 0)); sellable = int(S["sellable"].get(sym, 0))
+            rows += f"""<tr><td>{safe(name)}<br><span class='small'>{safe(sym)}</span></td><td>{fmt_won(price)}</td><td class='{color_class(chg)}'>{chg:.2f}%</td><td>{vr:.2f}배</td><td>{hd:.2f}%</td><td>{sig.get('score', S['scores'].get(sym,''))}</td><td>{rq}주</td><td>{sig.get('rec_sell_qty',0)}주</td><td><input id='{qid}' type='number' value='{rq}' min='0'><button class='buy' onclick="order('{sym}','BUY','{qid}')">매수</button><button class='sell' onclick="order('{sym}','SELL','{qid}')">매도</button><button class='graybtn' onclick="setQty('{qid}',{sellable})">전량</button></td></tr>"""
         return f"<div class='card'><h2>전체 26종목 실전 반자동</h2><table><tr><th>종목</th><th>현재가</th><th>등락</th><th>거래량</th><th>고점</th><th>점수</th><th>추천매수</th><th>추천매도</th><th>주문</th></tr>{rows}</table></div>"
 
     def news_card(self):
@@ -1602,8 +1595,8 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>AI 가상매매 기록</h2><table><tr><th>시간</th><th>행동</th><th>종목</th><th>손익</th></tr>{rows}</table></div>"
 
     def confirm_page(self, qs):
-        sym = (qs.get("symbol") or [""])[0]; side = (qs.get("side") or ["BUY"])[0]; qty = to_int((qs.get("qty") or [0])[0]); sig = S["signals"].get(sym, {}); price = S["prices"].get(sym, 0); qid = "confirm_qty"; tid = "confirm_type"; pid = "confirm_price"; side_kr = "매수" if side == "BUY" else "매도"
-        body = f"""<html><head><meta charset='utf-8'>{CSS}</head><body><div class='card'><h1>실계좌 {side_kr} 확인</h1><h2>{safe(name_of(sym))}</h2><div class='big'>{fmt_won(price)}</div><p>AI 점수: {sig.get('score',0)} / 신호: {safe(sig.get('label','-'))}</p><p>추천매수: {sig.get('rec_buy_qty',0)}주 / 추천매도: {sig.get('rec_sell_qty',0)}주 / 매도가능: {int(S['sellable'].get(sym,0))}주</p><div>수량 <input id='{qid}' type='number' value='{qty}' min='0'></div><div>주문방식 <select id='{tid}'><option value='MARKET'>시장가</option><option value='LIMIT'>지정가</option></select></div><div>지정가 <input id='{pid}' type='number' value='{int(price) if price else 0}' min='0'> 원</div><button class='{ 'buy' if side=='BUY' else 'sell' }' onclick="order('{sym}','{side}','{qid}','{tid}','{pid}')">실계좌 {side_kr} 최종 실행</button><button class='graybtn' onclick="location.href='/'">취소</button></div><script>async function postJson(path, body){{const res=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body||{{}})}});return await res.json();}}async function order(symbol,side,qtyId,typeId,priceId){{const qty=document.getElementById(qtyId).value;const orderType=document.getElementById(typeId).value;const price=document.getElementById(priceId).value;if(!qty||Number(qty)<=0){{alert('수량 0');return;}}if(orderType==='LIMIT'&&(!price||Number(price)<=0)){{alert('지정가 가격을 입력하세요.');return;}}const msg=orderType==='LIMIT'?('최종 지정가 주문 실행? '+Number(price).toLocaleString()+'원'):'최종 시장가 주문 실행?';if(!confirm(msg))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty,orderType:orderType,price:price}});alert(JSON.stringify(data));location.href='/';}}</script></body></html>"""
+        sym = (qs.get("symbol") or [""])[0]; side = (qs.get("side") or ["BUY"])[0]; qty = to_int((qs.get("qty") or [0])[0]); sig = S["signals"].get(sym, {}); price = S["prices"].get(sym, 0); qid = "confirm_qty"; side_kr = "매수" if side == "BUY" else "매도"
+        body = f"""<html><head><meta charset='utf-8'>{CSS}</head><body><div class='card'><h1>실계좌 {side_kr} 확인</h1><h2>{safe(name_of(sym))}</h2><div class='big'>{fmt_won(price)}</div><p>AI 점수: {sig.get('score',0)} / 신호: {safe(sig.get('label','-'))}</p><p>추천매수: {sig.get('rec_buy_qty',0)}주 / 추천매도: {sig.get('rec_sell_qty',0)}주 / 매도가능: {int(S['sellable'].get(sym,0))}주</p><input id='{qid}' type='number' value='{qty}' min='0'><button class='{ 'buy' if side=='BUY' else 'sell' }' onclick="order('{sym}','{side}','{qid}')">실계좌 {side_kr} 최종 실행</button><button class='graybtn' onclick="location.href='/'">취소</button></div><script>async function postJson(path, body){{const res=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body||{{}})}});return await res.json();}}async function order(symbol,side,qtyId){{const qty=document.getElementById(qtyId).value;if(!qty||Number(qty)<=0){{alert('수량 0');return;}}if(!confirm('최종 주문 실행?'))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty}});alert(JSON.stringify(data));location.href='/';}}</script></body></html>"""
         self.html_response(body)
 
     def symbols_page(self):
