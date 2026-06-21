@@ -22,65 +22,17 @@ CLIENT_ID = os.environ["TOSS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TOSS_CLIENT_SECRET"]
 KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "")
 
-BASE = "https://openapi.tossinvest.com"
-KST = pytz.timezone("Asia/Seoul")
-
-PORT = int(os.environ.get("PORT", "10000"))
-APP_URL = os.environ.get("APP_URL", "")
-
-CSV_PATH = os.environ.get("CSV_PATH", "data.csv")
-PAPER_CSV_PATH = os.environ.get("PAPER_CSV_PATH", "paper_trades.csv")
-
-REAL_BASE_CASH = float(os.environ.get("REAL_BASE_CASH", "20000000"))
-PAPER_START_CASH = float(os.environ.get("PAPER_START_CASH", "20000000"))
-
-MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.7"))
-ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
-
-VOLUME_SURGE = float(os.environ.get("VOLUME_SURGE", "1.8"))
-VOLUME_DRY = float(os.environ.get("VOLUME_DRY", "0.6"))
-VOLUME_REBUY = float(os.environ.get("VOLUME_REBUY", "1.3"))
-
-PAPER_MONTH_TARGET = float(os.environ.get("PAPER_MONTH_TARGET", "1000000"))
-ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "true").lower() == "true"
-
-ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
-NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
-NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
-
-
-# ============================================================
-# 종목
-# ============================================================
-
-MAIN = {
-    "0193T0": "하이닉스 레버리지",
-    "0197X0": "하이닉스 인버스",
-    "000660": "SK하이닉스",
-}
-
-MARKET = {
+BASE = RE_WEIGHT", "
     "122630": "KODEX 레버리지",
     "252670": "KODEX 인버스2X",
     "069500": "KODEX 200",
     "233740": "코스닥150 레버리지",
     "251340": "코스닥150 인버스",
-    "229200": "KODEX 코스닥150",
-}
-
-WATCH = {
-    "0193W0": "삼성전자 레버리지",
-    "0193L0": "삼성전자 인버스",
-    "005930": "삼성전자",
-
-    "494310": "반도체 레버리지",
-    "488080": "TIGER 반도체TOP10",
-    "469150": "AI반도체",
+    "229200": "KO
 
     "0100K0": "방산 레버리지",
     "0080Y0": "조선 레버리지",
     "462330": "2차전지 레버리지",
-
     "0177X0": "로봇 휴머노이드",
     "445290": "로봇액티브",
     "433500": "원자력",
