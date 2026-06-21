@@ -41,6 +41,8 @@ NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "20000000")))
+# 실계좌 보유관리 알림 기준: 고정 손절만이 아니라 시장 강도에 따라 조절됨
+HOLDING_ALERT_COOLDOWN_SEC = int(os.environ.get("HOLDING_ALERT_COOLDOWN_SEC", "300"))
 LOG_ROOT = os.environ.get("LOG_ROOT", "/tmp/logs")
 STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 
@@ -124,6 +126,9 @@ S = {
     "alerts": [],
     "last_alert": {},
     "orders": [],
+    # 실계좌 보유관리: 내가 산 종목의 매수가/매수 후 최고가를 기억해서
+    # 손절, 수익보호, 익절, 교체 후보 알림을 보냄.
+    "real_watch": {},
     "paper": {
         "start_cash": 0,
         "cash": 0,
@@ -264,7 +269,7 @@ def write_row(path, headers, row):
 def save_state():
     try:
         with LOCK:
-            data = {"real_base_cash": S["real_base_cash"], "paper": S["paper"]}
+            data = {"real_base_cash": S["real_base_cash"], "paper": S["paper"], "real_watch": S.get("real_watch", {})}
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -284,6 +289,9 @@ def load_state():
             paper = data.get("paper")
             if isinstance(paper, dict):
                 S["paper"].update(paper)
+            rw = data.get("real_watch")
+            if isinstance(rw, dict):
+                S["real_watch"] = rw
             if S["paper"].get("start_cash", 0) <= 0:
                 S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
     except Exception as e:
@@ -424,6 +432,37 @@ def send_signal_kakao(sym, title):
     with LOCK:
         S["kakao_last"] = f"{now_text()} kakao={kakao_text} / telegram={tg_text}"
     return kakao_ok or tg_ok, f"kakao={kakao_text} / telegram={tg_text}"
+
+def send_position_manage_alert(sym, title, detail):
+    sig = S["signals"].get(sym, {})
+    price = S["prices"].get(sym, 0)
+    sellable = int(S["sellable"].get(sym, 0) or S["hold_qty"].get(sym, 0) or 0)
+    sell_url = confirm_url(sym, "SELL", sellable)
+    dashboard_url = APP_URL or "https://market-watch-6zgo.onrender.com"
+    msg = (
+        f"{title}\n"
+        f"{name_of(sym)}\n"
+        f"현재가: {fmt_won(price)}\n"
+        f"AI 점수: {sig.get('score', 0)} / 신호: {sig.get('label', '-')}\n"
+        f"시장: {S['market_score']['label']} / {S['market_score']['total']}점\n"
+        f"뉴스: {S['news']['label']} / {S['news']['score']}점\n"
+        f"{detail}\n"
+        f"실제 매도는 확인 화면에서 직접 실행"
+    )
+    add_alert(msg)
+    kakao_buttons = [
+        {"title": "매도 확인", "link": {"web_url": sell_url, "mobile_web_url": sell_url}},
+        {"title": "대시보드", "link": {"web_url": dashboard_url, "mobile_web_url": dashboard_url}},
+    ]
+    telegram_buttons = [
+        [telegram_button("🔵 매도 확인", sell_url)],
+        [telegram_button("📊 대시보드", dashboard_url)],
+    ]
+    kakao_ok, kakao_text = post_kakao_template(kakao_template_feed(title, msg, kakao_buttons))
+    tg_ok, tg_text = send_telegram(msg, telegram_buttons)
+    with LOCK:
+        S["kakao_last"] = f"{now_text()} kakao={kakao_text} / telegram={tg_text}"
+    return kakao_ok or tg_ok
 
 def check_kakao():
     if not KAKAO_TOKEN:
@@ -616,7 +655,131 @@ def load_holdings():
         S["total_value"] = int(S["cash"] + total_market)
         if S["real_base_cash"] <= 0 and S["total_value"] > 0:
             S["real_base_cash"] = S["total_value"]
+    sync_real_watch_from_holdings()
     return True
+
+def sync_real_watch_from_holdings():
+    # 토스 보유종목을 기준으로 실계좌 보유감시 목록을 맞춤.
+    # 밖에서 산 종목도 평균매수가가 있으면 자동으로 감시 대상에 들어감.
+    with LOCK:
+        holdings = list(S.get("holdings", []))
+        prices = dict(S.get("prices", {}))
+        watch = dict(S.get("real_watch", {}))
+    active = set()
+    for h in holdings:
+        sym = str(h.get("symbol", ""))
+        qty = to_float(h.get("qty", 0))
+        if not sym or qty <= 0:
+            continue
+        active.add(sym)
+        avg = to_float(h.get("avg", 0)) or to_float(h.get("last_price", 0)) or prices.get(sym, 0)
+        cur = prices.get(sym, to_float(h.get("last_price", 0)) or avg)
+        item = watch.get(sym, {}) if isinstance(watch.get(sym), dict) else {}
+        buy_price = to_float(item.get("buy_price", 0)) or avg
+        high_after = max(to_float(item.get("high_after_buy", 0)), cur, buy_price)
+        watch[sym] = {
+            "symbol": sym,
+            "name": name_of(sym),
+            "qty": qty,
+            "buy_price": buy_price,
+            "buy_time": item.get("buy_time") or now_text(),
+            "high_after_buy": high_after,
+            "last_stage": item.get("last_stage", ""),
+        }
+    for sym in list(watch.keys()):
+        if sym not in active:
+            watch.pop(sym, None)
+    with LOCK:
+        S["real_watch"] = watch
+    save_state()
+
+def holding_thresholds():
+    # 시장이 약하면 더 민감하게, 시장이 강하면 조금 더 넓게 본다.
+    ms = S["market_score"].get("total", 50)
+    if ms >= 65:
+        return {"stop": -2.5, "protect_profit": 1.5, "trail_soft": -2.0, "trail_hard": -3.0, "score_warn": 45, "score_sell": 35}
+    if ms >= 45:
+        return {"stop": -2.0, "protect_profit": 1.0, "trail_soft": -1.5, "trail_hard": -2.5, "score_warn": 50, "score_sell": 40}
+    return {"stop": -1.2, "protect_profit": 0.7, "trail_soft": -1.0, "trail_hard": -2.0, "score_warn": 55, "score_sell": 45}
+
+def real_watch_detail(sym, item, stage):
+    price = S["prices"].get(sym, 0)
+    buy = to_float(item.get("buy_price", 0))
+    high = to_float(item.get("high_after_buy", buy))
+    profit = pct(price, buy) if buy else 0
+    drop = pct(price, high) if high else 0
+    sig = S["signals"].get(sym, {})
+    return (
+        f"매수가: {fmt_won(buy)}\n"
+        f"매수 후 최고가: {fmt_won(high)}\n"
+        f"현재 수익률: {profit:.2f}%\n"
+        f"고점대비: {drop:.2f}%\n"
+        f"AI 점수: {sig.get('score', 0)}\n"
+        f"단계: {stage}"
+    )
+
+def check_real_holding_management():
+    # 내가 실제로 산 종목을 계속 감시한다.
+    # 매수가 대비 손실뿐 아니라, 올라갔다가 꺾이는 수익보호/익절 알림도 보낸다.
+    with LOCK:
+        watch = dict(S.get("real_watch", {}))
+        prices = dict(S.get("prices", {}))
+        signals = dict(S.get("signals", {}))
+    if not watch:
+        return
+    th = holding_thresholds()
+    changed = False
+    for sym, item in watch.items():
+        price = prices.get(sym, 0)
+        buy = to_float(item.get("buy_price", 0))
+        if price <= 0 or buy <= 0:
+            continue
+        old_high = to_float(item.get("high_after_buy", buy))
+        high = max(old_high, price)
+        if high != old_high:
+            item["high_after_buy"] = high
+            changed = True
+        profit = pct(price, buy)
+        drop_from_high = pct(price, high) if high else 0
+        sig = signals.get(sym, {})
+        score = to_float(sig.get("score", 50))
+        stage = ""
+        title = ""
+        # 1) 손실 위험
+        if profit <= th["stop"] or (score <= th["score_sell"] and profit < 0):
+            stage = "LOSS_SELL"
+            title = "⛔ 실계좌 보유 매도 후보"
+        # 2) 수익권에서 고점 이탈: 먹고 빠지기/분할익절
+        elif profit >= th["protect_profit"] and drop_from_high <= th["trail_hard"]:
+            stage = "PROFIT_SELL"
+            title = "💰 실계좌 수익보호 매도 후보"
+        elif profit >= th["protect_profit"] and drop_from_high <= th["trail_soft"]:
+            stage = "PROFIT_WARN"
+            title = "💰 실계좌 익절/분할매도 검토"
+        # 3) 아직 큰 손실은 아니어도 시장/점수 약화
+        elif score <= th["score_warn"] and high_drop_pct(sym) <= -2:
+            stage = "WEAK_WARN"
+            title = "⚠️ 실계좌 보유 약화 경고"
+        # 4) 반대 방향이 훨씬 강하면 교체 후보
+        opp = INV if sym != INV else LEV
+        opp_score = to_float(signals.get(opp, {}).get("score", 0))
+        if opp_score >= 78 and opp_score >= score + 20:
+            stage = "SWITCH"
+            title = "🔁 실계좌 교체 후보"
+        if not stage:
+            continue
+        key = f"REALWATCH_{sym}_{stage}"
+        with LOCK:
+            last = S["last_alert"].get(key, 0)
+            if time.time() - last < HOLDING_ALERT_COOLDOWN_SEC:
+                continue
+            S["last_alert"][key] = time.time()
+        detail = real_watch_detail(sym, item, stage)
+        send_position_manage_alert(sym, title, detail)
+    if changed:
+        with LOCK:
+            S["real_watch"] = watch
+        save_state()
 
 def load_sellable_quantities():
     with LOCK:
@@ -985,6 +1148,28 @@ def place_order_manual(sym, side, qty):
     side_kr = "매수" if side == "BUY" else "매도"
     row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": side_kr, "qty": qty, "status": "성공" if ok else "실패", "response": json.dumps(data, ensure_ascii=False)[:500]}
     record_order(row)
+    if ok:
+        # 실제 버튼 주문이 성공하면 즉시 보유감시 목록에 반영한다.
+        price = S["prices"].get(sym, 0)
+        with LOCK:
+            if side == "BUY":
+                item = S["real_watch"].get(sym, {})
+                buy_price = to_float(item.get("buy_price", 0)) or price
+                old_qty = to_float(item.get("qty", 0))
+                new_qty = old_qty + qty
+                # 추가매수 시 평균가에 가깝게 갱신
+                if old_qty > 0 and buy_price > 0 and price > 0:
+                    buy_price = ((old_qty * buy_price) + (qty * price)) / new_qty
+                S["real_watch"][sym] = {"symbol": sym, "name": name_of(sym), "qty": new_qty, "buy_price": buy_price, "buy_time": item.get("buy_time") or now_text(), "high_after_buy": max(to_float(item.get("high_after_buy", 0)), price, buy_price), "last_stage": ""}
+            elif side == "SELL":
+                item = S["real_watch"].get(sym, {})
+                remain = to_float(item.get("qty", 0)) - qty
+                if remain <= 0:
+                    S["real_watch"].pop(sym, None)
+                elif item:
+                    item["qty"] = remain
+                    S["real_watch"][sym] = item
+        save_state()
     send_kakao(("✅" if ok else "⚠️") + f" 실계좌 반자동 {side_kr}\n{name_of(sym)}\n수량: {qty}주\n결과: {row['status']}", APP_URL)
     refresh_account_all()
     return {"ok": ok, "data": data, "message": row["status"]}
@@ -1033,7 +1218,7 @@ def paper_buy(sym, ratio, reason):
         new_qty = old_qty + qty
         new_avg = ((old_qty * old_avg) + cost) / new_qty if new_qty else price
         S["paper"]["cash"] -= cost
-        S["paper"]["positions"][sym] = {"qty": new_qty, "avg": new_avg, "buy_time": now_text()}
+        S["paper"]["positions"][sym] = {"qty": new_qty, "avg": new_avg, "buy_time": now_text(), "high_after_buy": max(to_float(pos.get("high_after_buy", 0)), price, new_avg)}
         S["paper"]["last_action"] = f"{now_short()} 가상매수 {name_of(sym)}"
     record_paper("가상매수", sym, price, qty, reason)
     return True
@@ -1058,7 +1243,7 @@ def paper_sell(sym, ratio, reason):
         if remain <= 0:
             S["paper"]["positions"].pop(sym, None)
         else:
-            S["paper"]["positions"][sym] = {"qty": remain, "avg": avg, "buy_time": pos.get("buy_time", "")}
+            S["paper"]["positions"][sym] = {"qty": remain, "avg": avg, "buy_time": pos.get("buy_time", ""), "high_after_buy": pos.get("high_after_buy", avg)}
         S["paper"]["last_action"] = f"{now_short()} 가상매도 {name_of(sym)}"
     record_paper("가상매도", sym, price, qty, reason, pl)
     return True
@@ -1067,23 +1252,50 @@ def run_paper_ai_if_enabled():
     if not ENABLE_PAPER_AUTO:
         update_paper_asset()
         return
-    # 기본값 false. 켠 경우에만 AI 가상 자동기록.
+    # AI 가상 2천만원은 26개 후보 중에서 자동으로 매수/매도한다.
     with LOCK:
         positions = dict(S["paper"].get("positions", {}))
         signals = dict(S["signals"])
-    for sym in list(positions.keys()):
+        prices = dict(S["prices"])
+    th = holding_thresholds()
+    for sym, pos in list(positions.items()):
+        price = prices.get(sym, 0)
+        avg = to_float(pos.get("avg", 0))
+        if price <= 0 or avg <= 0:
+            continue
+        high = max(to_float(pos.get("high_after_buy", avg)), price)
+        with LOCK:
+            if sym in S["paper"]["positions"]:
+                S["paper"]["positions"][sym]["high_after_buy"] = high
+        profit = pct(price, avg)
+        drop = pct(price, high) if high else 0
         sig = signals.get(sym, {})
-        if sig.get("rec_sell_qty", 0) > 0 or sig.get("score", 50) <= 40:
-            paper_sell(sym, 1.0, "AI 가상 자동 매도 신호")
+        score = to_float(sig.get("score", 50))
+        if profit <= th["stop"] or score <= th["score_sell"]:
+            paper_sell(sym, 1.0, "AI 가상 자동 매도: 손실/점수 약화")
+        elif profit >= th["protect_profit"] and drop <= th["trail_soft"]:
+            paper_sell(sym, 0.5, "AI 가상 자동 분할익절: 수익권 고점 이탈")
+        elif profit >= th["protect_profit"] and drop <= th["trail_hard"]:
+            paper_sell(sym, 1.0, "AI 가상 자동 전량익절: 수익권 강한 고점 이탈")
     with LOCK:
         has = bool(S["paper"].get("positions"))
     if has:
+        update_paper_asset()
+        save_state()
         return
-    candidates = [(signals.get(sym, {}).get("score", 0), sym) for sym in PRIMARY if signals.get(sym, {}).get("score", 0) >= 78]
+    # 26개 전체 중 점수 1등 후보. 단, 위험 신호는 제외.
+    candidates = []
+    for sym in ALL:
+        sig = signals.get(sym, {})
+        score = to_float(sig.get("score", 0))
+        if score >= 78 and not bad_news_risk_detected(sym):
+            candidates.append((score, sym))
     if candidates:
         candidates.sort(reverse=True)
         score, sym = candidates[0]
-        paper_buy(sym, recommend_ratio(score), f"AI 가상 자동 진입 score={score}")
+        paper_buy(sym, recommend_ratio(score), f"AI 가상 자동 진입: 26개 중 최고 후보 score={score}")
+    update_paper_asset()
+    save_state()
 
 def reset_base_and_paper():
     refresh_account_all()
@@ -1146,6 +1358,7 @@ def loop():
                 last_news = time.time()
             calc_scores()
             maybe_alert()
+            check_real_holding_management()
             run_paper_ai_if_enabled()
             write_logs()
             if counter % 5 == 0:
@@ -1173,7 +1386,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/selfcheck":
             return self.json_response({
                 "ok": True,
-                "version": "SEMI_AUTO_COMPLETE_PATCHED",
+                "version": "SEMI_AUTO_HOLDING_MANAGEMENT",
                 "symbols": len(ALL),
                 "real_auto_buy": False,
                 "real_auto_sell": False,
@@ -1182,6 +1395,8 @@ class Handler(BaseHTTPRequestHandler):
                 "telegram_configured": telegram_enabled(),
                 "log_root": LOG_ROOT,
                 "sellable_endpoint": "/api/v1/sellable",
+                "real_holding_management": True,
+                "paper_auto_26_symbols": ENABLE_PAPER_AUTO,
             })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "last_error"]})
@@ -1283,6 +1498,21 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
     def market_card(self):
         ms = S["market_score"]
         return f"""<div class="card"><h2>시장 방향</h2><div class="big yellow">{safe(ms['label'])}</div><div class="small">종합 시장 점수 {ms['total']}</div><div class="progress"><div class="bar" style="width:{ms['total']}%"></div></div><table><tr><td>코스피 대용</td><td>{ms['kospi']}점</td></tr><tr><td>코스닥 대용</td><td>{ms['kosdaq']}점</td></tr><tr><td>KODEX 200</td><td>{fmt_won(S['prices'].get('069500',0))}</td></tr><tr><td>KODEX 레버리지</td><td>{fmt_won(S['prices'].get('122630',0))}</td></tr><tr><td>KODEX 인버스2X</td><td>{fmt_won(S['prices'].get('252670',0))}</td></tr></table></div>"""
+
+    def real_watch_card(self):
+        with LOCK:
+            watch = dict(S.get("real_watch", {}))
+        rows = ""
+        for sym, item in watch.items():
+            price = S["prices"].get(sym, 0)
+            buy = to_float(item.get("buy_price", 0))
+            high = to_float(item.get("high_after_buy", buy))
+            profit = pct(price, buy) if buy else 0
+            drop = pct(price, high) if high else 0
+            rows += f"""<tr><td>{safe(name_of(sym))}<br><span class='small'>{sym}</span></td><td>{fmt_won(buy)}</td><td>{fmt_won(high)}</td><td class='{color_class(profit)}'>{profit:.2f}%</td><td class='{color_class(drop)}'>{drop:.2f}%</td></tr>"""
+        if not rows:
+            rows = "<tr><td colspan='5' class='gray'>실계좌 보유감시 없음</td></tr>"
+        return f"""<div class='card'><h2>실계좌 보유관리</h2><div class='small'>내가 산 종목의 매수가와 매수 후 최고가를 기준으로 손절/익절/수익보호 알림</div><table><tr><th>종목</th><th>매수가</th><th>최고가</th><th>수익률</th><th>고점대비</th></tr>{rows}</table></div>"""
 
     def signal_card(self, sym, color):
         name = name_of(sym); price = S["prices"].get(sym, 0); score = S["scores"].get(sym, 0); sig = S["signals"].get(sym, {}); wm = S["wma"].get(sym, {}); sellable = int(S["sellable"].get(sym, 0)); rec_qty = int(sig.get("rec_buy_qty", 0)); rec_sell = int(sig.get("rec_sell_qty", 0)); ratio = int(sig.get("ratio", 0) * 100); qty_id = f"qty_{sym}"
