@@ -29,6 +29,8 @@ APP_URL = os.environ.get("APP_URL", "https://market-watch-6zgo.onrender.com").rs
 CLIENT_ID = os.environ.get("TOSS_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("TOSS_CLIENT_SECRET", "").strip()
 KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true"
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
@@ -38,6 +40,7 @@ REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "60"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
+VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "20000000")))
 LOG_ROOT = os.environ.get("LOG_ROOT", "/tmp/logs")
 STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 
@@ -269,6 +272,9 @@ def save_state():
 
 def load_state():
     if not os.path.exists(STATE_PATH):
+        with LOCK:
+            if S["paper"].get("start_cash", 0) <= 0:
+                S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
         return
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
@@ -278,6 +284,8 @@ def load_state():
             paper = data.get("paper")
             if isinstance(paper, dict):
                 S["paper"].update(paper)
+            if S["paper"].get("start_cash", 0) <= 0:
+                S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
     except Exception as e:
         set_error(f"state 로드 실패: {e}")
 
@@ -325,13 +333,58 @@ def post_kakao_template(template):
     except Exception as e:
         return False, str(e)
 
+def telegram_enabled():
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+def telegram_button(text, url):
+    return {"text": text, "url": url}
+
+def send_telegram(msg, buttons=None):
+    # 텔레그램은 inline_keyboard 버튼이 카카오보다 안정적으로 보임.
+    # 버튼을 눌러도 바로 주문하지 않고 /confirm 확인 화면으로만 이동함.
+    if not telegram_enabled():
+        return False, "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 없음"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg[:3900],
+        "disable_web_page_preview": True,
+    }
+    if buttons:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=payload,
+            timeout=8,
+        )
+        return r.status_code == 200, f"HTTP {r.status_code} {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+def check_telegram():
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "TELEGRAM_BOT_TOKEN 없음"
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=8)
+        return r.status_code == 200, f"HTTP {r.status_code}\n{r.text}"
+    except Exception as e:
+        return False, str(e)
+
+def send_telegram_test():
+    url = APP_URL or "https://market-watch-6zgo.onrender.com"
+    return send_telegram(
+        "✅ 텔레그램 알림 테스트 성공\n" + now_text(),
+        [[telegram_button("대시보드 열기", url)]],
+    )
+
 def send_kakao(msg, link_url=None, button_title="대시보드 열기"):
     add_alert(msg)
     url = link_url or APP_URL or "https://developers.tossinvest.com/docs"
     ok, text = post_kakao_template(kakao_template_text(msg, url, button_title))
+    tg_ok, tg_text = send_telegram(msg, [[telegram_button(button_title, url)]])
     with LOCK:
-        S["kakao_last"] = f"{now_text()} {text}"
-    return ok, text
+        S["kakao_last"] = f"{now_text()} kakao={text} / telegram={tg_text}"
+    return ok or tg_ok, f"kakao={text} / telegram={tg_text}"
 
 def confirm_url(sym, side, qty=0):
     base = APP_URL or ""
@@ -343,6 +396,9 @@ def send_signal_kakao(sym, title):
     price = S["prices"].get(sym, 0)
     qty = int(sig.get("rec_buy_qty", 0) or sig.get("qty", 0) or 0)
     sellable = int(S["sellable"].get(sym, 0))
+    buy_url = confirm_url(sym, "BUY", qty)
+    sell_url = confirm_url(sym, "SELL", sellable or qty)
+    dashboard_url = APP_URL or "https://market-watch-6zgo.onrender.com"
     desc = (
         f"{name_of(sym)}\n"
         f"현재가: {fmt_won(price)}\n"
@@ -353,15 +409,21 @@ def send_signal_kakao(sym, title):
         f"추천매수: {qty}주 / 매도가능: {sellable}주\n"
         f"실제 주문은 확인 화면에서 직접 버튼 클릭"
     )
-    buttons = [
-        {"title": "매수 확인", "link": {"web_url": confirm_url(sym, "BUY", qty), "mobile_web_url": confirm_url(sym, "BUY", qty)}},
-        {"title": "매도 확인", "link": {"web_url": confirm_url(sym, "SELL", sellable or qty), "mobile_web_url": confirm_url(sym, "SELL", sellable or qty)}},
+    kakao_buttons = [
+        {"title": "매수 확인", "link": {"web_url": buy_url, "mobile_web_url": buy_url}},
+        {"title": "매도 확인", "link": {"web_url": sell_url, "mobile_web_url": sell_url}},
     ]
-    add_alert(f"{title}\n{desc}")
-    ok, text = post_kakao_template(kakao_template_feed(title, desc, buttons))
+    telegram_buttons = [
+        [telegram_button("🔴 매수 확인", buy_url), telegram_button("🔵 매도 확인", sell_url)],
+        [telegram_button("📊 대시보드", dashboard_url)],
+    ]
+    full_msg = f"{title}\n{desc}"
+    add_alert(full_msg)
+    kakao_ok, kakao_text = post_kakao_template(kakao_template_feed(title, desc, kakao_buttons))
+    tg_ok, tg_text = send_telegram(full_msg, telegram_buttons)
     with LOCK:
-        S["kakao_last"] = f"{now_text()} {text}"
-    return ok, text
+        S["kakao_last"] = f"{now_text()} kakao={kakao_text} / telegram={tg_text}"
+    return kakao_ok or tg_ok, f"kakao={kakao_text} / telegram={tg_text}"
 
 def check_kakao():
     if not KAKAO_TOKEN:
@@ -1031,10 +1093,11 @@ def reset_base_and_paper():
         return False, "총자산 조회 실패"
     with LOCK:
         S["real_base_cash"] = total
-        S["paper"] = {"start_cash": total, "cash": total, "positions": {}, "trades": [], "realized_pl": 0, "asset": total, "profit_rate": 0, "last_action": "리셋"}
+        # AI 가상계좌는 화면에서 2천만원 기준이 확실히 보이도록 고정 시작금 사용
+        S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "2천만원 리셋"}
     save_state()
-    send_kakao(f"🔄 기준금/AI가상 리셋\n기준금: {fmt_won(total)}", APP_URL)
-    return True, f"리셋 완료 {fmt_won(total)}"
+    send_kakao(f"🔄 기준금/AI가상 리셋\n실계좌 기준금: {fmt_won(total)}\nAI 가상 시작금: {fmt_won(VIRTUAL_BASE_CASH)}", APP_URL)
+    return True, f"리셋 완료: 실계좌 {fmt_won(total)} / AI가상 {fmt_won(VIRTUAL_BASE_CASH)}"
 
 # ============================================================
 # 저장 / 루프
@@ -1116,6 +1179,7 @@ class Handler(BaseHTTPRequestHandler):
                 "real_auto_sell": False,
                 "real_order_enabled": ENABLE_REAL_ORDER,
                 "app_url": APP_URL,
+                "telegram_configured": telegram_enabled(),
                 "log_root": LOG_ROOT,
                 "sellable_endpoint": "/api/v1/sellable",
             })
@@ -1125,8 +1189,12 @@ class Handler(BaseHTTPRequestHandler):
             load_prices(); refresh_candles(0); analyze_news_keywords(); calc_scores(); refresh_account_all(); update_paper_asset(); write_logs(); return self.redirect("/")
         if path == "/check_kakao":
             ok, msg = check_kakao(); return self.result_page("카카오 토큰 정상" if ok else "카카오 토큰 실패", msg)
+        if path == "/check_telegram":
+            ok, msg = check_telegram(); return self.result_page("텔레그램 봇 정상" if ok else "텔레그램 봇 실패", msg)
         if path == "/test_kakao":
-            send_kakao("✅ 카카오 알림 테스트 성공\n" + now_text(), APP_URL); return self.result_page("카카오 테스트", "전송 요청 완료")
+            send_kakao("✅ 카카오 알림 테스트 성공\n" + now_text(), APP_URL); return self.result_page("카카오/텔레그램 테스트", "전송 요청 완료")
+        if path == "/test_telegram":
+            ok, msg = send_telegram_test(); return self.result_page("텔레그램 테스트", msg)
         if path == "/test_entry":
             send_signal_kakao(LEV, "🟢 테스트 레버리지 진입 후보"); return self.result_page("진입 알림 테스트", "카카오 버튼 알림 전송 요청 완료")
         if path == "/test_sell":
@@ -1201,7 +1269,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
             pos_rows = "없음"
         real_compare = pct(S["total_value"], S["real_base_cash"]) if S["real_base_cash"] else 0
         diff = p.get("profit_rate", 0) - real_compare
-        return f"""<div class="card"><h2>AI 가상매매</h2><div class="small">가상 시작금</div><div class="mid yellow">{fmt_won(p.get('start_cash',0))}</div><br><div class="small">가상 총자산</div><div class="big {color_class(p.get('asset',0)-p.get('start_cash',0))}">{fmt_won(p.get('asset',0))}</div><div class="{color_class(p.get('profit_rate',0))}">{p.get('profit_rate',0):.2f}%</div><br><div class="small">실제 대비 차이</div><div class="mid {color_class(diff)}">{diff:.2f}%p</div><br><div class="small">가상 보유</div><div>{pos_rows}</div><br><div class="small">마지막 행동</div><div>{safe(p.get('last_action','없음'))}</div><br><button class="paperbtn" onclick="paperBuy('{LEV}')">가상 레버 매수</button><button class="paperbtn" onclick="paperBuy('{INV}')">가상 인버스 매수</button><button class="sell" onclick="paperSell('{LEV}')">가상 레버 매도</button><button class="sell" onclick="paperSell('{INV}')">가상 인버스 매도</button></div>"""
+        return f"""<div class="card"><h2>AI 가상매매</h2><div class="small">가상 기준금</div><div class="big yellow">{fmt_won(VIRTUAL_BASE_CASH)}</div><div class="small">가상 시작금</div><div class="mid yellow">{fmt_won(p.get('start_cash',0))}</div><br><div class="small">가상 총자산</div><div class="big {color_class(p.get('asset',0)-p.get('start_cash',0))}">{fmt_won(p.get('asset',0))}</div><div class="{color_class(p.get('profit_rate',0))}">{p.get('profit_rate',0):.2f}%</div><br><div class="small">실제 대비 차이</div><div class="mid {color_class(diff)}">{diff:.2f}%p</div><br><div class="small">가상 보유</div><div>{pos_rows}</div><br><div class="small">마지막 행동</div><div>{safe(p.get('last_action','없음'))}</div><br><button class="paperbtn" onclick="paperBuy('{LEV}')">가상 레버 매수</button><button class="paperbtn" onclick="paperBuy('{INV}')">가상 인버스 매수</button><button class="sell" onclick="paperSell('{LEV}')">가상 레버 매도</button><button class="sell" onclick="paperSell('{INV}')">가상 인버스 매도</button></div>"""
 
     def holdings_card(self):
         rows = ""
@@ -1240,7 +1308,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
