@@ -227,8 +227,17 @@ def set_status(msg):
         S["updated"] = now_short()
 
 def is_market_watch_time():
+    # 한국장 실시간 판단 시간.
+    # 장외에는 가격 표시/계좌조회만 하고, 신규 AI 판단/알림/가상매매/실주문은 막는다.
     n = now_kst()
-    return 8 <= n.hour < 16
+    if n.weekday() >= 5:  # 토/일
+        return False
+    start = n.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = n.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start <= n < end
+
+def market_time_label():
+    return "장중" if is_market_watch_time() else "장외/대기"
 
 def clean_name(s):
     out = str(s)
@@ -719,6 +728,9 @@ def real_watch_detail(sym, item, stage):
     )
 
 def check_real_holding_management():
+    # 장외에는 보유관리 알림을 보내지 않는다.
+    if not is_market_watch_time():
+        return
     # 내가 실제로 산 종목을 계속 감시한다.
     # 매수가 대비 손실뿐 아니라, 올라갔다가 꺾이는 수익보호/익절 알림도 보낸다.
     with LOCK:
@@ -1087,6 +1099,26 @@ def build_signal(sym):
     }
 
 def calc_scores():
+    # 장외에는 시장이 실제로 움직이지 않으므로 AI 판단을 고정한다.
+    # 가격/계좌/뉴스 표시는 가능하지만, 진입·매도 신호와 추천수량은 만들지 않는다.
+    if not is_market_watch_time():
+        with LOCK:
+            S["market_score"] = {"kospi": 50, "kosdaq": 50, "total": 50, "label": "장외/대기"}
+            for sym in ALL:
+                S["scores"][sym] = 50 if S["prices"].get(sym, 0) > 0 else 0
+                S["signals"][sym] = {
+                    "label": "장외/대기",
+                    "score": S["scores"].get(sym, 0),
+                    "ratio": 0,
+                    "qty": 0,
+                    "rec_buy_qty": 0,
+                    "rec_sell_qty": 0,
+                    "hdrop": round(high_drop_pct(sym), 2),
+                    "lrise": round(low_rise_pct(sym), 2),
+                    "chg": round(price_change_pct(sym), 2),
+                    "volume_ratio": round(volume_ratio(sym), 2),
+                }
+        return
     calc_market_direction()
     with LOCK:
         for sym in ALL:
@@ -1131,6 +1163,10 @@ def place_order_manual(sym, side, qty, order_type="MARKET", limit_price=0):
     limit_price = to_int(limit_price, 0)
     if qty <= 0:
         return {"ok": False, "message": "수량이 0입니다."}
+    if not is_market_watch_time():
+        row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": "매수" if side == "BUY" else "매도", "qty": qty, "order_type": order_type, "limit_price": limit_price if order_type == "LIMIT" else "", "status": "장외차단", "response": "장외에는 실계좌 주문을 보내지 않음"}
+        record_order(row)
+        return {"ok": False, "message": "장외/주말에는 실계좌 주문을 보내지 않습니다. 장중 09:00~15:30에 실행하세요."}
     if order_type == "LIMIT" and limit_price <= 0:
         return {"ok": False, "message": "지정가 주문은 가격을 입력해야 합니다."}
     if side == "SELL":
@@ -1256,6 +1292,13 @@ def paper_sell(sym, ratio, reason):
 def run_paper_ai_if_enabled():
     if not ENABLE_PAPER_AUTO:
         update_paper_asset()
+        return
+    # 장외에는 AI 가상계좌도 신규 매수/매도를 하지 않고 평가만 갱신한다.
+    if not is_market_watch_time():
+        with LOCK:
+            S["paper"]["last_action"] = f"{now_short()} 장외 대기"
+        update_paper_asset()
+        save_state()
         return
     # AI 가상 2천만원은 26개 후보 중에서 자동으로 매수/매도한다.
     with LOCK:
