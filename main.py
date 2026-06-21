@@ -1141,7 +1141,9 @@ def place_order_manual(sym, side, qty):
         row = {"time": now_short(), "symbol": sym, "name": name_of(sym), "side": "매수" if side == "BUY" else "매도", "qty": qty, "status": "차단", "response": "ENABLE_REAL_ORDER=false"}
         record_order(row)
         return {"ok": False, "message": "실계좌 주문이 비활성화되어 있습니다. ENABLE_REAL_ORDER=true 필요"}
-    client_order_id = f"semi-{sym}-{side}-{now_kst().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    # Toss clientOrderId는 길이 제한이 있어 짧게 만든다.
+    # 예: MW1720000000000A1B  (약 18자)
+    client_order_id = f"MW{int(time.time() * 1000)}{uuid.uuid4().hex[:3].upper()}"
     body = {"clientOrderId": client_order_id, "symbol": sym, "side": side, "orderType": "MARKET", "quantity": str(qty)}
     code, data = api_post("/api/v1/orders", body=body, account=True, timeout=10)
     ok = code == 200
