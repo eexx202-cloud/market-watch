@@ -1,6 +1,5 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
-import requests
+mport requests
 import json
 import threading
 import time
