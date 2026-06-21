@@ -1,8 +1,44 @@
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, quote, urlencode
+from datetime import datetime
+import os
+import json
+import csv
+import html
+import time
+import uuid
+import threading
+import xml.etree.ElementTree as ET
+
+import requests
+import pytz
+
+# ============================================================
+# 80억 프로젝트 실전 반자동 관제센터
+# - 실계좌: 자동매수/자동매도 없음. 반드시 사용자가 버튼으로 최종 실행
+# - 카카오: 매수/매도 확인 링크 포함
+# - 26개 종목: 현재가/점수/추천수량/버튼/CSV 저장
+# - AI 가상: 기본 수동. ENABLE_PAPER_AUTO=true 일 때만 가상 자동기록
+# ============================================================
+
+KST = pytz.timezone("Asia/Seoul")
+BASE = os.environ.get("TOSS_BASE", "https://openapi.tossinvest.com").rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+APP_URL = os.environ.get("APP_URL", "https://market-watch-6zgo.onrender.com").rstrip("/")
+
+CLIENT_ID = os.environ.get("TOSS_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.environ.get("TOSS_CLIENT_SECRET", "").strip()
+KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "").strip()
+
+ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true"
+ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
+ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "false").lower() == "true"
+NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
 REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "60"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
-LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
+LOG_ROOT = os.environ.get("LOG_ROOT", "/tmp/logs")
 STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 
 # 26개 감시 종목
@@ -525,12 +561,21 @@ def load_sellable_quantities():
         targets = set(ALL.keys()) | set(S["hold_qty"].keys())
     sellable = {}
     for sym in targets:
-        code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
+        if not sym:
+            continue
+
+        # 토스 매도가능수량: /api/v1/sellable 우선 사용
+        code, data = api_get("/api/v1/sellable", params={"symbol": sym}, account=True, timeout=8)
+
+        # 기존 환경/문서 차이 대비 fallback
+        if code != 200:
+            code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
+
         qty = 0
         if code == 200:
             r = data.get("result", data)
             if isinstance(r, dict):
-                for k in ["sellableQuantity", "quantity", "qty"]:
+                for k in ["sellableQuantity", "sellableQty", "quantity", "qty"]:
                     if k in r:
                         qty = to_float(r[k])
                         break
@@ -1063,7 +1108,17 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         qs = parse_qs(urlparse(self.path).query)
         if path == "/selfcheck":
-            return self.json_response({"ok": True, "version": "SEMI_AUTO_COMPLETE", "symbols": len(ALL), "real_auto_buy": False, "real_auto_sell": False, "real_order_enabled": ENABLE_REAL_ORDER})
+            return self.json_response({
+                "ok": True,
+                "version": "SEMI_AUTO_COMPLETE_PATCHED",
+                "symbols": len(ALL),
+                "real_auto_buy": False,
+                "real_auto_sell": False,
+                "real_order_enabled": ENABLE_REAL_ORDER,
+                "app_url": APP_URL,
+                "log_root": LOG_ROOT,
+                "sellable_endpoint": "/api/v1/sellable",
+            })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "last_error"]})
         if path == "/refresh":
