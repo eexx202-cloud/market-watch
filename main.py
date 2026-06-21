@@ -1,39 +1,3 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, urlencode
-from datetime import datetime
-import os
-import json
-import csv
-import html
-import time
-import uuid
-import threading
-import xml.etree.ElementTree as ET
-
-import requests
-import pytz
-
-# ============================================================
-# 80억 프로젝트 실전 반자동 관제센터
-# - 실계좌: 자동매수/자동매도 없음. 반드시 사용자가 버튼으로 최종 실행
-# - 카카오: 매수/매도 확인 링크 포함
-# - 26개 종목: 현재가/점수/추천수량/버튼/CSV 저장
-# - AI 가상: 기본 수동. ENABLE_PAPER_AUTO=true 일 때만 가상 자동기록
-# ============================================================
-
-KST = pytz.timezone("Asia/Seoul")
-BASE = os.environ.get("TOSS_BASE", "https://openapi.tossinvest.com").rstrip("/")
-PORT = int(os.environ.get("PORT", "10000"))
-APP_URL = os.environ.get("APP_URL", "").rstrip("/")
-
-CLIENT_ID = os.environ.get("TOSS_CLIENT_ID", "").strip()
-CLIENT_SECRET = os.environ.get("TOSS_CLIENT_SECRET", "").strip()
-KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "").strip()
-
-ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true"
-ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
-ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "false").lower() == "true"
-NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
 REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "60"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
