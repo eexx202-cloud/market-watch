@@ -83,11 +83,6 @@ ALL = {**MAIN, **MARKET, **WATCH}
 LEV = "0193T0"
 INV = "0197X0"
 HYNIX = "000660"
-SAM_LEV = "0193W0"
-SAM_INV = "0193L0"
-SAMSUNG = "005930"
-# 알림은 하이닉스/삼성 레버리지+인버스 4개 집중
-ALERT_SYMBOLS = [LEV, INV, SAM_LEV, SAM_INV]
 PRIMARY = [LEV, INV, "122630", "252670", "233740", "251340", "0193W0", "0193L0", "494310", "488080"]
 
 POSITIVE_NEWS_KEYWORDS = [
@@ -479,9 +474,6 @@ def check_kakao():
         return False, str(e)
 
 def send_alert_once(key, sym, title):
-    # 진입 알림은 하이닉스/삼성 레버리지+인버스 4개만
-    if sym not in ALERT_SYMBOLS:
-        return
     with LOCK:
         last = S["last_alert"].get(key, 0)
         if time.time() - last < ALERT_COOLDOWN_SEC:
@@ -705,16 +697,10 @@ def holding_thresholds():
     # 시장이 약하면 더 민감하게, 시장이 강하면 조금 더 넓게 본다.
     ms = S["market_score"].get("total", 50)
     if ms >= 65:
-        # 강세장: 손절 -2.5%, 익절1단계 +2%, 익절2단계 +3%, 수익보호 고점대비 -2%/-3%
-        return {"stop": -2.5, "protect_profit": 1.5, "trail_soft": -2.0, "trail_hard": -3.0,
-                "score_warn": 45, "score_sell": 35, "take_profit1": 2.0, "take_profit2": 3.0, "loss_cut": -1.5}
+        return {"stop": -2.5, "protect_profit": 1.5, "trail_soft": -2.0, "trail_hard": -3.0, "score_warn": 45, "score_sell": 35}
     if ms >= 45:
-        # 횡보장: 손절 -2%, 익절1단계 +2%, 익절2단계 +3%
-        return {"stop": -2.0, "protect_profit": 1.0, "trail_soft": -1.5, "trail_hard": -2.5,
-                "score_warn": 50, "score_sell": 40, "take_profit1": 2.0, "take_profit2": 3.0, "loss_cut": -1.5}
-    # 하락장: 손절 -1.5%, 익절1단계 +2%, 익절2단계 +3%
-    return {"stop": -1.2, "protect_profit": 0.7, "trail_soft": -1.0, "trail_hard": -2.0,
-            "score_warn": 55, "score_sell": 45, "take_profit1": 2.0, "take_profit2": 3.0, "loss_cut": -1.5}
+        return {"stop": -2.0, "protect_profit": 1.0, "trail_soft": -1.5, "trail_hard": -2.5, "score_warn": 50, "score_sell": 40}
+    return {"stop": -1.2, "protect_profit": 0.7, "trail_soft": -1.0, "trail_hard": -2.0, "score_warn": 55, "score_sell": 45}
 
 def real_watch_detail(sym, item, stage):
     price = S["prices"].get(sym, 0)
@@ -759,42 +745,21 @@ def check_real_holding_management():
         score = to_float(sig.get("score", 50))
         stage = ""
         title = ""
-        now_h = now_kst().hour
-        now_m = now_kst().minute
-        # 장 마감 리밸런싱 구간 (14:50~15:00) 주의
-        is_rebalancing = (now_h == 14 and now_m >= 50)
-
-        # 1) 손절 -1.5% 이하
-        if profit <= th["loss_cut"]:
-            stage = "LOSS_CUT"
-            title = "🚨 실계좌 손절 알림 (-1.5%)"
-        # 2) 더 큰 손실 또는 점수 급락
-        elif profit <= th["stop"] or (score <= th["score_sell"] and profit < 0):
+        # 1) 손실 위험
+        if profit <= th["stop"] or (score <= th["score_sell"] and profit < 0):
             stage = "LOSS_SELL"
             title = "⛔ 실계좌 보유 매도 후보"
-        # 3) 익절 +3% 강한 익절
-        elif profit >= th["take_profit2"]:
-            stage = "TAKE_PROFIT2"
-            title = "💰 실계좌 익절 알림 (+3% 달성!) 강하게 팔기"
-        # 4) 익절 +2% 1차 익절
-        elif profit >= th["take_profit1"]:
-            stage = "TAKE_PROFIT1"
-            title = "💰 실계좌 익절 알림 (+2% 달성) 분할 매도 검토"
-        # 5) 수익권에서 고점 이탈: 수익보호
+        # 2) 수익권에서 고점 이탈: 먹고 빠지기/분할익절
         elif profit >= th["protect_profit"] and drop_from_high <= th["trail_hard"]:
             stage = "PROFIT_SELL"
             title = "💰 실계좌 수익보호 매도 후보"
         elif profit >= th["protect_profit"] and drop_from_high <= th["trail_soft"]:
             stage = "PROFIT_WARN"
             title = "💰 실계좌 익절/분할매도 검토"
-        # 6) 아직 큰 손실은 아니어도 시장/점수 약화
+        # 3) 아직 큰 손실은 아니어도 시장/점수 약화
         elif score <= th["score_warn"] and high_drop_pct(sym) <= -2:
             stage = "WEAK_WARN"
             title = "⚠️ 실계좌 보유 약화 경고"
-        # 7) 장 마감 리밸런싱 구간 보유 중 주의
-        if is_rebalancing and not stage:
-            stage = "REBAL_WARN"
-            title = "⏰ 장 마감 리밸런싱 구간 (14:50~) 보유 주의"
         # 4) 반대 방향이 훨씬 강하면 교체 후보
         opp = INV if sym != INV else LEV
         opp_score = to_float(signals.get(opp, {}).get("score", 0))
@@ -1143,15 +1108,57 @@ def maybe_alert():
         return
     with LOCK:
         signals = dict(S["signals"])
-    for sym in PRIMARY:
+        prices = dict(S["prices"])
+        prev_prices = dict(S["prev_prices"])
+        watch = dict(S.get("real_watch", {}))
+    now_h = now_kst().hour
+    now_m = now_kst().minute
+    is_morning = (now_h == 9 and now_m <= 30)  # 오전 9시~9시 30분 집중 구간
+
+    for sym in ALERT_SYMBOLS:
         sig = signals.get(sym, {})
         score = sig.get("score", 0)
+        price = prices.get(sym, 0)
+        prev = prev_prices.get(sym, price)
+        chg = pct(price, prev) if prev else 0
+        vr = volume_ratio(sym)
+        hdrop = high_drop_pct(sym)
+
+        # 1) 악재성 급락 최우선
         if bad_news_risk_detected(sym):
             send_alert_once(f"RISK_{sym}", sym, "⚠️ 악재성 급락 의심")
+            continue
+
+        # 2) 눌림 진입 타이밍
+        # 조건: 오전 9시~9시30분 + 점수 65이상 + 잠깐 -0.5% 이상 눌렸다가 거래량 살아있음
+        if is_morning and score >= 65 and -2.0 <= chg <= -0.5 and vr >= 1.2:
+            send_alert_once(f"PULLBACK_{sym}", sym, "📌 눌림 진입 타이밍!")
+        # 오전 아니어도 점수 78이상이면 진입 알림
         elif score >= 78:
             send_alert_once(f"ENTRY_{sym}", sym, "🟢 AI 진입 후보")
-        elif sig.get("rec_sell_qty", 0) > 0:
-            send_alert_once(f"SELL_{sym}", sym, "⛔ AI 매도 후보")
+
+        # 3) 보유 중인 종목 1%단위 알림
+        if sym in watch:
+            item = watch[sym]
+            buy = to_float(item.get("buy_price", 0))
+            if buy <= 0:
+                continue
+            profit = pct(price, buy)
+
+            # 1% 단위로 알림 (정수 단위로 올림)
+            import math
+            profit_step = math.floor(profit)  # -2, -1, 0, 1, 2, 3 ...
+
+            if profit_step >= 3:
+                send_alert_once(f"TP3_{sym}_{profit_step}", sym, f"💰 +{profit_step}% 달성! 강하게 매도 검토")
+            elif profit_step >= 2:
+                send_alert_once(f"TP2_{sym}_{profit_step}", sym, f"💰 +{profit_step}% 달성 분할매도 검토")
+            elif profit_step >= 1:
+                send_alert_once(f"TP1_{sym}_{profit_step}", sym, f"📈 +{profit_step}% 수익 중")
+            elif profit_step <= -1:
+                send_alert_once(f"SL1_{sym}_{profit_step}", sym, f"⚠️ {profit_step}% 손실 중 주의")
+            elif profit_step <= -2:
+                send_alert_once(f"SL2_{sym}_{profit_step}", sym, f"🚨 {profit_step}% 손절 검토")
 
 # ============================================================
 # 실계좌 반자동 주문 / 가상매매
