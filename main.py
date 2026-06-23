@@ -8,6 +8,7 @@ import html
 import time
 import uuid
 import threading
+import zipfile
 import xml.etree.ElementTree as ET
 
 import requests
@@ -36,7 +37,7 @@ ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "tru
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
 ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "false").lower() == "true"
 NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
-REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "60"))
+REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "30"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
@@ -84,6 +85,8 @@ LEV = "0193T0"
 INV = "0197X0"
 HYNIX = "000660"
 PRIMARY = [LEV, INV, "122630", "252670", "233740", "251340", "0193W0", "0193L0", "494310", "488080"]
+# 알림 대상은 실전 핵심 종목만 제한. 미정의로 루프가 죽지 않게 반드시 정의한다.
+ALERT_SYMBOLS = [LEV, INV, HYNIX, "122630", "252670", "233740", "251340"]
 
 POSITIVE_NEWS_KEYWORDS = [
     "HBM", "엔비디아", "AI", "공급", "계약", "수주", "실적 호조", "목표가 상향", "상향", "증설",
@@ -252,8 +255,21 @@ def paper_path():
 def orders_path():
     return os.path.join(day_dir(), f"real_orders_{today()}.csv")
 
+def portfolio_path():
+    return os.path.join(day_dir(), f"portfolio_{today()}.csv")
+
+def swing_path():
+    return os.path.join(day_dir(), f"swing_decision_{today()}.csv")
+
+def alert_log_path():
+    return os.path.join(day_dir(), f"alert_log_{today()}.csv")
+
+def backup_zip_path():
+    return os.path.join(day_dir(), f"backup_{today()}.zip")
+
 def symbol_path(sym):
-    return os.path.join(day_dir(), "symbols", f"{sym}_{clean_name(name_of(sym))}.csv")
+    # 실제 파일명은 한글 금지. HTTP 헤더 latin-1 오류와 502 방지.
+    return os.path.join(day_dir(), "symbols", f"{sym}.csv")
 
 def write_row(path, headers, row):
     try:
@@ -265,6 +281,22 @@ def write_row(path, headers, row):
             w.writerow({h: row.get(h, "") for h in headers})
     except Exception as e:
         set_error(f"CSV 저장 오류: {e}")
+
+def write_alert_log(level, kind, sym, price, profit_rate, decision, reason, sent, response=""):
+    row = {
+        "time": now_text(),
+        "level": level,
+        "kind": kind,
+        "symbol": sym or "",
+        "name": name_of(sym) if sym else "",
+        "price": price or 0,
+        "profit_rate": round(to_float(profit_rate), 2),
+        "decision": decision or "",
+        "reason": reason or "",
+        "sent": bool(sent),
+        "response": str(response)[:300],
+    }
+    write_row(alert_log_path(), ["time", "level", "kind", "symbol", "name", "price", "profit_rate", "decision", "reason", "sent", "response"], row)
 
 def save_state():
     try:
@@ -351,6 +383,7 @@ def send_telegram(msg, buttons=None):
     # 텔레그램은 inline_keyboard 버튼이 카카오보다 안정적으로 보임.
     # 버튼을 눌러도 바로 주문하지 않고 /confirm 확인 화면으로만 이동함.
     if not telegram_enabled():
+        write_alert_log("SYSTEM", "telegram", "", 0, 0, "not_sent", "TELEGRAM 설정 없음", False, "missing token/chat_id")
         return False, "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 없음"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -365,8 +398,31 @@ def send_telegram(msg, buttons=None):
             data=payload,
             timeout=8,
         )
-        return r.status_code == 200, f"HTTP {r.status_code} {r.text[:300]}"
+        ok = r.status_code == 200
+        write_alert_log("INFO", "telegram", "", 0, 0, "sent" if ok else "failed", msg.split("\n")[0], ok, f"HTTP {r.status_code} {r.text[:300]}")
+        return ok, f"HTTP {r.status_code} {r.text[:300]}"
     except Exception as e:
+        write_alert_log("ERROR", "telegram", "", 0, 0, "exception", msg.split("\n")[0], False, str(e))
+        return False, str(e)
+
+def send_telegram_file(filepath, caption=""):
+    if not telegram_enabled():
+        return False, "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 없음"
+    if not os.path.exists(filepath):
+        return False, f"파일 없음: {filepath}"
+    try:
+        with open(filepath, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
+                files={"document": (os.path.basename(filepath), f)},
+                timeout=30,
+            )
+        ok = r.status_code == 200
+        write_alert_log("INFO", "telegram_file", "", 0, 0, "sent" if ok else "failed", caption, ok, f"HTTP {r.status_code} {r.text[:300]}")
+        return ok, f"HTTP {r.status_code} {r.text[:300]}"
+    except Exception as e:
+        write_alert_log("ERROR", "telegram_file", "", 0, 0, "exception", caption, False, str(e))
         return False, str(e)
 
 def check_telegram():
@@ -675,7 +731,10 @@ def sync_real_watch_from_holdings():
         avg = to_float(h.get("avg", 0)) or to_float(h.get("last_price", 0)) or prices.get(sym, 0)
         cur = prices.get(sym, to_float(h.get("last_price", 0)) or avg)
         item = watch.get(sym, {}) if isinstance(watch.get(sym), dict) else {}
-        buy_price = to_float(item.get("buy_price", 0)) or avg
+        # 실계좌는 토스 보유종목 평균매수가를 최우선으로 사용한다.
+        # state.json에 예전 buy_price가 남아 있어도 실제 평균가로 덮어쓴다.
+        old_buy = to_float(item.get("buy_price", 0))
+        buy_price = avg or old_buy or cur
         high_after = max(to_float(item.get("high_after_buy", 0)), cur, buy_price)
         watch[sym] = {
             "symbol": sym,
@@ -1155,10 +1214,10 @@ def maybe_alert():
                 send_alert_once(f"TP2_{sym}_{profit_step}", sym, f"💰 +{profit_step}% 달성 분할매도 검토")
             elif profit_step >= 1:
                 send_alert_once(f"TP1_{sym}_{profit_step}", sym, f"📈 +{profit_step}% 수익 중")
-            elif profit_step <= -1:
-                send_alert_once(f"SL1_{sym}_{profit_step}", sym, f"⚠️ {profit_step}% 손실 중 주의")
             elif profit_step <= -2:
                 send_alert_once(f"SL2_{sym}_{profit_step}", sym, f"🚨 {profit_step}% 손절 검토")
+            elif profit_step <= -1:
+                send_alert_once(f"SL1_{sym}_{profit_step}", sym, f"⚠️ {profit_step}% 손실 중 주의")
 
 # ============================================================
 # 실계좌 반자동 주문 / 가상매매
@@ -1367,23 +1426,115 @@ def write_logs():
     hs = ["time", "symbol", "name", "price", "high", "low", "wma5", "wma20", "wma60", "volume_ratio", "score", "signal", "market_score", "market_label", "news_score", "news_label", "rec_buy_qty", "rec_sell_qty"]
     with LOCK:
         signals = dict(S["signals"])
+        prices = dict(S["prices"])
+        highs = dict(S["high"])
+        lows = dict(S["low"])
+        wmas = dict(S["wma"])
+        market_score = dict(S["market_score"])
+        news = dict(S["news"])
     for sym in ALL:
-        price = S["prices"].get(sym, 0)
+        price = prices.get(sym, 0)
         if price <= 0:
             continue
-        wm = S["wma"].get(sym, {})
+        wm = wmas.get(sym, {})
         sig = signals.get(sym, {})
         row = {
             "time": now_text(), "symbol": sym, "name": name_of(sym), "price": price,
-            "high": S["high"].get(sym, price), "low": S["low"].get(sym, price),
+            "high": highs.get(sym, price), "low": lows.get(sym, price),
             "wma5": wm.get("wma5", 0), "wma20": wm.get("wma20", 0), "wma60": wm.get("wma60", 0), "volume_ratio": wm.get("volume_ratio", 1),
             "score": sig.get("score", 0), "signal": sig.get("label", ""),
-            "market_score": S["market_score"].get("total", 0), "market_label": S["market_score"].get("label", ""),
-            "news_score": S["news"].get("score", 0), "news_label": S["news"].get("label", ""),
+            "market_score": market_score.get("total", 0), "market_label": market_score.get("label", ""),
+            "news_score": news.get("score", 0), "news_label": news.get("label", ""),
             "rec_buy_qty": sig.get("rec_buy_qty", 0), "rec_sell_qty": sig.get("rec_sell_qty", 0),
         }
         write_row(summary_path(), hs, row)
         write_row(symbol_path(sym), hs, row)
+    write_portfolio_log()
+    write_swing_decision_log()
+
+def swing_decision_for_holding(sym, profit_rate, score, market_label, hdrop):
+    # 실전 1차 안정화용: 매수 추천보다 보유/복구/매도 판단을 우선한다.
+    if profit_rate <= -15:
+        return "복구 모드", "신규매수 금지 / 추가매수 금지 / 반등 확인 대기"
+    if profit_rate <= -5:
+        return "손실 관리", "추가매수 금지 / 약세 지속 시 축소 검토"
+    if score <= 40 or hdrop <= -3:
+        return "매도 후보", "절반 축소 또는 전량 매도 검토"
+    if score >= 60 and market_label != "하락장":
+        return "스윙 보유", "보유 유지"
+    return "관망", "현금 비중 유지 / 신규매수 금지"
+
+def write_portfolio_log():
+    headers = ["time", "symbol", "name", "qty", "avg", "last_price", "value", "pl_amt", "pl_rate", "cash", "total_value", "profit_loss", "profit_rate"]
+    with LOCK:
+        holdings = list(S.get("holdings", []))
+        cash = S.get("cash", 0)
+        total_value = S.get("total_value", 0)
+        profit_loss = S.get("profit_loss", 0)
+        profit_rate = S.get("profit_rate", 0)
+    if not holdings:
+        write_row(portfolio_path(), headers, {"time": now_text(), "symbol": "", "name": "보유없음", "cash": cash, "total_value": total_value, "profit_loss": profit_loss, "profit_rate": profit_rate})
+        return
+    for h in holdings:
+        row = {"time": now_text(), "cash": cash, "total_value": total_value, "profit_loss": profit_loss, "profit_rate": profit_rate}
+        row.update(h)
+        write_row(portfolio_path(), headers, row)
+
+def write_swing_decision_log():
+    headers = ["time", "symbol", "name", "price", "qty", "avg", "real_profit_rate", "market_label", "market_score", "ai_score", "hdrop", "decision", "action", "reason"]
+    with LOCK:
+        holdings = list(S.get("holdings", []))
+        prices = dict(S.get("prices", {}))
+        signals = dict(S.get("signals", {}))
+        market = dict(S.get("market_score", {}))
+    for h in holdings:
+        sym = str(h.get("symbol", ""))
+        if not sym:
+            continue
+        price = prices.get(sym, to_float(h.get("last_price", 0)))
+        avg = to_float(h.get("avg", 0))
+        profit_rate = pct(price, avg) if avg else to_float(h.get("pl_rate", 0))
+        sig = signals.get(sym, {})
+        score = to_float(sig.get("score", 0))
+        hdrop = high_drop_pct(sym)
+        decision, action = swing_decision_for_holding(sym, profit_rate, score, market.get("label", ""), hdrop)
+        reason = f"실계좌 평균가 기준, 시장={market.get('label','')}, AI={score}, 고점대비={hdrop:.2f}%"
+        row = {
+            "time": now_text(), "symbol": sym, "name": name_of(sym), "price": price,
+            "qty": h.get("qty", 0), "avg": avg, "real_profit_rate": round(profit_rate, 2),
+            "market_label": market.get("label", ""), "market_score": market.get("total", 0),
+            "ai_score": score, "hdrop": round(hdrop, 2), "decision": decision, "action": action, "reason": reason,
+        }
+        write_row(swing_path(), headers, row)
+
+def create_backup_zip():
+    path = backup_zip_path()
+    base = day_dir()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(base):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                if fp == path:
+                    continue
+                arc = os.path.relpath(fp, base)
+                z.write(fp, arc)
+    return path
+
+def maybe_send_daily_backup():
+    n = now_kst()
+    if not (n.hour == 15 and 35 <= n.minute <= 39):
+        return
+    key = f"BACKUP_SENT_{today()}"
+    with LOCK:
+        if S["last_alert"].get(key):
+            return
+        S["last_alert"][key] = time.time()
+    path = create_backup_zip()
+    url = f"{APP_URL}/download_backup" if APP_URL else "/download_backup"
+    caption = f"📦 오늘 데이터 백업 완료\n날짜: {today()}\n시간: {now_short()}\n다운로드 링크: {url}"
+    ok, msg = send_telegram_file(path, caption)
+    if not ok:
+        send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]])
 
 def loop():
     load_state()
@@ -1397,20 +1548,51 @@ def loop():
     last_news = 0
     while True:
         try:
+            # 1) 가격과 계좌를 같은 루프에서 30초마다 갱신
             load_prices()
+            refresh_account_all()
             calc_wma_all()
+
             if counter % 2 == 0:
-                refresh_candles(counter)
+                try:
+                    refresh_candles(counter)
+                except Exception as e:
+                    set_error(f"캔들 갱신 오류: {e}")
+
             if ENABLE_NEWS and time.time() - last_news >= NEWS_REFRESH_SEC:
-                analyze_news_keywords()
-                last_news = time.time()
+                try:
+                    analyze_news_keywords()
+                    last_news = time.time()
+                except Exception as e:
+                    set_error(f"뉴스 갱신 오류: {e}")
+
             calc_scores()
-            maybe_alert()
-            check_real_holding_management()
-            run_paper_ai_if_enabled()
+
+            # 2) 저장은 알림보다 먼저. 알림 오류가 나도 데이터는 반드시 남긴다.
             write_logs()
-            if counter % 5 == 0:
-                refresh_account_all()
+            update_paper_asset()
+
+            # 3) 알림/보유관리/가상매매는 각각 분리해서 하나가 터져도 루프 전체가 죽지 않게 한다.
+            try:
+                maybe_alert()
+            except Exception as e:
+                set_error(f"알림 오류: {e}")
+
+            try:
+                check_real_holding_management()
+            except Exception as e:
+                set_error(f"실계좌 보유관리 오류: {e}")
+
+            try:
+                run_paper_ai_if_enabled()
+            except Exception as e:
+                set_error(f"가상매매 오류: {e}")
+
+            try:
+                maybe_send_daily_backup()
+            except Exception as e:
+                set_error(f"백업 오류: {e}")
+
             ensure_token()
             counter += 1
         except Exception as e:
@@ -1445,6 +1627,9 @@ class Handler(BaseHTTPRequestHandler):
                 "sellable_endpoint": "/api/v1/sellable-quantity",
                 "real_holding_management": True,
                 "paper_auto_26_symbols": ENABLE_PAPER_AUTO,
+                "refresh_sec": REFRESH_SEC,
+                "alert_symbols": ALERT_SYMBOLS,
+                "backup_zip": backup_zip_path(),
             })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "last_error"]})
@@ -1470,6 +1655,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.download_file(orders_path(), f"real_orders_{today()}.csv")
         if path == "/download_paper":
             return self.download_file(paper_path(), f"paper_trades_{today()}.csv")
+        if path == "/download_portfolio":
+            return self.download_file(portfolio_path(), f"portfolio_{today()}.csv")
+        if path == "/download_swing":
+            return self.download_file(swing_path(), f"swing_decision_{today()}.csv")
+        if path == "/download_alert_log":
+            return self.download_file(alert_log_path(), f"alert_log_{today()}.csv")
+        if path == "/download_backup":
+            path_zip = create_backup_zip()
+            return self.download_file(path_zip, os.path.basename(path_zip), content_type="application/zip")
         if path == "/symbols_csv":
             return self.symbols_page()
         if path.startswith("/download_symbol/"):
@@ -1586,7 +1780,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
@@ -1613,12 +1807,27 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
     def result_page(self, title, msg):
         self.html_response(f"<html><head><meta charset='utf-8'>{CSS}</head><body><div class='card'><h1>{safe(title)}</h1><pre>{safe(msg)}</pre><a href='/'>돌아가기</a></div></body></html>")
 
-    def download_file(self, path, filename):
-        self.send_response(200); self.send_header("Content-Type", "text/csv; charset=utf-8"); self.send_header("Content-Disposition", f"attachment; filename={filename}"); self.end_headers()
-        if os.path.exists(path):
-            with open(path, "rb") as f: self.wfile.write(f.read())
-        else:
-            self.wfile.write("no data".encode("utf-8"))
+    def download_file(self, path, filename, content_type="text/csv; charset=utf-8"):
+        # Python http.server는 헤더를 latin-1로 인코딩한다.
+        # 한글 filename을 그대로 넣으면 UnicodeEncodeError가 나므로 filename*로 UTF-8 처리한다.
+        if not os.path.exists(path):
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("아직 저장된 데이터가 없습니다.".encode("utf-8"))
+            return
+
+        encoded_filename = quote(filename)
+        safe_filename = filename.encode("ascii", "ignore").decode("ascii")
+        if not safe_filename or safe_filename in [".csv", ".zip"]:
+            safe_filename = "download.csv" if filename.lower().endswith(".csv") else "download.zip"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f"attachment; filename=\"{safe_filename}\"; filename*=UTF-8''{encoded_filename}")
+        self.end_headers()
+        with open(path, "rb") as f:
+            self.wfile.write(f.read())
 
     def html_response(self, body):
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(body.encode("utf-8"))
