@@ -571,6 +571,12 @@ def ensure_token():
         return get_token()
     return token
 
+def clear_token():
+    # 토스가 401 invalid-token을 주면 서버 메모리에 남은 토큰을 버리고 재발급한다.
+    with LOCK:
+        S["token"] = ""
+        S["token_exp"] = 0
+
 def auth_headers(account=False):
     token = ensure_token() or ""
     h = {"Authorization": "Bearer " + token}
@@ -580,13 +586,30 @@ def auth_headers(account=False):
         h["X-Tossinvest-Account"] = str(acc)  # 계좌는 절대 int 변환 금지
     return h
 
+def _json_or_raw(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
+
+def _is_invalid_token(status_code, data):
+    if status_code != 401:
+        return False
+    text = str(data).lower()
+    return "invalid-token" in text or "invalid_token" in text or "유효하지 않은 토큰" in text or status_code == 401
+
 def api_get(path, params=None, account=False, timeout=10):
     try:
         r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
+        data = _json_or_raw(r)
+
+        # 401 invalid-token이면 토큰 캐시를 지우고 새 토큰으로 1회 재시도
+        if _is_invalid_token(r.status_code, data):
+            set_error(f"GET {path} 401 invalid-token: 토큰 재발급 후 재시도")
+            clear_token()
+            r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
+            data = _json_or_raw(r)
+
         if r.status_code >= 400:
             set_error(f"GET {path} {r.status_code}: {str(data)[:300]}")
         return r.status_code, data
@@ -599,10 +622,17 @@ def api_post(path, body=None, account=False, timeout=10):
         h = auth_headers(account)
         h["Content-Type"] = "application/json"
         r = requests.post(BASE + path, headers=h, json=body or {}, timeout=timeout)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
+        data = _json_or_raw(r)
+
+        # 주문/토큰 관련 POST도 401이면 새 토큰으로 1회 재시도
+        if _is_invalid_token(r.status_code, data):
+            set_error(f"POST {path} 401 invalid-token: 토큰 재발급 후 재시도")
+            clear_token()
+            h = auth_headers(account)
+            h["Content-Type"] = "application/json"
+            r = requests.post(BASE + path, headers=h, json=body or {}, timeout=timeout)
+            data = _json_or_raw(r)
+
         if r.status_code >= 400:
             set_error(f"POST {path} {r.status_code}: {str(data)[:300]}")
         return r.status_code, data
@@ -1616,7 +1646,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/selfcheck":
             return self.json_response({
                 "ok": True,
-                "version": "SEMI_AUTO_HOLDING_MANAGEMENT",
+                "version": "SEMI_AUTO_HOLDING_MANAGEMENT_V2_TOKEN_RETRY",
                 "symbols": len(ALL),
                 "real_auto_buy": False,
                 "real_auto_sell": False,
