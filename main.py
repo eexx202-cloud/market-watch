@@ -2081,6 +2081,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         qs = parse_qs(urlparse(self.path).query)
+        if path == "/ipcheck":
+            try:
+                r = requests.get("https://api.ipify.org?format=json", timeout=8)
+                body = r.text
+            except Exception as e:
+                body = json.dumps({"error": str(e)}, ensure_ascii=False)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+            return
+
         if path == "/selfcheck":
             return self.json_response({
                 "ok": True,
