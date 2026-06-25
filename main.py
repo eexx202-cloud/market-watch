@@ -19,7 +19,7 @@ import pytz
 # - 실계좌: 자동매수/자동매도 없음. 반드시 사용자가 버튼으로 최종 실행
 # - 카카오: 매수/매도 확인 링크 포함
 # - 26개 종목: 현재가/점수/추천수량/버튼/CSV 저장
-# - AI 가상: 기본 수동. ENABLE_PAPER_AUTO=true 일 때만 가상 자동기록
+# - AI 가상: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 AI 자동매수/자동매도
 # ============================================================
 
 KST = pytz.timezone("Asia/Seoul")
@@ -106,6 +106,33 @@ HYNIX = "000660"
 PRIMARY = [LEV, INV, "122630", "252670", "233740", "251340", "0193W0", "0193L0", "494310", "488080"]
 # 알림 대상은 실전 핵심 종목만 제한. 미정의로 루프가 죽지 않게 반드시 정의한다.
 ALERT_SYMBOLS = [LEV, INV, HYNIX, "122630", "252670", "233740", "251340"]
+
+
+# ============================================================
+# OPERATING V4 최종 운영 규칙
+# - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
+# - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
+# ============================================================
+OPERATING_VERSION = "OPERATING_V4_AI_PAPER_AUTO_SEMI_LEADER"
+
+# 실전 실행 후보는 감시 26개 중 일부로 제한한다.
+SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
+UP_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "122630", "069500", "0193W0", "005930"]
+INVERSE_SYMBOLS = [INV, "252670", "0193L0", "251340"]
+OBSERVE_ONLY_SYMBOLS = ["0100K0", "0080Y0", "462330", "0177X0", "445290", "433500", "487240", "418660", "465610", "225040", "0127R0"]
+
+# 자금 운용 기준: 2,030만원 전후 계좌 기준
+SWING_BUY_STEP_AMOUNTS = [7_000_000, 4_000_000, 4_000_000]
+SWING_MAX_EXPOSURE = 15_000_000
+MIN_DEFENSE_CASH = 5_000_000
+INVERSE_MAX_EXPOSURE = 8_000_000
+ORDER_SAFE_RATIO = 0.95
+
+# 시간 제한: 오늘 데이터 기준으로 확정
+NO_BUY_BEFORE = "09:05"
+NO_NEW_BUY_AFTER = "14:30"
+DAYTRADE_FORCE_EXIT_TIME = "15:20"
+
 
 POSITIVE_NEWS_KEYWORDS = [
     "HBM", "엔비디아", "AI", "공급", "계약", "수주", "실적 호조", "목표가 상향", "상향", "증설",
@@ -786,6 +813,9 @@ def sync_real_watch_from_holdings():
         qty = to_float(h.get("qty", 0))
         if not sym or qty <= 0:
             continue
+        # 1주 테스트/관찰용 포지션은 실계좌 보유감시 알림에서 제외
+        if qty <= 1:
+            continue
         active.add(sym)
         avg = to_float(h.get("avg", 0)) or to_float(h.get("last_price", 0)) or prices.get(sym, 0)
         cur = prices.get(sym, to_float(h.get("last_price", 0)) or avg)
@@ -848,6 +878,10 @@ def check_real_holding_management():
     th = holding_thresholds()
     changed = False
     for sym, item in watch.items():
+        qty = to_float(item.get("qty", 0))
+        # 1주 테스트/관찰용 포지션은 보유관리 알림 제외
+        if qty <= 1:
+            continue
         price = prices.get(sym, 0)
         buy = to_float(item.get("buy_price", 0))
         if price <= 0 or buy <= 0:
@@ -1084,6 +1118,131 @@ def analyze_news_keywords():
     with LOCK:
         S["news"] = {"updated": now_short(), "items": all_titles[:20], "score": score, "label": label, "positive": positives, "negative": negatives}
 
+
+# ============================================================
+# OPERATING V4 시장상태 / 실행제한 헬퍼
+# ============================================================
+
+def hhmm_tuple(hhmm):
+    h, m = parse_hhmm(hhmm)
+    return h, m
+
+def is_before_hhmm(hhmm):
+    h, m = hhmm_tuple(hhmm)
+    n = now_kst()
+    return (n.hour, n.minute) < (h, m)
+
+def is_after_or_equal_hhmm(hhmm):
+    h, m = hhmm_tuple(hhmm)
+    n = now_kst()
+    return (n.hour, n.minute) >= (h, m)
+
+def buy_time_blocked():
+    return is_before_hhmm(NO_BUY_BEFORE) or is_after_or_equal_hhmm(NO_NEW_BUY_AFTER)
+
+def is_inverse_symbol(sym):
+    return sym in INVERSE_SYMBOLS or "인버스" in name_of(sym)
+
+def is_long_allowed_symbol(sym, mode):
+    if mode == "SEMI_LEADER_UP":
+        return sym in SEMI_LONG_SYMBOLS
+    if mode == "UP":
+        return sym in UP_LONG_SYMBOLS
+    return False
+
+def symbol_strength(sym):
+    price = S["prices"].get(sym, 0)
+    if price <= 0:
+        return 0
+    score = to_float(S["signals"].get(sym, {}).get("score", raw_symbol_score(sym)))
+    chg = price_change_pct(sym)
+    lrise = low_rise_pct(sym)
+    hdrop = high_drop_pct(sym)
+    vr = volume_ratio(sym)
+    strength = score
+    strength += max(chg, 0) * 8
+    strength += max(lrise, 0) * 2
+    strength -= max(-hdrop, 0) * 1.5 if hdrop < -4 else 0
+    strength += min(vr, 3) * 2
+    return strength
+
+def semiconductor_strong():
+    core = [LEV, HYNIX, "494310", "488080", "469150"]
+    strong = 0
+    for sym in core:
+        score = to_float(S["signals"].get(sym, {}).get("score", raw_symbol_score(sym)))
+        chg = price_change_pct(sym)
+        lrise = low_rise_pct(sym)
+        if score >= 65 or chg >= 0.3 or lrise >= 1.0:
+            strong += 1
+    inverse_weak = True
+    for sym in [INV, "252670", "0193L0"]:
+        score = to_float(S["signals"].get(sym, {}).get("score", raw_symbol_score(sym)))
+        chg = price_change_pct(sym)
+        if score >= 62 and chg > 0:
+            inverse_weak = False
+    return strong >= 2 and inverse_weak
+
+def inverse_market_confirmed():
+    weak_long = 0
+    for sym in [LEV, HYNIX, "494310", "488080", "122630", "069500", "233740"]:
+        score = to_float(S["signals"].get(sym, {}).get("score", raw_symbol_score(sym)))
+        chg = price_change_pct(sym)
+        hdrop = high_drop_pct(sym)
+        if score <= 45 or chg <= -0.3 or hdrop <= -1.5:
+            weak_long += 1
+    strong_inv = 0
+    for sym in INVERSE_SYMBOLS:
+        score = to_float(S["signals"].get(sym, {}).get("score", raw_symbol_score(sym)))
+        chg = price_change_pct(sym)
+        lrise = low_rise_pct(sym)
+        if score >= 58 and (chg > 0 or lrise >= 0.7):
+            strong_inv += 1
+    return weak_long >= 4 and strong_inv >= 1
+
+def operating_market_mode():
+    market_total = to_float(S["market_score"].get("total", 50))
+    label = S["market_score"].get("label", "")
+    if semiconductor_strong() and market_total >= 42:
+        return "SEMI_LEADER_UP"
+    if inverse_market_confirmed() and (market_total <= 42 or label == "하락장"):
+        return "DOWN"
+
+    ups = downs = movers = 0
+    for sym in ALERT_SYMBOLS:
+        chg = price_change_pct(sym)
+        hdrop = high_drop_pct(sym)
+        lrise = low_rise_pct(sym)
+        if chg >= 0.25 or lrise >= 1.0:
+            ups += 1
+        if chg <= -0.25 or hdrop <= -1.0:
+            downs += 1
+        if abs(chg) >= 0.25 or abs(hdrop) >= 1.0 or abs(lrise) >= 1.0:
+            movers += 1
+
+    if market_total >= 65 or label == "상승장":
+        return "UP"
+    if movers >= 3 and ups >= 1 and downs >= 1:
+        return "CHOPPY"
+    return "NO_TRADE"
+
+def choose_best_symbol(candidates):
+    valid = []
+    for sym in candidates:
+        price = S["prices"].get(sym, 0)
+        if price <= 0:
+            continue
+        if bad_news_risk_detected(sym):
+            continue
+        valid.append((symbol_strength(sym), sym))
+    if not valid:
+        return None
+    valid.sort(reverse=True)
+    return valid[0][1]
+
+def log_execution_block(reason, sym=""):
+    write_alert_log("BLOCK", "execution", sym, S["prices"].get(sym, 0), 0, "blocked", reason, False, "")
+
 # ============================================================
 # AI 점수 / 신호
 # ============================================================
@@ -1222,43 +1381,31 @@ def calc_scores():
             S["signals"][sym] = build_signal(sym)
 
 def maybe_alert():
+    """기본 알림은 위험/금지성만 보낸다.
+    실제 매수/매도 실행 신호는 run_daytrade_engine()과 보유관리에서만 보낸다.
+    """
     if not is_market_watch_time():
         return
     with LOCK:
         signals = dict(S["signals"])
         prices = dict(S["prices"])
-        prev_prices = dict(S["prev_prices"])
-        watch = dict(S.get("real_watch", {}))
-    now_h = now_kst().hour
-    now_m = now_kst().minute
-    is_morning = (now_h == 9 and now_m <= 30)  # 오전 9시~9시 30분 집중 구간
+    mode = operating_market_mode()
+    # CHOPPY/NO_TRADE는 매수 후보 알림 대신 금지성 메시지만 쿨다운 전송
+    if mode in ["CHOPPY", "NO_TRADE"]:
+        key = f"NO_BUY_{mode}"
+        with LOCK:
+            last = S["last_alert"].get(key, 0)
+            if time.time() - last >= max(ALERT_COOLDOWN_SEC, 600):
+                S["last_alert"][key] = time.time()
+                send_telegram(
+                    f"⛔ [금지]\n시장상태: {mode}\n행동: 신규매수 금지 / 관찰만\n시간: {now_short()}",
+                    [[telegram_button("📊 대시보드", APP_URL)]],
+                )
+        return
 
     for sym in ALERT_SYMBOLS:
-        sig = signals.get(sym, {})
-        score = sig.get("score", 0)
-        price = prices.get(sym, 0)
-        prev = prev_prices.get(sym, price)
-        chg = pct(price, prev) if prev else 0
-        vr = volume_ratio(sym)
-        hdrop = high_drop_pct(sym)
-
-        # 1) 악재성 급락 최우선
         if bad_news_risk_detected(sym):
             send_alert_once(f"RISK_{sym}", sym, "⚠️ 악재성 급락 의심")
-            continue
-
-        # 2) 눌림 진입 타이밍
-        # 조건: 오전 9시~9시30분 + 점수 65이상 + 잠깐 -0.5% 이상 눌렸다가 거래량 살아있음
-        if is_morning and score >= 65 and -2.0 <= chg <= -0.5 and vr >= 1.2:
-            send_alert_once(f"PULLBACK_{sym}", sym, "📌 눌림 진입 타이밍!")
-        # 오전 아니어도 점수 78이상이면 진입 알림
-        elif score >= 78:
-            send_alert_once(f"ENTRY_{sym}", sym, "🟢 AI 진입 후보")
-
-        # 3) 보유 중인 종목 반복 알림은 중단.
-        # 실제 단타 실행 알림은 run_daytrade_engine()에서만 보낸다.
-        # 복구용 보유 관리는 check_real_holding_management()가 단계 변경/위험 알림만 담당한다.
-        continue
 
 # ============================================================
 # 800만원 단타 전용 엔진
@@ -1344,98 +1491,29 @@ def daytrade_available_cash():
     return cash
 
 def daytrade_market_mode():
-    """
-    시장상황을 4가지로 정리한다.
-    UP: 상승 추세
-    DOWN: 하락 추세
-    CHOPPY: 위아래 변동성 장
-    NO_TRADE: 애매한 장
-    """
-    with LOCK:
-        market_total = to_float(S["market_score"].get("total", 50))
-        market_label = S["market_score"].get("label", "")
-        symbols = list(ALERT_SYMBOLS)
-    ups = downs = movers = strong_buy = strong_sell = 0
-    for sym in symbols:
-        price = S["prices"].get(sym, 0)
-        if price <= 0:
-            continue
-        chg = price_change_pct(sym)
-        hdrop = high_drop_pct(sym)
-        lrise = low_rise_pct(sym)
-        score = to_float(S["signals"].get(sym, {}).get("score", 50))
-        label = str(S["signals"].get(sym, {}).get("label", ""))
-        if chg >= 0.25 or lrise >= 1.0:
-            ups += 1
-        if chg <= -0.25 or hdrop <= -1.0:
-            downs += 1
-        if abs(chg) >= 0.25 or abs(hdrop) >= 1.0 or abs(lrise) >= 1.0:
-            movers += 1
-        if score >= 70 or "진입" in label:
-            strong_buy += 1
-        if score <= 40 or "매도" in label or "급락" in label:
-            strong_sell += 1
-
-    if market_total >= 65 or market_label == "상승장":
-        return "UP"
-    if market_total <= 40 or market_label == "하락장":
-        return "DOWN"
-    # 혼조라도 움직임이 있으면 단타장으로 인정한다.
-    if movers >= 3 and ups >= 1 and downs >= 1:
-        return "CHOPPY"
-    if strong_buy >= 2 and ups >= 2:
-        return "UP"
-    if strong_sell >= 2 and downs >= 2:
-        return "DOWN"
-    return "NO_TRADE"
+    """OPERATING V4 공통 시장상태를 단타 엔진에서도 그대로 사용한다."""
+    return operating_market_mode()
 
 def daytrade_candidate_for_mode(mode):
-    candidates = []
-    with LOCK:
-        sigs = dict(S.get("signals", {}))
-        prices = dict(S.get("prices", {}))
-    for sym, price in prices.items():
-        if sym not in ALL or price <= 0:
-            continue
-        if is_locked_recovery_symbol(sym):
-            continue
-
-        name = name_of(sym)
-        sig = sigs.get(sym, {})
-        score = to_float(sig.get("score", 0))
-        chg = price_change_pct(sym)
-        hdrop = high_drop_pct(sym)
-        lrise = low_rise_pct(sym)
-        vr = volume_ratio(sym)
-
-        is_inverse = "인버스" in name
-        is_leverage = "레버리지" in name
-
-        if mode == "UP":
-            if not is_inverse and score >= 65 and (chg > 0 or lrise >= 1.0):
-                rank = score + max(chg, 0) * 8 + max(lrise, 0) * 2 + vr
-                candidates.append((rank, sym))
-        elif mode == "DOWN":
-            if is_inverse and score >= 55 and (chg > 0 or lrise >= 0.7):
-                rank = score + max(chg, 0) * 8 + max(lrise, 0) * 2 + vr
-                candidates.append((rank, sym))
-        elif mode == "CHOPPY":
-            # 변동장은 하이닉스/반도체/레버리지/인버스처럼 많이 움직인 종목만 후보
-            if score >= 55 and (abs(chg) >= 0.25 or abs(hdrop) >= 1.0 or lrise >= 1.0):
-                rank = score + abs(chg) * 8 + abs(hdrop) * 2 + lrise * 2 + (5 if is_leverage or is_inverse else 0)
-                candidates.append((rank, sym))
-
-    if not candidates:
+    # CHOPPY/NO_TRADE에서는 실행 후보 없음. 관찰만.
+    if mode in ["CHOPPY", "NO_TRADE"]:
         return None
-    candidates.sort(reverse=True)
-    return candidates[0][1]
+    if mode == "SEMI_LEADER_UP":
+        return choose_best_symbol(SEMI_LONG_SYMBOLS)
+    if mode == "UP":
+        return choose_best_symbol(UP_LONG_SYMBOLS)
+    if mode == "DOWN":
+        if semiconductor_strong():
+            return None
+        return choose_best_symbol(INVERSE_SYMBOLS)
+    return None
 
 def daytrade_calc_qty(sym):
     price = S["prices"].get(sym, 0)
     cash = daytrade_available_cash()
     if price <= 0 or cash <= 0:
         return 0
-    return int(cash // price)
+    return int((cash * ORDER_SAFE_RATIO) // price)
 
 def daytrade_position_profit(pos, current_price):
     entry = to_float(pos.get("entry_price", 0))
@@ -1477,14 +1555,14 @@ def daytrade_send_button(pending):
     reason = pending.get("reason", "")
     mode = S["daytrade"].get("market_mode", "")
     if action == "BUY":
-        title = "📈 800만 단타 매수 신호"
-        btn_title = "📈 단타 매수 실행"
+        title = "🟢 [매수-실행] 단타/스윙 후보"
+        btn_title = "🟢 매수 실행"
     elif action == "SELL":
-        title = "📉 800만 단타 매도 신호"
-        btn_title = "📉 단타 매도 실행"
+        title = "🔴 [매도-실행] 보유 정리"
+        btn_title = "🔴 매도 실행"
     else:
-        title = "⚡ 800만 인버스 단타 신호"
-        btn_title = "⚡ 인버스 단타 실행"
+        title = "🟢 [인버스-실행] 하락장 단타"
+        btn_title = "🟢 인버스 실행"
 
     msg = (
         f"{title}\n"
@@ -1610,21 +1688,23 @@ def run_daytrade_engine():
         drop_from_high = pct(cur, high) if high else 0
 
         reason = ""
-        if time_after_hhmm(DAYTRADE_FORCE_EXIT_AFTER):
+        if time_after_hhmm(DAYTRADE_FORCE_EXIT_TIME):
             reason = "15:20 전 정산"
         elif pnl <= DAYTRADE_STOP_LOSS:
             reason = f"손절 {pnl:.2f}%"
-        elif high_pnl >= DAYTRADE_TP_START and drop_from_high <= -DAYTRADE_TRAIL_DROP:
+        elif is_after_or_equal_hhmm(NO_NEW_BUY_AFTER) and high_pnl >= 1.0 and drop_from_high <= -1.5:
+            reason = f"14:30 이후 수익보호 고점대비 {drop_from_high:.2f}%"
+        elif high_pnl >= DAYTRADE_TP_START and drop_from_high <= -max(DAYTRADE_TRAIL_DROP, 0.8):
             reason = f"추적익절 고점대비 {drop_from_high:.2f}%"
-        elif pnl >= DAYTRADE_TP_HARD and mode != "UP":
+        elif pnl >= DAYTRADE_TP_HARD and mode not in ["UP", "SEMI_LEADER_UP"]:
             reason = f"목표익절 {pnl:.2f}%"
         elif pos.get("action") in ["BUY"] and mode == "DOWN":
             reason = "시장 하락 전환"
-        elif pos.get("action") in ["INVERSE"] and mode == "UP":
-            reason = "시장 상승 전환"
+        elif pos.get("action") in ["INVERSE"] and mode in ["UP", "SEMI_LEADER_UP"]:
+            reason = "시장 상승/반도체 주도 전환"
 
         if reason:
-            if DAYTRADE_AUTO_FORCE_SELL and time_after_hhmm(DAYTRADE_FORCE_EXIT_AFTER):
+            if DAYTRADE_AUTO_FORCE_SELL and time_after_hhmm(DAYTRADE_FORCE_EXIT_TIME):
                 res = daytrade_close_position(reason)
                 send_telegram("⏰ 단타 자동 정산 결과\n" + str(res), [[telegram_button("📊 대시보드", APP_URL)]])
             else:
@@ -1633,10 +1713,10 @@ def run_daytrade_engine():
                 daytrade_alert_once(f"DAYTRADE_SELL_{sym}_{reason}", pending, cooldown=60)
         return
 
-    # 신규진입 금지 시간
-    if not time_before_hhmm(DAYTRADE_NO_ENTRY_AFTER):
+    # 신규진입 금지 시간/상태
+    if buy_time_blocked():
         return
-    if mode == "NO_TRADE":
+    if mode in ["CHOPPY", "NO_TRADE"]:
         return
     if trade_count >= DAYTRADE_MAX_TRADES:
         return
@@ -1648,10 +1728,14 @@ def run_daytrade_engine():
     if qty <= 0:
         return
 
-    action = "INVERSE" if mode == "DOWN" and "인버스" in name_of(sym) else "BUY"
-    reason = f"{mode} 시장 단타 후보 / 점수 {S['signals'].get(sym, {}).get('score', 0)}"
+    action = "INVERSE" if mode == "DOWN" and is_inverse_symbol(sym) else "BUY"
+    if action == "BUY" and is_inverse_symbol(sym):
+        return
+    if action == "INVERSE" and not is_inverse_symbol(sym):
+        return
+    reason = f"{mode} 실행 신호 / 점수 {S['signals'].get(sym, {}).get('score', 0)} / 후보제한 통과"
     pending = daytrade_make_signal(action, sym, reason)
-    daytrade_alert_once(f"DAYTRADE_BUY_{mode}_{sym}", pending, cooldown=300)
+    daytrade_alert_once(f"DAYTRADE_BUY_{mode}_{sym}", pending, cooldown=900)
 
 def execute_daytrade_from_url(qs):
     token = (qs.get("token") or [""])[0]
@@ -1671,8 +1755,34 @@ def execute_daytrade_from_url(qs):
         return {"ok": False, "message": "만료되었거나 다른 신호입니다"}
 
     sym = pending.get("symbol")
+    if sym not in ALL:
+        return {"ok": False, "message": "허용되지 않은 종목"}
+
+    # 주문 직전 재검사: 시간/시장상태/종목 방향/수량
+    mode = daytrade_market_mode()
+    if action in ["BUY", "INVERSE"]:
+        if buy_time_blocked():
+            log_execution_block("09:05 전 또는 14:30 이후 신규매수 차단", sym)
+            return {"ok": False, "message": "신규매수 금지 시간입니다. 09:05 전/14:30 이후 차단."}
+        if mode in ["CHOPPY", "NO_TRADE"]:
+            log_execution_block(f"{mode} 신규매수 차단", sym)
+            return {"ok": False, "message": f"시장상태 {mode}: 신규매수 금지"}
+        if action == "BUY" and mode == "DOWN":
+            return {"ok": False, "message": "하락장에서는 롱 매수 차단"}
+        if action == "BUY" and is_inverse_symbol(sym):
+            return {"ok": False, "message": "롱 매수 신호에서 인버스 종목 차단"}
+        if action == "INVERSE":
+            if mode != "DOWN" or semiconductor_strong():
+                return {"ok": False, "message": "인버스는 확실한 DOWN에서만 허용"}
+            if not is_inverse_symbol(sym):
+                return {"ok": False, "message": "인버스 신호인데 인버스 종목이 아님"}
+
     price = S["prices"].get(sym, 0)
     qty = int(to_float(pending.get("qty", 0)))
+    if action in ["BUY", "INVERSE"]:
+        qty = daytrade_calc_qty(sym)
+        if qty <= 0:
+            return {"ok": False, "message": "매수 가능 수량 0"}
 
     if action in ["BUY", "INVERSE"]:
         return daytrade_open_position(action, sym, qty, price)
@@ -1758,14 +1868,73 @@ def update_paper_asset():
         start = S["paper"].get("start_cash", 0)
         S["paper"]["profit_rate"] = pct(asset, start) if start else 0
 
-def record_paper(action, sym, price, qty, reason, pl=0):
+def record_paper(action, sym, price, qty, reason, pl=0, strategy="", mode="", source="AUTO"):
     update_paper_asset()
     with LOCK:
-        row = {"time": now_short(), "action": action, "symbol": sym, "name": name_of(sym), "price": price, "qty": qty, "pl": pl, "reason": reason, "asset": S["paper"].get("asset", 0)}
+        row = {
+            "time": now_short(),
+            "source": source,
+            "strategy": strategy,
+            "market_mode": mode or S.get("daytrade", {}).get("market_mode", ""),
+            "action": action,
+            "symbol": sym,
+            "name": name_of(sym),
+            "price": price,
+            "qty": qty,
+            "pl": pl,
+            "reason": reason,
+            "asset": S["paper"].get("asset", 0),
+        }
         S["paper"]["trades"].insert(0, row)
         S["paper"]["trades"] = S["paper"]["trades"][:100]
-    write_row(paper_path(), ["time", "action", "symbol", "name", "price", "qty", "pl", "reason", "asset"], row)
+    write_row(paper_path(), ["time", "source", "strategy", "market_mode", "action", "symbol", "name", "price", "qty", "pl", "reason", "asset"], row)
     save_state()
+
+def paper_invested_amount():
+    with LOCK:
+        positions = dict(S["paper"].get("positions", {}))
+        prices = dict(S["prices"])
+    total = 0
+    for sym, pos in positions.items():
+        total += to_float(pos.get("qty", 0)) * prices.get(sym, to_float(pos.get("avg", 0)))
+    return int(total)
+
+def paper_buy_amount(sym, amount, reason, strategy="SWING", mode=""):
+    if sym not in ALL:
+        return False
+    price = S["prices"].get(sym, 0)
+    if price <= 0 or amount <= 0:
+        return False
+    with LOCK:
+        cash = to_int(S["paper"].get("cash", 0))
+    # 가상도 실제 운영처럼 최소 방어현금은 남긴다.
+    spendable = max(0, cash - MIN_DEFENSE_CASH)
+    amount = min(int(amount), spendable)
+    if amount <= 0:
+        return False
+    qty = int(amount // price)
+    if qty <= 0:
+        return False
+    cost = qty * price
+    with LOCK:
+        pos = S["paper"]["positions"].get(sym, {"qty": 0, "avg": 0, "stage": 0, "strategy": strategy})
+        old_qty = to_float(pos.get("qty", 0))
+        old_avg = to_float(pos.get("avg", 0))
+        new_qty = old_qty + qty
+        new_avg = ((old_qty * old_avg) + cost) / new_qty if new_qty else price
+        stage = min(3, int(to_float(pos.get("stage", 0))) + 1)
+        S["paper"]["cash"] -= cost
+        S["paper"]["positions"][sym] = {
+            "qty": new_qty,
+            "avg": new_avg,
+            "buy_time": pos.get("buy_time") or now_text(),
+            "high_after_buy": max(to_float(pos.get("high_after_buy", 0)), price, new_avg),
+            "stage": stage,
+            "strategy": strategy,
+        }
+        S["paper"]["last_action"] = f"{now_short()} AI 자동가상매수 {name_of(sym)} {stage}단계"
+    record_paper("AI자동가상매수", sym, price, qty, reason, strategy=strategy, mode=mode or operating_market_mode(), source="AUTO")
+    return True
 
 def paper_buy(sym, ratio, reason):
     if sym not in ALL:
@@ -1788,7 +1957,7 @@ def paper_buy(sym, ratio, reason):
         S["paper"]["cash"] -= cost
         S["paper"]["positions"][sym] = {"qty": new_qty, "avg": new_avg, "buy_time": now_text(), "high_after_buy": max(to_float(pos.get("high_after_buy", 0)), price, new_avg)}
         S["paper"]["last_action"] = f"{now_short()} 가상매수 {name_of(sym)}"
-    record_paper("가상매수", sym, price, qty, reason)
+    record_paper("수동가상매수", sym, price, qty, reason, strategy="MANUAL", mode=operating_market_mode(), source="MANUAL")
     return True
 
 def paper_sell(sym, ratio, reason):
@@ -1813,55 +1982,96 @@ def paper_sell(sym, ratio, reason):
         else:
             S["paper"]["positions"][sym] = {"qty": remain, "avg": avg, "buy_time": pos.get("buy_time", ""), "high_after_buy": pos.get("high_after_buy", avg)}
         S["paper"]["last_action"] = f"{now_short()} 가상매도 {name_of(sym)}"
-    record_paper("가상매도", sym, price, qty, reason, pl)
+    record_paper("수동가상매도", sym, price, qty, reason, pl, strategy="MANUAL", mode=operating_market_mode(), source="MANUAL")
     return True
 
 def run_paper_ai_if_enabled():
+    """AI 가상계좌 자동운영.
+    ENABLE_PAPER_AUTO=true 이면 사용자가 버튼을 누르지 않아도 2천만원 기준으로
+    AI가 스스로 단타/스윙/관망/인버스를 판단해 가상매수/가상매도한다.
+    """
+    mode = operating_market_mode()
+    with LOCK:
+        S["daytrade"]["market_mode"] = mode
     if not ENABLE_PAPER_AUTO:
         update_paper_asset()
         return
-    # AI 가상 2천만원은 26개 후보 중에서 자동으로 매수/매도한다.
+
     with LOCK:
         positions = dict(S["paper"].get("positions", {}))
-        signals = dict(S["signals"])
         prices = dict(S["prices"])
-    th = holding_thresholds()
+
+    # 1) 보유 포지션 자동 매도/보유/추가매수 판단
     for sym, pos in list(positions.items()):
         price = prices.get(sym, 0)
         avg = to_float(pos.get("avg", 0))
         if price <= 0 or avg <= 0:
             continue
         high = max(to_float(pos.get("high_after_buy", avg)), price)
+        stage = int(to_float(pos.get("stage", 1)))
+        strategy = pos.get("strategy", "SWING")
         with LOCK:
             if sym in S["paper"]["positions"]:
                 S["paper"]["positions"][sym]["high_after_buy"] = high
         profit = pct(price, avg)
         drop = pct(price, high) if high else 0
-        sig = signals.get(sym, {})
-        score = to_float(sig.get("score", 50))
-        if profit <= th["stop"] or score <= th["score_sell"]:
-            paper_sell(sym, 1.0, "AI 가상 자동 매도: 손실/점수 약화")
-        elif profit >= th["protect_profit"] and drop <= th["trail_soft"]:
-            paper_sell(sym, 0.5, "AI 가상 자동 분할익절: 수익권 고점 이탈")
-        elif profit >= th["protect_profit"] and drop <= th["trail_hard"]:
-            paper_sell(sym, 1.0, "AI 가상 자동 전량익절: 수익권 강한 고점 이탈")
+
+        sell_reason = ""
+        if profit <= -3.0:
+            sell_reason = f"AI 자동 손절 {profit:.2f}%"
+        elif is_inverse_symbol(sym) and mode in ["UP", "SEMI_LEADER_UP"]:
+            sell_reason = "AI 자동매도: 인버스 보유 중 상승/반도체 주도 전환"
+        elif (not is_inverse_symbol(sym)) and mode == "DOWN":
+            sell_reason = "AI 자동매도: 롱 보유 중 DOWN 전환"
+        elif is_after_or_equal_hhmm(NO_NEW_BUY_AFTER) and profit >= 1.0 and drop <= -1.5:
+            sell_reason = f"AI 자동 수익보호: 14:30 이후 고점대비 {drop:.2f}%"
+        elif profit >= 1.0 and drop <= -3.0:
+            sell_reason = f"AI 자동 추적익절: 고점대비 {drop:.2f}%"
+        elif strategy == "DAYTRADE" and time_after_hhmm(DAYTRADE_FORCE_EXIT_TIME):
+            sell_reason = "AI 자동 단타 15:20 전 정리"
+
+        if sell_reason:
+            paper_sell(sym, 1.0, sell_reason)
+            continue
+
+        # 스윙 포지션은 반도체 주도/상승장이 유지되고 최대금액 전이면 단계적 추가매수
+        invested = paper_invested_amount()
+        if strategy == "SWING" and mode in ["SEMI_LEADER_UP", "UP"] and stage < 3 and invested < SWING_MAX_EXPOSURE:
+            if profit >= 0.5 or symbol_strength(sym) >= 72:
+                next_amount = SWING_BUY_STEP_AMOUNTS[min(stage, 2)]
+                paper_buy_amount(sym, next_amount, f"AI 자동 추가매수 {stage+1}단계: {mode} 강세 유지", strategy="SWING", mode=mode)
+
     with LOCK:
         has = bool(S["paper"].get("positions"))
     if has:
         update_paper_asset()
         save_state()
         return
-    # 26개 전체 중 점수 1등 후보. 단, 위험 신호는 제외.
-    candidates = []
-    for sym in ALL:
-        sig = signals.get(sym, {})
-        score = to_float(sig.get("score", 0))
-        if score >= 78 and not bad_news_risk_detected(sym):
-            candidates.append((score, sym))
-    if candidates:
-        candidates.sort(reverse=True)
-        score, sym = candidates[0]
-        paper_buy(sym, recommend_ratio(score), f"AI 가상 자동 진입: 26개 중 최고 후보 score={score}")
+
+    # 2) 신규 자동진입 판단
+    if buy_time_blocked():
+        record_paper("AI자동관망", "", 0, 0, "09:05 전 또는 14:30 이후 신규 가상매수 금지", strategy="WAIT", mode=mode, source="AUTO")
+        update_paper_asset()
+        return
+    if mode in ["CHOPPY", "NO_TRADE"]:
+        record_paper("AI자동관망", "", 0, 0, f"{mode}: 방향 없음, 가상매수 안 함", strategy="WAIT", mode=mode, source="AUTO")
+        update_paper_asset()
+        return
+
+    if mode == "SEMI_LEADER_UP":
+        sym = choose_best_symbol(SEMI_LONG_SYMBOLS)
+        if sym:
+            paper_buy_amount(sym, SWING_BUY_STEP_AMOUNTS[0], f"AI 자동 스윙 1차: 반도체 주도장 {sym}", strategy="SWING", mode=mode)
+    elif mode == "UP":
+        sym = choose_best_symbol(UP_LONG_SYMBOLS)
+        if sym:
+            paper_buy_amount(sym, SWING_BUY_STEP_AMOUNTS[0], f"AI 자동 롱 1차: 상승장 {sym}", strategy="SWING", mode=mode)
+    elif mode == "DOWN":
+        if not semiconductor_strong():
+            sym = choose_best_symbol(INVERSE_SYMBOLS)
+            if sym:
+                paper_buy_amount(sym, min(5_000_000, INVERSE_MAX_EXPOSURE), f"AI 자동 인버스 단타: DOWN {sym}", strategy="DAYTRADE", mode=mode)
+
     update_paper_asset()
     save_state()
 
@@ -2097,7 +2307,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/selfcheck":
             return self.json_response({
                 "ok": True,
-                "version": "SEMI_AUTO_HOLDING_MANAGEMENT_V2_TOKEN_RETRY",
+                "version": OPERATING_VERSION,
                 "symbols": len(ALL),
                 "real_auto_buy": False,
                 "real_auto_sell": False,
@@ -2107,7 +2317,10 @@ class Handler(BaseHTTPRequestHandler):
                 "log_root": LOG_ROOT,
                 "sellable_endpoint": "/api/v1/sellable-quantity",
                 "real_holding_management": True,
-                "paper_auto_26_symbols": ENABLE_PAPER_AUTO,
+                "paper_auto_ai_2000": ENABLE_PAPER_AUTO,
+                "operating_modes": ["SEMI_LEADER_UP", "UP", "DOWN", "CHOPPY", "NO_TRADE"],
+                "real_account_mode": "semi_auto_button_only",
+                "paper_account_mode": "auto_ai_when_ENABLE_PAPER_AUTO_true",
                 "refresh_sec": REFRESH_SEC,
                 "alert_symbols": ALERT_SYMBOLS,
                 "backup_zip": backup_zip_path(),
@@ -2129,9 +2342,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/test_telegram":
             ok, msg = send_telegram_test(); return self.result_page("텔레그램 테스트", msg)
         if path == "/test_entry":
-            send_signal_kakao(LEV, "🟢 테스트 레버리지 진입 후보"); return self.result_page("진입 알림 테스트", "카카오 버튼 알림 전송 요청 완료")
+            send_signal_kakao(LEV, "🟢 [매수-실행] 테스트"); return self.result_page("진입 알림 테스트", "카카오 버튼 알림 전송 요청 완료")
         if path == "/test_sell":
-            send_signal_kakao(LEV, "⛔ 테스트 레버리지 매도 후보"); return self.result_page("매도 알림 테스트", "카카오 버튼 알림 전송 요청 완료")
+            send_signal_kakao(LEV, "🔴 [매도-실행] 테스트"); return self.result_page("매도 알림 테스트", "카카오 버튼 알림 전송 요청 완료")
         if path == "/daytrade_exec":
             result = execute_daytrade_from_url(qs)
             return self.result_page("단타 실행 결과", json.dumps(result, ensure_ascii=False, indent=2))
@@ -2245,7 +2458,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
             pos_rows = "없음"
         real_compare = pct(S["total_value"], S["real_base_cash"]) if S["real_base_cash"] else 0
         diff = p.get("profit_rate", 0) - real_compare
-        return f"""<div class="card"><h2>AI 가상매매</h2><div class="small">가상 기준금</div><div class="big yellow">{fmt_won(VIRTUAL_BASE_CASH)}</div><div class="small">가상 시작금</div><div class="mid yellow">{fmt_won(p.get('start_cash',0))}</div><br><div class="small">가상 총자산</div><div class="big {color_class(p.get('asset',0)-p.get('start_cash',0))}">{fmt_won(p.get('asset',0))}</div><div class="{color_class(p.get('profit_rate',0))}">{p.get('profit_rate',0):.2f}%</div><br><div class="small">실제 대비 차이</div><div class="mid {color_class(diff)}">{diff:.2f}%p</div><br><div class="small">가상 보유</div><div>{pos_rows}</div><br><div class="small">마지막 행동</div><div>{safe(p.get('last_action','없음'))}</div><br><button class="paperbtn" onclick="paperBuy('{LEV}')">가상 레버 매수</button><button class="paperbtn" onclick="paperBuy('{INV}')">가상 인버스 매수</button><button class="sell" onclick="paperSell('{LEV}')">가상 레버 매도</button><button class="sell" onclick="paperSell('{INV}')">가상 인버스 매도</button></div>"""
+        return f"""<div class="card"><h2>AI 가상매매</h2><div class="small">가상 기준금 / 자동운영</div><div class="big yellow">{fmt_won(VIRTUAL_BASE_CASH)}</div><div class="small">ENABLE_PAPER_AUTO={'ON' if ENABLE_PAPER_AUTO else 'OFF'}</div><div class="small">가상 시작금</div><div class="mid yellow">{fmt_won(p.get('start_cash',0))}</div><br><div class="small">가상 총자산</div><div class="big {color_class(p.get('asset',0)-p.get('start_cash',0))}">{fmt_won(p.get('asset',0))}</div><div class="{color_class(p.get('profit_rate',0))}">{p.get('profit_rate',0):.2f}%</div><br><div class="small">실제 대비 차이</div><div class="mid {color_class(diff)}">{diff:.2f}%p</div><br><div class="small">가상 보유</div><div>{pos_rows}</div><br><div class="small">마지막 행동</div><div>{safe(p.get('last_action','없음'))}</div><br><button class="paperbtn" onclick="paperBuy('{LEV}')">가상 레버 매수</button><button class="paperbtn" onclick="paperBuy('{INV}')">가상 인버스 매수</button><button class="sell" onclick="paperSell('{LEV}')">가상 레버 매도</button><button class="sell" onclick="paperSell('{INV}')">가상 인버스 매도</button></div>"""
 
     def holdings_card(self):
         rows = ""
