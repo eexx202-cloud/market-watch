@@ -113,7 +113,7 @@ ALERT_SYMBOLS = [LEV, INV, HYNIX, "122630", "252670", "233740", "251340"]
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_2_MARKET_HOURS_PAPER_SAFE"
+OPERATING_VERSION = "OPERATING_V4_3_AFTER_HOURS_ACCOUNT_SAFE"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -141,6 +141,12 @@ DAYTRADE_FORCE_EXIT_TIME = "15:20"
 PAPER_AUTO_START = os.environ.get("PAPER_AUTO_START", "09:00")
 PAPER_AUTO_END = os.environ.get("PAPER_AUTO_END", "15:20")
 PAPER_WAIT_LOG_COOLDOWN_SEC = int(os.environ.get("PAPER_WAIT_LOG_COOLDOWN_SEC", "600"))
+
+# 실계좌 계좌조회 API 시간 제한: 장 마감 후 buying-power/holdings 반복조회 금지
+# 데이터 저장은 계속하지만, 계좌/매수가능/보유/매도가능 조회는 이 시간 안에서만 자동 갱신한다.
+ACCOUNT_REFRESH_START = os.environ.get("ACCOUNT_REFRESH_START", "08:50")
+ACCOUNT_REFRESH_END = os.environ.get("ACCOUNT_REFRESH_END", "15:35")
+INVALID_TOKEN_STATUS_COOLDOWN_SEC = int(os.environ.get("INVALID_TOKEN_STATUS_COOLDOWN_SEC", "300"))
 
 
 POSITIVE_NEWS_KEYWORDS = [
@@ -298,6 +304,23 @@ def set_status(msg):
 def is_market_watch_time():
     n = now_kst()
     return 8 <= n.hour < 16
+
+def account_api_time_open():
+    # 장 마감 후에는 buying-power/holdings/sellable 반복조회 금지.
+    # 가격/CSV 저장은 별도 루프에서 계속 유지한다.
+    sh, sm = parse_hhmm(ACCOUNT_REFRESH_START, 8, 50)
+    eh, em = parse_hhmm(ACCOUNT_REFRESH_END, 15, 35)
+    n = now_kst()
+    cur = (n.hour, n.minute)
+    return (sh, sm) <= cur <= (eh, em)
+
+def set_status_once(key, msg, cooldown=300):
+    with LOCK:
+        last = S["last_alert"].get(key, 0)
+        if time.time() - last < cooldown:
+            return
+        S["last_alert"][key] = time.time()
+    set_status(msg)
 
 def clean_name(s):
     out = str(s)
@@ -676,6 +699,12 @@ def api_get(path, params=None, account=False, timeout=10):
             r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
             data = _json_or_raw(r)
 
+            # 재시도 후에도 invalid-token이면 장외 계좌조회/토큰 갱신 흔들림으로 처리하고
+            # 빨간 오류를 반복 저장하지 않는다. 가격 저장 루프는 계속 돈다.
+            if _is_invalid_token(r.status_code, data):
+                set_status_once(f"INVALID_TOKEN_{path}", f"토스 토큰 재발급 대기: {path}", INVALID_TOKEN_STATUS_COOLDOWN_SEC)
+                return r.status_code, data
+
         # 429는 토스 요청 한도 초과다. 서버 장애가 아니므로 상태만 바꾸고 빨간 오류 폭탄은 막는다.
         if r.status_code == 429:
             set_status(f"토스 요청 제한 대기: {path}")
@@ -703,6 +732,10 @@ def api_post(path, body=None, account=False, timeout=10):
             h["Content-Type"] = "application/json"
             r = requests.post(BASE + path, headers=h, json=body or {}, timeout=timeout)
             data = _json_or_raw(r)
+
+            if _is_invalid_token(r.status_code, data):
+                set_status_once(f"INVALID_TOKEN_POST_{path}", f"토스 토큰 재발급 대기: {path}", INVALID_TOKEN_STATUS_COOLDOWN_SEC)
+                return r.status_code, data
 
         if r.status_code == 429:
             set_status(f"토스 요청 제한 대기: {path}")
@@ -1017,7 +1050,13 @@ def load_sellable_quantities():
         S["sellable"] = sellable
     return True
 
-def refresh_account_all():
+def refresh_account_all(force=False):
+    # 장 마감 후에는 계좌 API를 30초마다 때리지 않는다.
+    # 데이터 저장/가격 저장은 load_prices + write_logs가 계속 담당한다.
+    if not force and not account_api_time_open():
+        set_status_once("ACCOUNT_REFRESH_CLOSED", "장외: 계좌조회 중지, 가격/CSV 저장만 유지", 300)
+        return True
+
     with LOCK:
         has_account = bool(S["account_seq"])
     if not has_account:
@@ -1028,6 +1067,7 @@ def refresh_account_all():
         load_buying_power()
         load_holdings()
         load_sellable_quantities()
+    return True
 
 # ============================================================
 # 가격 / 지표 / 뉴스
@@ -1923,7 +1963,7 @@ def place_order_manual(sym, side, qty):
                     S["real_watch"][sym] = item
         save_state()
     send_kakao(("✅" if ok else "⚠️") + f" 실계좌 반자동 {side_kr}\n{name_of(sym)}\n수량: {qty}주\n결과: {row['status']}", APP_URL)
-    refresh_account_all()
+    refresh_account_all(force=True)
     return {"ok": ok, "data": data, "message": row["status"]}
 
 def paper_total_asset():
@@ -2163,7 +2203,7 @@ def run_paper_ai_if_enabled():
     save_state()
 
 def reset_base_and_paper():
-    refresh_account_all()
+    refresh_account_all(force=True)
     with LOCK:
         total = S["total_value"]
     if total <= 0:
@@ -2407,6 +2447,8 @@ class Handler(BaseHTTPRequestHandler):
                 "paper_auto_ai_2000": ENABLE_PAPER_AUTO,
                 "paper_auto_hours": f"{PAPER_AUTO_START}~{PAPER_AUTO_END}",
                 "paper_auto_time_open": paper_auto_time_open(),
+                "account_refresh_hours": f"{ACCOUNT_REFRESH_START}~{ACCOUNT_REFRESH_END}",
+                "account_api_time_open": account_api_time_open(),
                 "operating_modes": ["SEMI_LEADER_UP", "UP", "DOWN", "CHOPPY", "NO_TRADE"],
                 "real_account_mode": "semi_auto_button_only",
                 "paper_account_mode": "auto_ai_when_ENABLE_PAPER_AUTO_true",
