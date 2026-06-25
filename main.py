@@ -113,7 +113,7 @@ ALERT_SYMBOLS = [LEV, INV, HYNIX, "122630", "252670", "233740", "251340"]
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_AI_PAPER_AUTO_SEMI_LEADER"
+OPERATING_VERSION = "OPERATING_V4_2_MARKET_HOURS_PAPER_SAFE"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -128,10 +128,19 @@ MIN_DEFENSE_CASH = 5_000_000
 INVERSE_MAX_EXPOSURE = 8_000_000
 ORDER_SAFE_RATIO = 0.95
 
+# 토스 API 요청 제한 방어: sellable-quantity는 보유종목만, 캐시 적용
+SELLABLE_CACHE_SEC = int(os.environ.get("SELLABLE_CACHE_SEC", "180"))
+SELLABLE_MIN_QTY = int(os.environ.get("SELLABLE_MIN_QTY", "2"))
+
 # 시간 제한: 오늘 데이터 기준으로 확정
 NO_BUY_BEFORE = "09:05"
 NO_NEW_BUY_AFTER = "14:30"
 DAYTRADE_FORCE_EXIT_TIME = "15:20"
+# AI 가상계좌 자동운영 시간: 장중/정산 시간에만 작동한다.
+# 장 마감 후에는 가상매수/가상매도/가상관망 로그를 새로 만들지 않는다.
+PAPER_AUTO_START = os.environ.get("PAPER_AUTO_START", "09:00")
+PAPER_AUTO_END = os.environ.get("PAPER_AUTO_END", "15:20")
+PAPER_WAIT_LOG_COOLDOWN_SEC = int(os.environ.get("PAPER_WAIT_LOG_COOLDOWN_SEC", "600"))
 
 
 POSITIVE_NEWS_KEYWORDS = [
@@ -172,6 +181,7 @@ S = {
     "holdings": [],
     "hold_qty": {},
     "sellable": {},
+    "sellable_cache": {},
     "alerts": [],
     "last_alert": {},
     "orders": [],
@@ -659,12 +669,17 @@ def api_get(path, params=None, account=False, timeout=10):
         r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
         data = _json_or_raw(r)
 
-        # 401 invalid-token이면 토큰 캐시를 지우고 새 토큰으로 1회 재시도
+        # 401 invalid-token이면 조용히 토큰 캐시를 지우고 새 토큰으로 1회 재시도한다.
+        # 재시도까지 실패했을 때만 빨간 오류로 남긴다.
         if _is_invalid_token(r.status_code, data):
-            set_error(f"GET {path} 401 invalid-token: 토큰 재발급 후 재시도")
             clear_token()
             r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
             data = _json_or_raw(r)
+
+        # 429는 토스 요청 한도 초과다. 서버 장애가 아니므로 상태만 바꾸고 빨간 오류 폭탄은 막는다.
+        if r.status_code == 429:
+            set_status(f"토스 요청 제한 대기: {path}")
+            return r.status_code, data
 
         if r.status_code >= 400:
             set_error(f"GET {path} {r.status_code}: {str(data)[:300]}")
@@ -680,14 +695,18 @@ def api_post(path, body=None, account=False, timeout=10):
         r = requests.post(BASE + path, headers=h, json=body or {}, timeout=timeout)
         data = _json_or_raw(r)
 
-        # 주문/토큰 관련 POST도 401이면 새 토큰으로 1회 재시도
+        # 주문/토큰 관련 POST도 401이면 새 토큰으로 1회 재시도한다.
+        # 재시도까지 실패했을 때만 빨간 오류로 남긴다.
         if _is_invalid_token(r.status_code, data):
-            set_error(f"POST {path} 401 invalid-token: 토큰 재발급 후 재시도")
             clear_token()
             h = auth_headers(account)
             h["Content-Type"] = "application/json"
             r = requests.post(BASE + path, headers=h, json=body or {}, timeout=timeout)
             data = _json_or_raw(r)
+
+        if r.status_code == 429:
+            set_status(f"토스 요청 제한 대기: {path}")
+            return r.status_code, data
 
         if r.status_code >= 400:
             set_error(f"POST {path} {r.status_code}: {str(data)[:300]}")
@@ -933,34 +952,67 @@ def check_real_holding_management():
             S["real_watch"] = watch
         save_state()
 
-def load_sellable_quantities():
+def parse_sellable_qty(data):
+    r = data.get("result", data) if isinstance(data, dict) else data
+    if isinstance(r, dict):
+        for k in ["sellableQuantity", "sellableQty", "quantity", "qty"]:
+            if k in r:
+                return to_float(r[k])
+    return 0
+
+def get_sellable_quantity(sym, force=False):
+    """
+    sellable-quantity는 토스 요청 한도에 쉽게 걸린다.
+    그래서 평소에는 캐시를 쓰고, 실제 매도 실행 직전에만 force=True로 1종목 조회한다.
+    """
+    sym = str(sym or "")
+    if not sym:
+        return 0
+    now_ts = time.time()
     with LOCK:
-        targets = set(ALL.keys()) | set(S["hold_qty"].keys())
-        holding_qty = dict(S["hold_qty"])
-    sellable = {}
+        cache = S.get("sellable_cache", {}).get(sym, {})
+        holding_qty = to_float(S.get("hold_qty", {}).get(sym, 0))
+    if not force and isinstance(cache, dict):
+        cached_at = to_float(cache.get("ts", 0))
+        if cached_at and now_ts - cached_at < SELLABLE_CACHE_SEC:
+            return to_float(cache.get("qty", 0))
+
+    code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
+    if code == 200:
+        qty = parse_sellable_qty(data)
+    else:
+        # 429/일시 오류면 기존 캐시를 먼저 쓰고, 없으면 보유수량으로 fallback.
+        qty = to_float(cache.get("qty", 0)) if isinstance(cache, dict) else 0
+        if qty <= 0:
+            qty = holding_qty
+
+    with LOCK:
+        S.setdefault("sellable_cache", {})[sym] = {"qty": qty, "ts": now_ts}
+        S.setdefault("sellable", {})[sym] = qty
+    return qty
+
+def load_sellable_quantities():
+    """
+    기존처럼 26개 전 종목 sellable-quantity를 30초마다 조회하면 429가 난다.
+    이제는 실제 보유 중이고 2주 이상인 종목만 조회한다.
+    1주 테스트 포지션은 조회/알림 대상에서 제외한다.
+    """
+    with LOCK:
+        holding_qty = dict(S.get("hold_qty", {}))
+        old_sellable = dict(S.get("sellable", {}))
+
+    sellable = dict(old_sellable)
+    targets = [sym for sym, qty in holding_qty.items() if sym and to_float(qty) >= SELLABLE_MIN_QTY]
+
     for sym in targets:
-        if not sym:
-            continue
+        sellable[sym] = get_sellable_quantity(sym, force=False)
 
-        # 토스 공식 문서의 Order 그룹: sellable quantity
-        # endpoint는 /api/v1/sellable-quantity 를 사용한다.
-        # /api/v1/sellable 은 404가 나와서 사용하지 않는다.
-        code, data = api_get("/api/v1/sellable-quantity", params={"symbol": sym}, account=True, timeout=8)
+    # 보유가 사라진 종목은 sellable 표시도 정리한다.
+    active = set(targets)
+    for sym in list(sellable.keys()):
+        if sym not in active:
+            sellable.pop(sym, None)
 
-        qty = 0
-        if code == 200:
-            r = data.get("result", data)
-            if isinstance(r, dict):
-                for k in ["sellableQuantity", "sellableQty", "quantity", "qty"]:
-                    if k in r:
-                        qty = to_float(r[k])
-                        break
-        else:
-            # 매도가능수량 API가 응답하지 않으면 화면/버튼이 0으로 막히지 않도록
-            # 보유수량을 임시 fallback으로 표시한다. 실제 주문은 토스 주문 API가 최종 검증한다.
-            qty = holding_qty.get(sym, 0)
-
-        sellable[sym] = qty
     with LOCK:
         S["sellable"] = sellable
     return True
@@ -1139,6 +1191,26 @@ def is_after_or_equal_hhmm(hhmm):
 
 def buy_time_blocked():
     return is_before_hhmm(NO_BUY_BEFORE) or is_after_or_equal_hhmm(NO_NEW_BUY_AFTER)
+
+def paper_auto_time_open():
+    # AI 가상 자동운영은 지정 시간 안에서만 돈을 움직인다.
+    # 15:20 정산 신호를 처리하기 위해 종료 분까지는 허용하고, 15:21부터 완전 정지한다.
+    sh, sm = hhmm_tuple(PAPER_AUTO_START)
+    eh, em = hhmm_tuple(PAPER_AUTO_END)
+    n = now_kst()
+    cur = (n.hour, n.minute)
+    return cur >= (sh, sm) and cur <= (eh, em)
+
+def record_paper_wait_once(reason, mode):
+    # CHOPPY/NO_TRADE 관망 로그가 30초마다 쌓이는 것을 막는다.
+    key = f"PAPER_WAIT_{mode}_{reason}"
+    with LOCK:
+        last = S["last_alert"].get(key, 0)
+        if time.time() - last < PAPER_WAIT_LOG_COOLDOWN_SEC:
+            return False
+        S["last_alert"][key] = time.time()
+    record_paper("AI자동관망", "", 0, 0, reason, strategy="WAIT", mode=mode, source="AUTO")
+    return True
 
 def is_inverse_symbol(sym):
     return sym in INVERSE_SYMBOLS or "인버스" in name_of(sym)
@@ -1809,7 +1881,9 @@ def place_order_manual(sym, side, qty):
     if qty <= 0:
         return {"ok": False, "message": "수량이 0입니다."}
     if side == "SELL":
-        sellable = int(S["sellable"].get(sym, 0))
+        # 실제 매도 실행 직전에는 해당 종목 1개만 실시간 재조회한다.
+        # 평소 26개 전체 조회는 하지 않는다.
+        sellable = int(get_sellable_quantity(sym, force=True))
         if sellable <= 0:
             return {"ok": False, "message": "매도가능수량 0"}
         qty = min(qty, sellable)
@@ -1989,11 +2063,23 @@ def run_paper_ai_if_enabled():
     """AI 가상계좌 자동운영.
     ENABLE_PAPER_AUTO=true 이면 사용자가 버튼을 누르지 않아도 2천만원 기준으로
     AI가 스스로 단타/스윙/관망/인버스를 판단해 가상매수/가상매도한다.
+
+    중요:
+    - 데이터 저장은 계속 한다.
+    - AI 가상계좌가 돈을 움직이는 시간은 PAPER_AUTO_START~PAPER_AUTO_END 안에서만 허용한다.
+    - 장 마감/정산 시간 이후에는 가상매수/가상매도/가상관망 로그를 새로 만들지 않는다.
     """
     mode = operating_market_mode()
     with LOCK:
         S["daytrade"]["market_mode"] = mode
+
     if not ENABLE_PAPER_AUTO:
+        update_paper_asset()
+        return
+
+    # 장중 자동운영 시간 밖이면 아무 매매도 하지 않는다.
+    # 이미 저장된 가격/CSV/대시보드 갱신은 루프의 write_logs()가 계속 담당한다.
+    if not paper_auto_time_open():
         update_paper_asset()
         return
 
@@ -2034,9 +2120,10 @@ def run_paper_ai_if_enabled():
             paper_sell(sym, 1.0, sell_reason)
             continue
 
-        # 스윙 포지션은 반도체 주도/상승장이 유지되고 최대금액 전이면 단계적 추가매수
+        # 스윙 포지션은 반도체 주도/상승장이 유지되고 최대금액 전이면 단계적 추가매수.
+        # 단, 14:30 이후 신규/추가 가상매수는 금지한다.
         invested = paper_invested_amount()
-        if strategy == "SWING" and mode in ["SEMI_LEADER_UP", "UP"] and stage < 3 and invested < SWING_MAX_EXPOSURE:
+        if (not buy_time_blocked()) and strategy == "SWING" and mode in ["SEMI_LEADER_UP", "UP"] and stage < 3 and invested < SWING_MAX_EXPOSURE:
             if profit >= 0.5 or symbol_strength(sym) >= 72:
                 next_amount = SWING_BUY_STEP_AMOUNTS[min(stage, 2)]
                 paper_buy_amount(sym, next_amount, f"AI 자동 추가매수 {stage+1}단계: {mode} 강세 유지", strategy="SWING", mode=mode)
@@ -2050,11 +2137,11 @@ def run_paper_ai_if_enabled():
 
     # 2) 신규 자동진입 판단
     if buy_time_blocked():
-        record_paper("AI자동관망", "", 0, 0, "09:05 전 또는 14:30 이후 신규 가상매수 금지", strategy="WAIT", mode=mode, source="AUTO")
+        record_paper_wait_once("09:05 전 또는 14:30 이후 신규 가상매수 금지", mode)
         update_paper_asset()
         return
     if mode in ["CHOPPY", "NO_TRADE"]:
-        record_paper("AI자동관망", "", 0, 0, f"{mode}: 방향 없음, 가상매수 안 함", strategy="WAIT", mode=mode, source="AUTO")
+        record_paper_wait_once(f"{mode}: 방향 없음, 가상매수 안 함", mode)
         update_paper_asset()
         return
 
@@ -2318,6 +2405,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sellable_endpoint": "/api/v1/sellable-quantity",
                 "real_holding_management": True,
                 "paper_auto_ai_2000": ENABLE_PAPER_AUTO,
+                "paper_auto_hours": f"{PAPER_AUTO_START}~{PAPER_AUTO_END}",
+                "paper_auto_time_open": paper_auto_time_open(),
                 "operating_modes": ["SEMI_LEADER_UP", "UP", "DOWN", "CHOPPY", "NO_TRADE"],
                 "real_account_mode": "semi_auto_button_only",
                 "paper_account_mode": "auto_ai_when_ENABLE_PAPER_AUTO_true",
