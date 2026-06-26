@@ -43,24 +43,24 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "20000000")))
 # ============================================================
-# 단타 전용 설정
-# - 기존 하이닉스 레버리지 보유분은 복구용으로 분리
-# - 800만원 단타 시드는 당일청산 / 수익 재투자
+# 구 구 단타 단타 엔진 제거
+# - 실계좌는 V4.10 목표 패턴 알림만 사용
+# - 과거 DAYTRADE 엔진/시드/리셋/실행 URL은 비활성화
 # ============================================================
-ENABLE_DAYTRADE = os.environ.get("ENABLE_DAYTRADE", "true").lower() == "true"
-DAYTRADE_BASE_CASH = int(float(os.environ.get("DAYTRADE_BASE_CASH", "8000000")))
+ENABLE_DAYTRADE = False
+DAYTRADE_BASE_CASH = 0
 DAYTRADE_STATE_PATH = os.environ.get("DAYTRADE_STATE_PATH", "daytrade_state.json")
-DAYTRADE_EXEC_TOKEN = os.environ.get("DAYTRADE_EXEC_TOKEN", "").strip()
-DAYTRADE_MAX_TRADES = int(os.environ.get("DAYTRADE_MAX_TRADES", "3"))
-DAYTRADE_TP_START = float(os.environ.get("DAYTRADE_TP_START", "1.0"))
-DAYTRADE_TP_HARD = float(os.environ.get("DAYTRADE_TP_HARD", "3.0"))
-DAYTRADE_STOP_LOSS = float(os.environ.get("DAYTRADE_STOP_LOSS", "-2.0"))
-DAYTRADE_TRAIL_DROP = float(os.environ.get("DAYTRADE_TRAIL_DROP", "0.6"))
-DAYTRADE_NO_ENTRY_AFTER = os.environ.get("DAYTRADE_NO_ENTRY_AFTER", "15:05")
-DAYTRADE_FORCE_EXIT_AFTER = os.environ.get("DAYTRADE_FORCE_EXIT_AFTER", "15:18")
-DAYTRADE_CUTOFF = os.environ.get("DAYTRADE_CUTOFF", "15:20")
-DAYTRADE_AUTO_FORCE_SELL = os.environ.get("DAYTRADE_AUTO_FORCE_SELL", "false").lower() == "true"
-DAYTRADE_ALERT_COOLDOWN_SEC = int(os.environ.get("DAYTRADE_ALERT_COOLDOWN_SEC", "180"))
+DAYTRADE_EXEC_TOKEN = ""
+DAYTRADE_MAX_TRADES = 0
+DAYTRADE_TP_START = 1.0
+DAYTRADE_TP_HARD = 3.0
+DAYTRADE_STOP_LOSS = -2.0
+DAYTRADE_TRAIL_DROP = 0.6
+DAYTRADE_NO_ENTRY_AFTER = "14:30"
+DAYTRADE_FORCE_EXIT_AFTER = "15:20"
+DAYTRADE_CUTOFF = "15:20"
+DAYTRADE_AUTO_FORCE_SELL = False
+DAYTRADE_ALERT_COOLDOWN_SEC = 180
 # 실계좌 보유관리 알림 기준: 고정 손절만이 아니라 시장 강도에 따라 조절됨
 HOLDING_ALERT_COOLDOWN_SEC = int(os.environ.get("HOLDING_ALERT_COOLDOWN_SEC", "300"))
 LOG_ROOT = os.environ.get("LOG_ROOT", "/tmp/logs")
@@ -107,13 +107,19 @@ PRIMARY = [LEV, INV, "122630", "252670", "233740", "251340", "0193W0", "0193L0",
 # 알림 대상은 실전 핵심 종목만 제한. 미정의로 루프가 죽지 않게 반드시 정의한다.
 ALERT_SYMBOLS = [LEV, INV, HYNIX, "122630", "252670", "233740", "251340"]
 
+# V4.10 실계좌 판단 대상: 시장상황 핵심 종목
+REAL_LONG_PRIORITY = [LEV, "494310", "0193W0", "122630", "233740"]
+REAL_INVERSE_PRIORITY = ["252670", "251340", INV, "0193L0"]
+REAL_TARGET_SYMBOLS = list(dict.fromkeys(REAL_LONG_PRIORITY + REAL_INVERSE_PRIORITY + [HYNIX, "005930", "069500", "229200"]))
+ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
+
 
 # ============================================================
 # OPERATING V4 최종 운영 규칙
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_3_AFTER_HOURS_ACCOUNT_SAFE"
+OPERATING_VERSION = "OPERATING_V4_10_UNIFIED_TARGET_PATTERN_FINAL"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -125,7 +131,7 @@ OBSERVE_ONLY_SYMBOLS = ["0100K0", "0080Y0", "462330", "0177X0", "445290", "43350
 SWING_BUY_STEP_AMOUNTS = [7_000_000, 4_000_000, 4_000_000]
 SWING_MAX_EXPOSURE = 15_000_000
 MIN_DEFENSE_CASH = 5_000_000
-INVERSE_MAX_EXPOSURE = 8_000_000
+INVERSE_MAX_EXPOSURE = 15_000_000
 ORDER_SAFE_RATIO = 0.95
 
 # 토스 API 요청 제한 방어: sellable-quantity는 보유종목만, 캐시 적용
@@ -133,7 +139,7 @@ SELLABLE_CACHE_SEC = int(os.environ.get("SELLABLE_CACHE_SEC", "180"))
 SELLABLE_MIN_QTY = int(os.environ.get("SELLABLE_MIN_QTY", "2"))
 
 # 시간 제한: 오늘 데이터 기준으로 확정
-NO_BUY_BEFORE = "09:05"
+NO_BUY_BEFORE = "09:30"
 NO_NEW_BUY_AFTER = "14:30"
 DAYTRADE_FORCE_EXIT_TIME = "15:20"
 # AI 가상계좌 자동운영 시간: 장중/정산 시간에만 작동한다.
@@ -147,6 +153,24 @@ PAPER_WAIT_LOG_COOLDOWN_SEC = int(os.environ.get("PAPER_WAIT_LOG_COOLDOWN_SEC", 
 ACCOUNT_REFRESH_START = os.environ.get("ACCOUNT_REFRESH_START", "08:50")
 ACCOUNT_REFRESH_END = os.environ.get("ACCOUNT_REFRESH_END", "15:35")
 INVALID_TOKEN_STATUS_COOLDOWN_SEC = int(os.environ.get("INVALID_TOKEN_STATUS_COOLDOWN_SEC", "300"))
+
+# ============================================================
+# V4.10 목표 패턴 설정
+# - 리플레이/실시간/AI 가상/실계좌 알림이 같은 판단 함수를 사용하도록 통합
+# ============================================================
+TARGET_PATTERN_ENABLED = True
+SCORE_BUY_DISABLED = True
+LEGACY_DAYTRADE_REMOVED = True
+TARGET_PATTERN_LOOKBACK_POINTS = int(os.environ.get("TARGET_PATTERN_LOOKBACK_POINTS", "600"))
+TARGET_LONG_PULLBACK_PCT = float(os.environ.get("TARGET_LONG_PULLBACK_PCT", "8.0"))
+TARGET_LONG_MAJOR_PULLBACK_PCT = float(os.environ.get("TARGET_LONG_MAJOR_PULLBACK_PCT", "10.0"))
+TARGET_REBREAK_BUFFER_PCT = float(os.environ.get("TARGET_REBREAK_BUFFER_PCT", "0.15"))
+TARGET_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("TARGET_MAX_REAL_ALERTS_PER_DAY", "3"))
+TARGET_REAL_ALERT_COOLDOWN_SEC = int(os.environ.get("TARGET_REAL_ALERT_COOLDOWN_SEC", "600"))
+TARGET_PAPER_MIN_HOLD_SEC = int(os.environ.get("TARGET_PAPER_MIN_HOLD_SEC", "900"))
+TARGET_PAPER_REENTRY_COOLDOWN_SEC = int(os.environ.get("TARGET_PAPER_REENTRY_COOLDOWN_SEC", "900"))
+TARGET_PAPER_MAX_TRADES_PER_DAY = int(os.environ.get("TARGET_PAPER_MAX_TRADES_PER_DAY", "8"))
+
 
 
 POSITIVE_NEWS_KEYWORDS = [
@@ -206,12 +230,19 @@ S = {
     },
     "daytrade": {
         "date": "",
-        "cash": DAYTRADE_BASE_CASH,
+        "cash": 0,
         "trade_count": 0,
         "position": None,
-        "market_mode": "대기",
+        "market_mode": "LEGACY_REMOVED",
         "pending": None,
         "trades": [],
+        "last_action": "구 구 단타 단타 제거",
+    },
+    "target_pattern": {
+        "date": "",
+        "sent_count": 0,
+        "stages": {},
+        "last_choice": {},
         "last_action": "없음",
     },
 }
@@ -1095,8 +1126,8 @@ def load_prices():
             S["prices"][sym] = price
             hist = S["history"].setdefault(sym, [])
             hist.append(price)
-            if len(hist) > 240:
-                del hist[:-240]
+            if len(hist) > TARGET_PATTERN_LOOKBACK_POINTS:
+                del hist[:-TARGET_PATTERN_LOOKBACK_POINTS]
             S["high"][sym] = max(S["high"].get(sym, price), price)
             S["low"][sym] = min(S["low"].get(sym, price), price)
             cnt += 1
@@ -1504,28 +1535,264 @@ def maybe_alert():
     mode = operating_market_mode()
     # CHOPPY/NO_TRADE는 매수 후보 알림 대신 금지성 메시지만 쿨다운 전송
     if mode in ["CHOPPY", "NO_TRADE"]:
-        key = f"NO_BUY_{mode}"
-        with LOCK:
-            last = S["last_alert"].get(key, 0)
-            if time.time() - last >= max(ALERT_COOLDOWN_SEC, 600):
-                S["last_alert"][key] = time.time()
-                send_telegram(
-                    f"⛔ [금지]\n시장상태: {mode}\n행동: 신규매수 금지 / 관찰만\n시간: {now_short()}",
-                    [[telegram_button("📊 대시보드", APP_URL)]],
-                )
         return
 
     for sym in ALERT_SYMBOLS:
         if bad_news_risk_detected(sym):
             send_alert_once(f"RISK_{sym}", sym, "⚠️ 악재성 급락 의심")
 
+
 # ============================================================
-# 800만원 단타 전용 엔진
-# - 시장상황별: UP / DOWN / CHOPPY / NO_TRADE
-# - Telegram 버튼 URL 클릭 시 /daytrade_exec 에서 주문 실행
-# - 토스 주문 API는 기존 place_order_manual()을 사용한다.
+# V4.10 목표 패턴 공통 판단 함수
+# - 리플레이/실시간/AI가상/실계좌 알림이 이 함수를 같이 사용해야 함
 # ============================================================
 
+def target_pattern_reset_if_new_day():
+    with LOCK:
+        tp = S.setdefault("target_pattern", {})
+        if tp.get("date") != today():
+            S["target_pattern"] = {
+                "date": today(),
+                "sent_count": 0,
+                "stages": {},
+                "last_choice": {},
+                "last_action": "새 장 시작",
+            }
+
+def target_market_regime():
+    """시장상황 분류: RECOVERY/UP/DOWN/CHOPPY/NO_TRADE.
+    점수형 매수는 쓰지 않고, 롱/인버스 그룹의 실제 흐름으로 먼저 분류한다.
+    """
+    long_syms = [LEV, "494310", "0193W0", "122630", "233740"]
+    inv_syms = ["252670", "251340", INV, "0193L0"]
+
+    def avg_change(syms):
+        vals = [price_change_pct(s) for s in syms if S["prices"].get(s, 0) > 0]
+        return sum(vals) / len(vals) if vals else 0
+
+    def avg_low_rise(syms):
+        vals = [low_rise_pct(s) for s in syms if S["prices"].get(s, 0) > 0]
+        return sum(vals) / len(vals) if vals else 0
+
+    def avg_high_drop(syms):
+        vals = [high_drop_pct(s) for s in syms if S["prices"].get(s, 0) > 0]
+        return sum(vals) / len(vals) if vals else 0
+
+    long_chg = avg_change(long_syms)
+    inv_chg = avg_change(inv_syms)
+    long_drop = avg_high_drop(long_syms)
+    inv_drop = avg_high_drop(inv_syms)
+    long_rise = avg_low_rise(long_syms)
+
+    if inv_chg >= 0.4 and long_chg <= -0.25 and long_drop <= -1.0:
+        return "DOWN"
+    if long_chg >= 0.35 and inv_chg <= 0.2:
+        return "UP"
+    # 큰 하락 후 저점 대비 회복: 24일 같은 회복장
+    if long_drop <= -TARGET_LONG_PULLBACK_PCT and long_rise >= 2.0 and inv_chg < 1.0:
+        return "RECOVERY"
+    movers = sum(1 for s in long_syms + inv_syms if abs(price_change_pct(s)) >= 0.3)
+    mixed = (long_chg > 0 and inv_chg > 0) or (long_chg < 0 and inv_chg < 0)
+    if movers >= 3 and mixed:
+        return "CHOPPY"
+    return "NO_TRADE"
+
+def target_symbol_priority(mode):
+    if mode == "DOWN":
+        return REAL_INVERSE_PRIORITY
+    if mode in ["UP", "RECOVERY"]:
+        return REAL_LONG_PRIORITY
+    return []
+
+def target_rebreak_ready(sym, mode):
+    """첫 반등 금지 + 반등 고점 재돌파 확인.
+    현재까지 들어온 history만 사용하므로 미래 데이터 사용이 없다.
+    """
+    hist = S["history"].get(sym, [])
+    if len(hist) < 10:
+        return False, "history 부족"
+
+    cur = hist[-1]
+    first = hist[0]
+    hi = max(hist)
+    lo = min(hist)
+    hi_idx = hist.index(hi)
+    lo_idx = hist.index(lo)
+    pullback = pct(lo, hi)
+    rise_from_low = pct(cur, lo)
+    chg_from_first = pct(cur, first)
+
+    # 하락장 인버스: 26일 같은 날은 인버스 조기 진입 허용
+    if mode == "DOWN":
+        if not is_inverse_symbol(sym):
+            return False, "DOWN인데 인버스 아님"
+        inv_group_ok = inverse_market_confirmed() or price_change_pct(sym) >= 0.4 or low_rise_pct(sym) >= 1.0
+        long_weak = sum(1 for s in [LEV, "0193W0", "122630", "233740", "494310"] if high_drop_pct(s) <= -1.0 or price_change_pct(s) <= -0.3)
+        if inv_group_ok and long_weak >= 3 and rise_from_low >= 0.7:
+            return True, f"하락장 인버스 조기확인: 롱약세={long_weak}, 저점대비={rise_from_low:.2f}%"
+        return False, "인버스 확인 부족"
+
+    if mode not in ["UP", "RECOVERY"]:
+        return False, f"{mode} 매수대상 아님"
+    if is_inverse_symbol(sym):
+        return False, "롱 모드에서 인버스 제외"
+
+    # 큰 눌림 요건. 회복장은 더 강하게 확인.
+    need_pullback = -TARGET_LONG_MAJOR_PULLBACK_PCT if mode == "RECOVERY" else -TARGET_LONG_PULLBACK_PCT
+    if pullback > need_pullback:
+        return False, f"큰 눌림 부족 {pullback:.2f}%"
+
+    # 저점이 고점 이후에 나와야 정상적인 눌림.
+    if lo_idx <= hi_idx:
+        return False, "저점이 고점 이후 구조가 아님"
+
+    after_low = hist[lo_idx:]
+    if len(after_low) < 5:
+        return False, "저점 후 확인 부족"
+    # 첫 반등 고점과 그 이후 눌림을 확인.
+    rebound_window = after_low[:max(3, min(20, len(after_low)))]
+    first_rebound_high = max(rebound_window)
+    # 첫 반등 고점 돌파 버퍼
+    rebreak_level = first_rebound_high * (1 + TARGET_REBREAK_BUFFER_PCT / 100)
+    if cur < rebreak_level:
+        return False, f"재돌파 전: 현재 {cur:.0f} < {rebreak_level:.0f}"
+    if rise_from_low < 2.0:
+        return False, f"저점대비 회복 부족 {rise_from_low:.2f}%"
+
+    # 반대 인버스가 여전히 강하면 롱 금지.
+    inv_too_strong = any(price_change_pct(s) > 0.5 and low_rise_pct(s) > 1.0 for s in REAL_INVERSE_PRIORITY)
+    if inv_too_strong and mode != "UP":
+        return False, "인버스 동시강세"
+
+    return True, f"{mode} 재돌파 확인: 눌림={pullback:.2f}%, 저점대비={rise_from_low:.2f}%"
+
+def target_choose_symbol(mode):
+    for sym in target_symbol_priority(mode):
+        if S["prices"].get(sym, 0) <= 0:
+            continue
+        ok, reason = target_rebreak_ready(sym, mode)
+        if ok:
+            return sym, reason
+    return None, "조건 충족 종목 없음"
+
+def target_next_stage_amount(sym):
+    with LOCK:
+        stages = S.setdefault("target_pattern", {}).setdefault("stages", {})
+        stage = int(stages.get(sym, 0))
+    if stage >= len(SWING_BUY_STEP_AMOUNTS):
+        return 0, stage
+    return SWING_BUY_STEP_AMOUNTS[stage], stage + 1
+
+def send_real_pattern_buy_alert(sym, amount, stage, reason):
+    price = S["prices"].get(sym, 0)
+    qty = int((amount * ORDER_SAFE_RATIO) // price) if price > 0 else 0
+    if qty <= 0:
+        return False
+    key = f"TARGET_BUY_{today()}_{sym}_{stage}"
+    with LOCK:
+        last = S["last_alert"].get(key, 0)
+        if time.time() - last < TARGET_REAL_ALERT_COOLDOWN_SEC:
+            return False
+        S["last_alert"][key] = time.time()
+        S.setdefault("target_pattern", {}).setdefault("stages", {})[sym] = stage
+        S["target_pattern"]["sent_count"] = int(S["target_pattern"].get("sent_count", 0)) + 1
+        S["target_pattern"]["last_action"] = f"{now_short()} 목표패턴 매수알림 {name_of(sym)} {stage}단계"
+    title = f"🟢 매수"
+    msg = (
+        f"{title}\n"
+        f"종목: {name_of(sym)} ({sym})\n"
+        f"단계: {stage}차\n"
+        f"금액: {fmt_won(amount)}\n"
+        f"추천수량: {qty}주\n"
+        f"현재가: {fmt_won(price)}\n"
+        f"시장: {target_market_regime()}\n"
+        f"이유: {reason}\n"
+        f"실제 주문은 확인 화면에서 최종 실행"
+    )
+    url = confirm_url(sym, "BUY", qty)
+    add_alert(msg)
+    send_telegram(msg, [[telegram_button("🟢 매수 확인", url)], [telegram_button("📊 대시보드", APP_URL)]])
+    write_alert_log("REAL", "target_buy", sym, price, 0, "BUY", reason, True, "telegram")
+    return True
+
+def send_real_pattern_sell_alert(sym, qty, reason):
+    price = S["prices"].get(sym, 0)
+    if qty <= 0:
+        qty = int(S["sellable"].get(sym, 0) or S["hold_qty"].get(sym, 0) or 0)
+    if qty <= 0:
+        return False
+    key = f"TARGET_SELL_{today()}_{sym}_{reason}"
+    with LOCK:
+        last = S["last_alert"].get(key, 0)
+        if time.time() - last < 300:
+            return False
+        S["last_alert"][key] = time.time()
+        S["target_pattern"]["last_action"] = f"{now_short()} 목표패턴 매도알림 {name_of(sym)}"
+    msg = (
+        f"🔴 매도\n"
+        f"종목: {name_of(sym)} ({sym})\n"
+        f"수량: {qty}주\n"
+        f"현재가: {fmt_won(price)}\n"
+        f"이유: {reason}\n"
+        f"실제 주문은 확인 화면에서 최종 실행"
+    )
+    url = confirm_url(sym, "SELL", qty)
+    add_alert(msg)
+    send_telegram(msg, [[telegram_button("🔴 매도 확인", url)], [telegram_button("📊 대시보드", APP_URL)]])
+    write_alert_log("REAL", "target_sell", sym, price, 0, "SELL", reason, True, "telegram")
+    return True
+
+def run_real_pattern_alert_engine():
+    """실계좌용 목표 패턴 알림 엔진.
+    자동주문은 하지 않고 텔레그램 매수/매도 확인 버튼만 보낸다.
+    """
+    if not TARGET_PATTERN_ENABLED:
+        return
+    target_pattern_reset_if_new_day()
+
+    # 보유 중이면 매도 알림부터 본다.
+    with LOCK:
+        watch = dict(S.get("real_watch", {}))
+    mode = target_market_regime()
+    for sym, item in watch.items():
+        qty = int(to_float(item.get("qty", 0)))
+        if qty <= 1:
+            continue
+        price = S["prices"].get(sym, 0)
+        buy = to_float(item.get("buy_price", 0))
+        high = max(to_float(item.get("high_after_buy", buy)), price)
+        if price <= 0 or buy <= 0:
+            continue
+        profit = pct(price, buy)
+        drop = pct(price, high) if high else 0
+        if is_after_or_equal_hhmm(DAYTRADE_FORCE_EXIT_TIME):
+            send_real_pattern_sell_alert(sym, qty, "15:20 전 당일청산")
+        elif profit >= 0.5 and is_after_or_equal_hhmm(NO_NEW_BUY_AFTER) and drop <= -3.0:
+            send_real_pattern_sell_alert(sym, qty, f"수익권 고점대비 {drop:.2f}% 이탈")
+        elif (not is_inverse_symbol(sym)) and mode == "DOWN":
+            send_real_pattern_sell_alert(sym, qty, "롱 보유 중 하락장 전환")
+        elif is_inverse_symbol(sym) and mode in ["UP", "RECOVERY"]:
+            send_real_pattern_sell_alert(sym, qty, "인버스 보유 중 상승/회복장 전환")
+
+    # 신규/추가 매수 알림
+    if buy_time_blocked():
+        return
+    with LOCK:
+        sent_count = int(S.get("target_pattern", {}).get("sent_count", 0))
+    if sent_count >= TARGET_MAX_REAL_ALERTS_PER_DAY:
+        return
+    if mode in ["CHOPPY", "NO_TRADE"]:
+        return
+
+    sym, reason = target_choose_symbol(mode)
+    if not sym:
+        return
+    amount, stage = target_next_stage_amount(sym)
+    if amount <= 0:
+        return
+    send_real_pattern_buy_alert(sym, amount, stage, reason)
+
+# 구 단타 관련 기존 시간 함수는 호환용으로만 남긴다.
 def parse_hhmm(s, default_h=15, default_m=20):
     try:
         h, m = str(s).split(":")
@@ -1766,145 +2033,11 @@ def daytrade_close_position(reason="단타 청산"):
     return {"ok": True, "message": f"단타 매도 완료: {name_of(sym)} {pnl_pct:.2f}% / 시드 {fmt_won(cash_after)}"}
 
 def run_daytrade_engine():
-    if not ENABLE_DAYTRADE:
-        return
-    reset_daytrade_if_new_day()
-    if not daytrade_time_open():
-        return
-
-    mode = daytrade_market_mode()
-    with LOCK:
-        S["daytrade"]["market_mode"] = mode
-    save_daytrade_state()
-
-    with LOCK:
-        pos = S["daytrade"].get("position")
-        trade_count = int(S["daytrade"].get("trade_count", 0))
-
-    # 보유 중이면 매도 판단
-    if pos:
-        sym = pos.get("symbol")
-        cur = S["prices"].get(sym, 0)
-        if cur <= 0:
-            return
-        high = max(to_float(pos.get("highest_price", cur)), cur)
-        low = min(to_float(pos.get("lowest_price", cur)), cur)
-        pos["highest_price"] = high
-        pos["lowest_price"] = low
-        with LOCK:
-            S["daytrade"]["position"] = pos
-        save_daytrade_state()
-
-        pnl = daytrade_position_profit(pos, cur)
-        high_pnl = pct(high, to_float(pos.get("entry_price", cur)))
-        drop_from_high = pct(cur, high) if high else 0
-
-        reason = ""
-        if time_after_hhmm(DAYTRADE_FORCE_EXIT_TIME):
-            reason = "15:20 전 정산"
-        elif pnl <= DAYTRADE_STOP_LOSS:
-            reason = f"손절 {pnl:.2f}%"
-        elif is_after_or_equal_hhmm(NO_NEW_BUY_AFTER) and high_pnl >= 1.0 and drop_from_high <= -1.5:
-            reason = f"14:30 이후 수익보호 고점대비 {drop_from_high:.2f}%"
-        elif high_pnl >= DAYTRADE_TP_START and drop_from_high <= -max(DAYTRADE_TRAIL_DROP, 0.8):
-            reason = f"추적익절 고점대비 {drop_from_high:.2f}%"
-        elif pnl >= DAYTRADE_TP_HARD and mode not in ["UP", "SEMI_LEADER_UP"]:
-            reason = f"목표익절 {pnl:.2f}%"
-        elif pos.get("action") in ["BUY"] and mode == "DOWN":
-            reason = "시장 하락 전환"
-        elif pos.get("action") in ["INVERSE"] and mode in ["UP", "SEMI_LEADER_UP"]:
-            reason = "시장 상승/반도체 주도 전환"
-
-        if reason:
-            if DAYTRADE_AUTO_FORCE_SELL and time_after_hhmm(DAYTRADE_FORCE_EXIT_TIME):
-                res = daytrade_close_position(reason)
-                send_telegram("⏰ 단타 자동 정산 결과\n" + str(res), [[telegram_button("📊 대시보드", APP_URL)]])
-            else:
-                pending = daytrade_make_signal("SELL", sym, reason)
-                pending["qty"] = pos.get("qty", 0)
-                daytrade_alert_once(f"DAYTRADE_SELL_{sym}_{reason}", pending, cooldown=60)
-        return
-
-    # 신규진입 금지 시간/상태
-    if buy_time_blocked():
-        return
-    if mode in ["CHOPPY", "NO_TRADE"]:
-        return
-    if trade_count >= DAYTRADE_MAX_TRADES:
-        return
-
-    sym = daytrade_candidate_for_mode(mode)
-    if not sym:
-        return
-    qty = daytrade_calc_qty(sym)
-    if qty <= 0:
-        return
-
-    action = "INVERSE" if mode == "DOWN" and is_inverse_symbol(sym) else "BUY"
-    if action == "BUY" and is_inverse_symbol(sym):
-        return
-    if action == "INVERSE" and not is_inverse_symbol(sym):
-        return
-    reason = f"{mode} 실행 신호 / 점수 {S['signals'].get(sym, {}).get('score', 0)} / 후보제한 통과"
-    pending = daytrade_make_signal(action, sym, reason)
-    daytrade_alert_once(f"DAYTRADE_BUY_{mode}_{sym}", pending, cooldown=900)
+    # 구 구 단타 단타 엔진은 V4.10에서 제거.
+    return
 
 def execute_daytrade_from_url(qs):
-    token = (qs.get("token") or [""])[0]
-    action = (qs.get("action") or [""])[0]
-    signal = (qs.get("signal") or [""])[0]
-
-    if not DAYTRADE_EXEC_TOKEN:
-        return {"ok": False, "message": "DAYTRADE_EXEC_TOKEN 미설정. 보안상 실행 차단."}
-    if token != DAYTRADE_EXEC_TOKEN:
-        return {"ok": False, "message": "실행 토큰 불일치"}
-    if not daytrade_time_open():
-        return {"ok": False, "message": "단타 가능 시간이 아닙니다"}
-
-    with LOCK:
-        pending = S["daytrade"].get("pending")
-    if not pending or pending.get("id") != signal:
-        return {"ok": False, "message": "만료되었거나 다른 신호입니다"}
-
-    sym = pending.get("symbol")
-    if sym not in ALL:
-        return {"ok": False, "message": "허용되지 않은 종목"}
-
-    # 주문 직전 재검사: 시간/시장상태/종목 방향/수량
-    mode = daytrade_market_mode()
-    if action in ["BUY", "INVERSE"]:
-        if buy_time_blocked():
-            log_execution_block("09:05 전 또는 14:30 이후 신규매수 차단", sym)
-            return {"ok": False, "message": "신규매수 금지 시간입니다. 09:05 전/14:30 이후 차단."}
-        if mode in ["CHOPPY", "NO_TRADE"]:
-            log_execution_block(f"{mode} 신규매수 차단", sym)
-            return {"ok": False, "message": f"시장상태 {mode}: 신규매수 금지"}
-        if action == "BUY" and mode == "DOWN":
-            return {"ok": False, "message": "하락장에서는 롱 매수 차단"}
-        if action == "BUY" and is_inverse_symbol(sym):
-            return {"ok": False, "message": "롱 매수 신호에서 인버스 종목 차단"}
-        if action == "INVERSE":
-            if mode != "DOWN" or semiconductor_strong():
-                return {"ok": False, "message": "인버스는 확실한 DOWN에서만 허용"}
-            if not is_inverse_symbol(sym):
-                return {"ok": False, "message": "인버스 신호인데 인버스 종목이 아님"}
-
-    price = S["prices"].get(sym, 0)
-    qty = int(to_float(pending.get("qty", 0)))
-    if action in ["BUY", "INVERSE"]:
-        qty = daytrade_calc_qty(sym)
-        if qty <= 0:
-            return {"ok": False, "message": "매수 가능 수량 0"}
-
-    if action in ["BUY", "INVERSE"]:
-        return daytrade_open_position(action, sym, qty, price)
-    if action == "SELL":
-        return daytrade_close_position(pending.get("reason", "텔레그램 매도"))
-    return {"ok": False, "message": "알 수 없는 단타 명령"}
-
-# ============================================================
-# 실계좌 반자동 주문 / 가상매매
-# ============================================================
+    return {"ok": False, "message": "구 구 단타 단타 실행 URL은 V4.10에서 제거되었습니다. 텔레그램 🟢/🔴 목표패턴 확인 버튼을 사용하세요."}
 
 def record_order(row):
     with LOCK:
@@ -2109,7 +2242,7 @@ def run_paper_ai_if_enabled():
     - AI 가상계좌가 돈을 움직이는 시간은 PAPER_AUTO_START~PAPER_AUTO_END 안에서만 허용한다.
     - 장 마감/정산 시간 이후에는 가상매수/가상매도/가상관망 로그를 새로 만들지 않는다.
     """
-    mode = operating_market_mode()
+    mode = target_market_regime()
     with LOCK:
         S["daytrade"]["market_mode"] = mode
 
@@ -2336,7 +2469,6 @@ def maybe_send_daily_backup():
 
 def loop():
     load_state()
-    load_daytrade_state()
     get_token()
     refresh_account_all()
     load_prices()
@@ -2371,11 +2503,11 @@ def loop():
             write_logs()
             update_paper_asset()
 
-            # 2-1) 800만원 단타 엔진: 시장상태별 진입/청산 신호와 텔레그램 실행 버튼 생성
+            # 2-1) V4.10 목표 패턴 실계좌 알림 엔진
             try:
-                run_daytrade_engine()
+                run_real_pattern_alert_engine()
             except Exception as e:
-                set_error(f"단타엔진 오류: {e}")
+                set_error(f"목표패턴 엔진 오류: {e}")
 
             # 3) 알림/보유관리/가상매매는 각각 분리해서 하나가 터져도 루프 전체가 죽지 않게 한다.
             try:
@@ -2455,10 +2587,15 @@ class Handler(BaseHTTPRequestHandler):
                 "refresh_sec": REFRESH_SEC,
                 "alert_symbols": ALERT_SYMBOLS,
                 "backup_zip": backup_zip_path(),
-                "daytrade_enabled": ENABLE_DAYTRADE,
-                "daytrade_cash": S["daytrade"].get("cash", DAYTRADE_BASE_CASH),
-                "daytrade_market_mode": S["daytrade"].get("market_mode", "대기"),
-                "daytrade_exec_token_set": bool(DAYTRADE_EXEC_TOKEN),
+                "legacy_daytrade_removed": LEGACY_DAYTRADE_REMOVED,
+                "score_buy_disabled": SCORE_BUY_DISABLED,
+                "target_pattern_enabled": TARGET_PATTERN_ENABLED,
+                "target_pattern_mode": target_market_regime(),
+                "target_pattern_lookback_points": TARGET_PATTERN_LOOKBACK_POINTS,
+                "real_target_symbols": REAL_TARGET_SYMBOLS,
+                "paper_alert_enabled": False,
+                "real_pattern_alert_enabled": True,
+                "telegram_trade_buttons": "confirm_page_buttons",
             })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "daytrade", "last_error"]})
@@ -2520,10 +2657,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/reset_base":
             ok, msg = reset_base_and_paper(); return self.json_response({"ok": ok, "message": msg})
         if path == "/reset_daytrade":
-            with LOCK:
-                S["daytrade"] = {"date": today(), "cash": DAYTRADE_BASE_CASH, "trade_count": 0, "position": None, "market_mode": "대기", "pending": None, "trades": [], "last_action": "단타 리셋"}
-            save_daytrade_state()
-            return self.json_response({"ok": True, "message": "단타 시드/상태 리셋 완료"})
+            return self.json_response({"ok": False, "message": "구 구 단타 단타 리셋은 V4.10에서 제거되었습니다."})
         return self.json_response({"ok": False, "message": "unknown path"})
 
     def render_dashboard(self):
@@ -2531,14 +2665,13 @@ class Handler(BaseHTTPRequestHandler):
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>80억 프로젝트 실전 반자동 관제센터</title><meta http-equiv="refresh" content="60">{CSS}</head><body>
 <h1>80억 프로젝트 실전 반자동 관제센터</h1>
 <div class="sub">업데이트 {safe(S['updated'])} | 상태 {safe(S['status'])} | 계좌 {safe(S['account_seq'])}</div>
-<div class="grid"><div>{self.account_card()}{self.daytrade_card()}{self.paper_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.signal_card(LEV,'red')}{self.signal_card(INV,'blue')}{self.basic_card(HYNIX)}{self.stock_table()}</div><div>{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}{self.paper_trade_card()}</div></div>
+<div class="grid"><div>{self.account_card()}{self.paper_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.signal_card(LEV,'red')}{self.signal_card(INV,'blue')}{self.basic_card(HYNIX)}{self.stock_table()}</div><div>{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}{self.paper_trade_card()}</div></div>
 <script>
 async function postJson(path, body){{const res=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body||{{}})}});return await res.json();}}
 async function order(symbol,side,qtyId){{const qty=document.getElementById(qtyId).value;const sideText=side==='BUY'?'매수':'매도';if(!qty||Number(qty)<=0){{alert('수량이 0입니다.');return;}}if(!confirm(symbol+' '+qty+'주 실계좌 '+sideText+' 주문 전송?'))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty}});alert(JSON.stringify(data));location.reload();}}
 async function paperBuy(symbol){{const data=await postJson('/paper_buy',{{symbol:symbol,ratio:0.5}});alert(data.ok?'가상매수 완료':'가상매수 실패');location.reload();}}
 async function paperSell(symbol){{const data=await postJson('/paper_sell',{{symbol:symbol}});alert(data.ok?'가상매도 완료':'가상매도 실패');location.reload();}}
 async function resetBase(){{if(!confirm('현재 토스 총자산으로 기준금과 AI 가상계좌를 리셋할까요?'))return;const data=await postJson('/reset_base',{{}});alert(JSON.stringify(data));location.reload();}}
-async function resetDaytrade(){{if(!confirm('단타 시드와 단타 상태를 800만원으로 리셋할까요?'))return;const data=await postJson('/reset_daytrade',{{}});alert(JSON.stringify(data));location.reload();}}
 function setQty(id,qty){{document.getElementById(id).value=qty;}}
 </script></body></html>"""
         self.html_response(html_doc)
@@ -2549,28 +2682,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
 
 
     def daytrade_card(self):
-        dt = S.get("daytrade", {})
-        pos = dt.get("position")
-        pending = dt.get("pending")
-        pos_html = "없음"
-        if pos:
-            sym = pos.get("symbol", "")
-            cur = S["prices"].get(sym, 0)
-            pnl = daytrade_position_profit(pos, cur) if cur else 0
-            pos_html = f"{safe(pos.get('name', name_of(sym)))} {int(to_float(pos.get('qty',0)))}주<br>진입가 {fmt_won(pos.get('entry_price',0))}<br><span class='{color_class(pnl)}'>수익률 {pnl:.2f}%</span>"
-        pending_html = "없음"
-        if pending:
-            pending_html = f"{safe(pending.get('action',''))} / {safe(pending.get('name',''))}<br>{safe(pending.get('reason',''))}"
-        token_state = "설정됨" if DAYTRADE_EXEC_TOKEN else "미설정"
-        return f"""<div class="card"><h2>800만원 단타</h2>
-<div class="small">시장상태</div><div class="big yellow">{safe(dt.get('market_mode','대기'))}</div>
-<div class="small">단타 시드</div><div class="big yellow">{fmt_won(dt.get('cash', DAYTRADE_BASE_CASH))}</div>
-<div class="small">오늘 횟수</div><div>{dt.get('trade_count',0)} / {DAYTRADE_MAX_TRADES}</div>
-<br><div class="small">단타 포지션</div><div>{pos_html}</div>
-<br><div class="small">대기 신호</div><div>{pending_html}</div>
-<br><div class="small">텔레그램 실행 토큰</div><div class="{'green' if DAYTRADE_EXEC_TOKEN else 'red'}">{token_state}</div>
-<div class="small">원칙: 09:00~15:20 / 수익 재투자 / 하이닉스 레버리지 보유분 제외</div>
-<button class="gold" onclick="resetDaytrade()">단타 800만 리셋</button></div>"""
+        return ""
 
     def paper_card(self):
         p = S["paper"]
