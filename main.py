@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true"
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
-ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "false").lower() == "true"
+ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "true").lower() == "true"
 NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
 REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "30"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_10_UNIFIED_TARGET_PATTERN_FINAL"
+OPERATING_VERSION = "OPERATING_V4_11_WORK_SWING_ALERT_FAST_LOG_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -139,7 +139,7 @@ SELLABLE_CACHE_SEC = int(os.environ.get("SELLABLE_CACHE_SEC", "180"))
 SELLABLE_MIN_QTY = int(os.environ.get("SELLABLE_MIN_QTY", "2"))
 
 # 시간 제한: 오늘 데이터 기준으로 확정
-NO_BUY_BEFORE = "09:30"
+NO_BUY_BEFORE = os.environ.get("NO_BUY_BEFORE", "09:05")
 NO_NEW_BUY_AFTER = "14:30"
 DAYTRADE_FORCE_EXIT_TIME = "15:20"
 # AI 가상계좌 자동운영 시간: 장중/정산 시간에만 작동한다.
@@ -165,11 +165,34 @@ TARGET_PATTERN_LOOKBACK_POINTS = int(os.environ.get("TARGET_PATTERN_LOOKBACK_POI
 TARGET_LONG_PULLBACK_PCT = float(os.environ.get("TARGET_LONG_PULLBACK_PCT", "8.0"))
 TARGET_LONG_MAJOR_PULLBACK_PCT = float(os.environ.get("TARGET_LONG_MAJOR_PULLBACK_PCT", "10.0"))
 TARGET_REBREAK_BUFFER_PCT = float(os.environ.get("TARGET_REBREAK_BUFFER_PCT", "0.15"))
-TARGET_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("TARGET_MAX_REAL_ALERTS_PER_DAY", "3"))
+TARGET_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("TARGET_MAX_REAL_ALERTS_PER_DAY", "2"))
 TARGET_REAL_ALERT_COOLDOWN_SEC = int(os.environ.get("TARGET_REAL_ALERT_COOLDOWN_SEC", "600"))
 TARGET_PAPER_MIN_HOLD_SEC = int(os.environ.get("TARGET_PAPER_MIN_HOLD_SEC", "900"))
 TARGET_PAPER_REENTRY_COOLDOWN_SEC = int(os.environ.get("TARGET_PAPER_REENTRY_COOLDOWN_SEC", "900"))
 TARGET_PAPER_MAX_TRADES_PER_DAY = int(os.environ.get("TARGET_PAPER_MAX_TRADES_PER_DAY", "8"))
+
+# ============================================================
+# V4.11 알림 정책
+# - 실계좌 텔레그램 알림: 장중 스윙 단타 매수/매도만 전송
+# - 짧은 단타: 알림 금지, CSV 기록만 남김
+# - 텔레그램 주문 버튼: 30초 만료 + 현재가 재확인 + 가격괴리 차단
+# ============================================================
+REAL_ALERT_MODE = os.environ.get("REAL_ALERT_MODE", "WORK_SWING_ONLY")
+ENABLE_WORK_SWING_ALERT = os.environ.get("ENABLE_WORK_SWING_ALERT", "true").lower() == "true"
+ENABLE_FAST_SCALP_ALERT = os.environ.get("ENABLE_FAST_SCALP_ALERT", "false").lower() == "true"
+ENABLE_FAST_SCALP_LOG_ONLY = os.environ.get("ENABLE_FAST_SCALP_LOG_ONLY", "true").lower() == "true"
+ENABLE_TELEGRAM_BUTTON_ORDER = os.environ.get("ENABLE_TELEGRAM_BUTTON_ORDER", "true").lower() == "true"
+TELEGRAM_BUTTON_TTL_SEC = int(os.environ.get("TELEGRAM_BUTTON_TTL_SEC", "30"))
+MAX_BUTTON_PRICE_DRIFT_PCT = float(os.environ.get("MAX_BUTTON_PRICE_DRIFT_PCT", "0.5"))
+FAST_SCALP_SCORE_MIN = int(os.environ.get("FAST_SCALP_SCORE_MIN", "85"))
+FAST_SCALP_LOG_COOLDOWN_SEC = int(os.environ.get("FAST_SCALP_LOG_COOLDOWN_SEC", "60"))
+WORK_SWING_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("WORK_SWING_MAX_REAL_ALERTS_PER_DAY", "2"))
+
+# 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
+TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200"]
+FAST_SCALP_ALLOWED_SYMBOLS = TRADE_ALLOWED_SYMBOLS
+WORK_SWING_ALLOWED_SYMBOLS = TRADE_ALLOWED_SYMBOLS
+
 
 
 
@@ -215,6 +238,7 @@ S = {
     "alerts": [],
     "last_alert": {},
     "orders": [],
+    "pending_orders": {},
     # 실계좌 보유관리: 내가 산 종목의 매수가/매수 후 최고가를 기억해서
     # 손절, 수익보호, 익절, 교체 후보 알림을 보냄.
     "real_watch": {},
@@ -371,6 +395,9 @@ def summary_path():
 
 def paper_path():
     return os.path.join(day_dir(), f"paper_trades_{today()}.csv")
+
+def fast_scalp_path():
+    return os.path.join(day_dir(), f"fast_scalp_signals_{today()}.csv")
 
 def orders_path():
     return os.path.join(day_dir(), f"real_orders_{today()}.csv")
@@ -574,6 +601,64 @@ def confirm_url(sym, side, qty=0):
     base = APP_URL or ""
     qs = urlencode({"symbol": sym, "side": side, "qty": str(qty)})
     return f"{base}/confirm?{qs}" if base else "/confirm?" + qs
+
+def create_trade_button_url(sym, side, qty, alert_price, reason=""):
+    """텔레그램 버튼용 1회성 주문 URL.
+    - 버튼은 TELEGRAM_BUTTON_TTL_SEC 안에서만 유효
+    - 클릭 시 현재가를 다시 확인하고 가격 괴리가 크면 차단
+    - ENABLE_REAL_ORDER=false면 실제 주문은 place_order_manual에서 최종 차단됨
+    """
+    oid = uuid.uuid4().hex
+    with LOCK:
+        S.setdefault("pending_orders", {})[oid] = {
+            "created_at": time.time(),
+            "symbol": str(sym),
+            "side": str(side),
+            "qty": int(to_int(qty)),
+            "alert_price": float(to_float(alert_price)),
+            "reason": str(reason)[:200],
+            "used": False,
+        }
+    qs = urlencode({"oid": oid})
+    base = APP_URL or ""
+    return f"{base}/telegram_order?{qs}" if base else "/telegram_order?" + qs
+
+def handle_telegram_order(qs):
+    oid = (qs.get("oid") or [""])[0]
+    with LOCK:
+        item = S.setdefault("pending_orders", {}).get(oid)
+    if not item:
+        return {"ok": False, "message": "주문 버튼이 없거나 만료되었습니다."}
+    if item.get("used"):
+        return {"ok": False, "message": "이미 사용된 주문 버튼입니다."}
+    age = time.time() - to_float(item.get("created_at", 0))
+    if age > TELEGRAM_BUTTON_TTL_SEC:
+        with LOCK:
+            S["pending_orders"].pop(oid, None)
+        return {"ok": False, "message": f"주문 버튼 만료: {int(age)}초 경과. 새 신호를 기다리세요."}
+    sym = str(item.get("symbol", ""))
+    side = str(item.get("side", ""))
+    qty = int(to_int(item.get("qty", 0)))
+    alert_price = to_float(item.get("alert_price", 0))
+    current_price = to_float(S.get("prices", {}).get(sym, 0))
+    if sym not in TRADE_ALLOWED_SYMBOLS:
+        return {"ok": False, "message": "허용되지 않은 실전 매매 후보입니다."}
+    if current_price <= 0 or alert_price <= 0:
+        return {"ok": False, "message": "현재가 확인 실패. 주문 차단."}
+    drift = pct(current_price, alert_price)
+    # 매수는 알림가보다 비싸지면 차단, 매도는 알림가보다 크게 밀리면 차단
+    if side == "BUY" and drift > MAX_BUTTON_PRICE_DRIFT_PCT:
+        return {"ok": False, "message": f"가격 상승으로 매수 차단: 알림가 대비 {drift:.2f}%"}
+    if side == "SELL" and drift < -MAX_BUTTON_PRICE_DRIFT_PCT:
+        return {"ok": False, "message": f"가격 하락으로 매도 재확인 필요: 알림가 대비 {drift:.2f}%"}
+    with LOCK:
+        S.setdefault("pending_orders", {}).setdefault(oid, {})["used"] = True
+    result = place_order_manual(sym, side, qty)
+    result["button_age_sec"] = round(age, 1)
+    result["alert_price"] = alert_price
+    result["current_price"] = current_price
+    result["price_drift_pct"] = round(drift, 3)
+    return result
 
 def send_signal_kakao(sym, title):
     sig = S["signals"].get(sym, {})
@@ -1707,11 +1792,12 @@ def send_real_pattern_buy_alert(sym, amount, stage, reason):
         f"현재가: {fmt_won(price)}\n"
         f"시장: {target_market_regime()}\n"
         f"이유: {reason}\n"
-        f"실제 주문은 확인 화면에서 최종 실행"
+        f"실제 주문: 텔레그램 버튼 30초 유효 / 클릭 시 현재가 재확인"
     )
-    url = confirm_url(sym, "BUY", qty)
+    url = create_trade_button_url(sym, "BUY", qty, price, reason)
+    confirm = confirm_url(sym, "BUY", qty)
     add_alert(msg)
-    send_telegram(msg, [[telegram_button("🟢 매수 확인", url)], [telegram_button("📊 대시보드", APP_URL)]])
+    send_telegram(msg, [[telegram_button("🟢 30초 매수 실행", url)], [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", APP_URL)]])
     write_alert_log("REAL", "target_buy", sym, price, 0, "BUY", reason, True, "telegram")
     return True
 
@@ -1734,11 +1820,12 @@ def send_real_pattern_sell_alert(sym, qty, reason):
         f"수량: {qty}주\n"
         f"현재가: {fmt_won(price)}\n"
         f"이유: {reason}\n"
-        f"실제 주문은 확인 화면에서 최종 실행"
+        f"실제 주문: 텔레그램 버튼 30초 유효 / 클릭 시 현재가 재확인"
     )
-    url = confirm_url(sym, "SELL", qty)
+    url = create_trade_button_url(sym, "SELL", qty, price, reason)
+    confirm = confirm_url(sym, "SELL", qty)
     add_alert(msg)
-    send_telegram(msg, [[telegram_button("🔴 매도 확인", url)], [telegram_button("📊 대시보드", APP_URL)]])
+    send_telegram(msg, [[telegram_button("🔴 30초 매도 실행", url)], [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", APP_URL)]])
     write_alert_log("REAL", "target_sell", sym, price, 0, "SELL", reason, True, "telegram")
     return True
 
@@ -1746,7 +1833,7 @@ def run_real_pattern_alert_engine():
     """실계좌용 목표 패턴 알림 엔진.
     자동주문은 하지 않고 텔레그램 매수/매도 확인 버튼만 보낸다.
     """
-    if not TARGET_PATTERN_ENABLED:
+    if not TARGET_PATTERN_ENABLED or not ENABLE_WORK_SWING_ALERT or REAL_ALERT_MODE != "WORK_SWING_ONLY":
         return
     target_pattern_reset_if_new_day()
 
@@ -1779,7 +1866,7 @@ def run_real_pattern_alert_engine():
         return
     with LOCK:
         sent_count = int(S.get("target_pattern", {}).get("sent_count", 0))
-    if sent_count >= TARGET_MAX_REAL_ALERTS_PER_DAY:
+    if sent_count >= min(TARGET_MAX_REAL_ALERTS_PER_DAY, WORK_SWING_MAX_REAL_ALERTS_PER_DAY):
         return
     if mode in ["CHOPPY", "NO_TRADE"]:
         return
@@ -2350,6 +2437,67 @@ def reset_base_and_paper():
     return True, f"리셋 완료: 실계좌 {fmt_won(total)} / AI가상 {fmt_won(VIRTUAL_BASE_CASH)}"
 
 # ============================================================
+# 짧은 단타 기록 전용 엔진
+# - 실계좌 알림은 보내지 않는다.
+# - 나중에 분석용으로 "그때 샀다면/팔았다면" 후보만 CSV에 남긴다.
+# ============================================================
+
+def fast_scalp_candidate(sym):
+    if sym not in FAST_SCALP_ALLOWED_SYMBOLS:
+        return False, "매매후보 아님"
+    price = S["prices"].get(sym, 0)
+    if price <= 0:
+        return False, "현재가 없음"
+    sig = S["signals"].get(sym, {})
+    score = to_int(sig.get("score", 0))
+    if score < FAST_SCALP_SCORE_MIN:
+        return False, f"score 부족 {score}"
+    if "진입" not in str(sig.get("label", "")) and score < 90:
+        return False, "진입 신호 부족"
+    wm20 = to_float(S["wma"].get(sym, {}).get("wma20", 0))
+    if wm20 > 0 and price < wm20:
+        return False, "WMA20 아래"
+    mode = target_market_regime()
+    if mode == "DOWN" and not is_inverse_symbol(sym):
+        return False, "DOWN에서 롱 제외"
+    if mode in ["UP", "RECOVERY", "SEMI_LEADER_UP"] and is_inverse_symbol(sym):
+        return False, "상승모드에서 인버스 제외"
+    if mode in ["CHOPPY", "NO_TRADE"]:
+        return False, f"{mode} 관망"
+    return True, f"FAST_LOG_ONLY {mode} score={score}"
+
+def write_fast_scalp_log_only():
+    if not ENABLE_FAST_SCALP_LOG_ONLY:
+        return
+    # 알림 폭탄 방지: 같은 종목은 FAST_SCALP_LOG_COOLDOWN_SEC마다 1회 기록
+    headers = ["time", "symbol", "name", "price", "score", "signal", "mode", "reason", "alert_sent"]
+    mode = target_market_regime()
+    with LOCK:
+        symbols = list(FAST_SCALP_ALLOWED_SYMBOLS)
+    for sym in symbols:
+        ok, reason = fast_scalp_candidate(sym)
+        if not ok:
+            continue
+        key = f"FAST_SCALP_LOG_{today()}_{sym}"
+        with LOCK:
+            last = S["last_alert"].get(key, 0)
+            if time.time() - last < FAST_SCALP_LOG_COOLDOWN_SEC:
+                continue
+            S["last_alert"][key] = time.time()
+        sig = S["signals"].get(sym, {})
+        write_row(fast_scalp_path(), headers, {
+            "time": now_text(),
+            "symbol": sym,
+            "name": name_of(sym),
+            "price": S["prices"].get(sym, 0),
+            "score": sig.get("score", 0),
+            "signal": sig.get("label", ""),
+            "mode": mode,
+            "reason": reason,
+            "alert_sent": False,
+        })
+
+# ============================================================
 # 저장 / 루프
 # ============================================================
 
@@ -2404,6 +2552,10 @@ def write_portfolio_log():
         profit_loss = S.get("profit_loss", 0)
         profit_rate = S.get("profit_rate", 0)
     if not holdings:
+        # 계좌조회 실패로 cash/total_value가 0이면 정상 포트폴리오로 저장하지 않는다.
+        if cash == 0 and total_value == 0:
+            write_alert_log("BLOCK", "portfolio", "", 0, 0, "skip", "비정상 0원 계좌스냅샷 저장 차단", False, "")
+            return
         write_row(portfolio_path(), headers, {"time": now_text(), "symbol": "", "name": "보유없음", "cash": cash, "total_value": total_value, "profit_loss": profit_loss, "profit_rate": profit_rate})
         return
     for h in holdings:
@@ -2501,6 +2653,10 @@ def loop():
 
             # 2) 저장은 알림보다 먼저. 알림 오류가 나도 데이터는 반드시 남긴다.
             write_logs()
+            try:
+                write_fast_scalp_log_only()
+            except Exception as e:
+                set_error(f"짧은단타 기록 오류: {e}")
             update_paper_asset()
 
             # 2-1) V4.10 목표 패턴 실계좌 알림 엔진
@@ -2595,7 +2751,10 @@ class Handler(BaseHTTPRequestHandler):
                 "real_target_symbols": REAL_TARGET_SYMBOLS,
                 "paper_alert_enabled": False,
                 "real_pattern_alert_enabled": True,
-                "telegram_trade_buttons": "confirm_page_buttons",
+                "telegram_trade_buttons": "30sec_direct_button_with_price_recheck",
+                "real_alert_mode": REAL_ALERT_MODE,
+                "fast_scalp_alert": ENABLE_FAST_SCALP_ALERT,
+                "fast_scalp_log_only": ENABLE_FAST_SCALP_LOG_ONLY,
             })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "daytrade", "last_error"]})
@@ -2616,6 +2775,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/daytrade_exec":
             result = execute_daytrade_from_url(qs)
             return self.result_page("단타 실행 결과", json.dumps(result, ensure_ascii=False, indent=2))
+        if path == "/telegram_order":
+            result = handle_telegram_order(qs)
+            return self.result_page("텔레그램 버튼 주문 결과", json.dumps(result, ensure_ascii=False, indent=2))
         if path == "/confirm":
             return self.confirm_page(qs)
         if path == "/download_csv":
@@ -2630,6 +2792,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.download_file(swing_path(), f"swing_decision_{today()}.csv")
         if path == "/download_alert_log":
             return self.download_file(alert_log_path(), f"alert_log_{today()}.csv")
+        if path == "/download_fast_scalp":
+            return self.download_file(fast_scalp_path(), f"fast_scalp_signals_{today()}.csv")
         if path == "/download_backup":
             path_zip = create_backup_zip()
             return self.download_file(path_zip, os.path.basename(path_zip), content_type="application/zip")
@@ -2755,7 +2919,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
