@@ -16,7 +16,7 @@ import pytz
 
 # ============================================================
 # 80억 프로젝트 실전 반자동 관제센터
-# - 실계좌: 자동매수/자동매도 없음. 반드시 사용자가 버튼으로 최종 실행
+# - 실계좌: 자동매수 없음. 매수는 사용자 선택, 수익권 자동매도는 선택적으로 실행
 # - 카카오: 매수/매도 확인 링크 포함
 # - 26개 종목: 현재가/점수/추천수량/버튼/CSV 저장
 # - AI 가상: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 AI 자동매수/자동매도
@@ -109,7 +109,7 @@ ALERT_SYMBOLS = [LEV, INV, HYNIX, "122630", "252670", "233740", "251340"]
 
 # V4.10 실계좌 판단 대상: 시장상황 핵심 종목
 REAL_LONG_PRIORITY = [LEV, "494310", "0193W0", "122630", "233740"]
-REAL_INVERSE_PRIORITY = ["252670", "251340", INV, "0193L0"]
+REAL_INVERSE_PRIORITY = [INV, "0193L0", "252670", "251340"]
 REAL_TARGET_SYMBOLS = list(dict.fromkeys(REAL_LONG_PRIORITY + REAL_INVERSE_PRIORITY + [HYNIX, "005930", "069500", "229200"]))
 ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 
@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_11_WORK_SWING_ALERT_FAST_LOG_ONLY"
+OPERATING_VERSION = "OPERATING_V4_12_RECOVERY_AUTOSELL_FINAL"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -165,7 +165,7 @@ TARGET_PATTERN_LOOKBACK_POINTS = int(os.environ.get("TARGET_PATTERN_LOOKBACK_POI
 TARGET_LONG_PULLBACK_PCT = float(os.environ.get("TARGET_LONG_PULLBACK_PCT", "8.0"))
 TARGET_LONG_MAJOR_PULLBACK_PCT = float(os.environ.get("TARGET_LONG_MAJOR_PULLBACK_PCT", "10.0"))
 TARGET_REBREAK_BUFFER_PCT = float(os.environ.get("TARGET_REBREAK_BUFFER_PCT", "0.15"))
-TARGET_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("TARGET_MAX_REAL_ALERTS_PER_DAY", "2"))
+TARGET_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("TARGET_MAX_REAL_ALERTS_PER_DAY", "4"))
 TARGET_REAL_ALERT_COOLDOWN_SEC = int(os.environ.get("TARGET_REAL_ALERT_COOLDOWN_SEC", "600"))
 TARGET_PAPER_MIN_HOLD_SEC = int(os.environ.get("TARGET_PAPER_MIN_HOLD_SEC", "900"))
 TARGET_PAPER_REENTRY_COOLDOWN_SEC = int(os.environ.get("TARGET_PAPER_REENTRY_COOLDOWN_SEC", "900"))
@@ -186,10 +186,37 @@ TELEGRAM_BUTTON_TTL_SEC = int(os.environ.get("TELEGRAM_BUTTON_TTL_SEC", "30"))
 MAX_BUTTON_PRICE_DRIFT_PCT = float(os.environ.get("MAX_BUTTON_PRICE_DRIFT_PCT", "0.5"))
 FAST_SCALP_SCORE_MIN = int(os.environ.get("FAST_SCALP_SCORE_MIN", "85"))
 FAST_SCALP_LOG_COOLDOWN_SEC = int(os.environ.get("FAST_SCALP_LOG_COOLDOWN_SEC", "60"))
-WORK_SWING_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("WORK_SWING_MAX_REAL_ALERTS_PER_DAY", "2"))
+WORK_SWING_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("WORK_SWING_MAX_REAL_ALERTS_PER_DAY", "4"))
+
+# ============================================================
+# V4.12 최종 수정: 회복 반등 + 수익권 자동매도
+# - 자동매수는 계속 금지
+# - 자동매도는 실전 허용 종목 + 수익권에서만 실행
+# - 빨간색 추격이 아니라 VI/당일 저점 대비 살아나는 종목을 감지
+# ============================================================
+ENABLE_REAL_AUTO_BUY = os.environ.get("ENABLE_REAL_AUTO_BUY", "false").lower() == "true"
+ENABLE_REAL_AUTO_SELL = os.environ.get("ENABLE_REAL_AUTO_SELL", "true").lower() == "true"
+AUTO_SELL_PROFIT_ONLY = os.environ.get("AUTO_SELL_PROFIT_ONLY", "true").lower() == "true"
+AUTO_SELL_LOSS_CUT = os.environ.get("AUTO_SELL_LOSS_CUT", "false").lower() == "true"
+AUTO_SELL_MIN_PROFIT_PCT = float(os.environ.get("AUTO_SELL_MIN_PROFIT_PCT", "1.0"))
+AUTO_SELL_PROFIT_START_PCT = float(os.environ.get("AUTO_SELL_PROFIT_START_PCT", "2.0"))
+AUTO_SELL_TRAIL_DROP_PCT = float(os.environ.get("AUTO_SELL_TRAIL_DROP_PCT", "1.5"))
+AUTO_SELL_BIG_PROFIT_PCT = float(os.environ.get("AUTO_SELL_BIG_PROFIT_PCT", "5.0"))
+AUTO_SELL_BIG_TRAIL_DROP_PCT = float(os.environ.get("AUTO_SELL_BIG_TRAIL_DROP_PCT", "2.0"))
+AUTO_SELL_FORCE_EXIT_TIME = os.environ.get("AUTO_SELL_FORCE_EXIT_TIME", "15:15")
+AUTO_SELL_FORCE_EXIT_ONLY_PROFIT = os.environ.get("AUTO_SELL_FORCE_EXIT_ONLY_PROFIT", "true").lower() == "true"
+RECOVERY_CANDIDATE_ENGINE = os.environ.get("RECOVERY_CANDIDATE_ENGINE", "true").lower() == "true"
+POSITION_SET_REENTRY = os.environ.get("POSITION_SET_REENTRY", "true").lower() == "true"
+FAMILY_MODE_ENGINE = os.environ.get("FAMILY_MODE_ENGINE", "true").lower() == "true"
+PEAK_PROFIT_TRAILING_AUTO_SELL = os.environ.get("PEAK_PROFIT_TRAILING_AUTO_SELL", "true").lower() == "true"
+ALERT_ONLY_ACTIONABLE = os.environ.get("ALERT_ONLY_ACTIONABLE", "true").lower() == "true"
+VI_AFTER_RECHECK = os.environ.get("VI_AFTER_RECHECK", "true").lower() == "true"
+RECOVERY_LOW_RISE_PCT = float(os.environ.get("RECOVERY_LOW_RISE_PCT", "3.0"))
+RECOVERY_STRONG_LOW_RISE_PCT = float(os.environ.get("RECOVERY_STRONG_LOW_RISE_PCT", "5.0"))
+RECOVERY_RECENT_UP_PCT = float(os.environ.get("RECOVERY_RECENT_UP_PCT", "0.25"))
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
-TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200"]
+TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200", "494310", "488080", "469150", "005930", "000660"]
 FAST_SCALP_ALLOWED_SYMBOLS = TRADE_ALLOWED_SYMBOLS
 WORK_SWING_ALLOWED_SYMBOLS = TRADE_ALLOWED_SYMBOLS
 
@@ -1034,6 +1061,74 @@ def real_watch_detail(sym, item, stage):
         f"단계: {stage}"
     )
 
+
+def auto_sell_allowed_symbol(sym):
+    if sym not in TRADE_ALLOWED_SYMBOLS:
+        return False
+    # 해외/이벤트/장기투자/관찰용은 제외. 이 리스트에 없는 종목은 자동매도하지 않는다.
+    return sym in set(TRADE_ALLOWED_SYMBOLS)
+
+def auto_sell_reason(sym, qty, price, buy, high, profit, drop_from_high):
+    if not ENABLE_REAL_AUTO_SELL or not PEAK_PROFIT_TRAILING_AUTO_SELL:
+        return None
+    if not auto_sell_allowed_symbol(sym):
+        return None
+    if qty <= 1:
+        return None
+    if price <= 0 or buy <= 0 or high <= 0:
+        return None
+    # 손실권 자동손절은 기본 OFF. 수익권 자동매도만 한다.
+    if AUTO_SELL_PROFIT_ONLY and profit < AUTO_SELL_MIN_PROFIT_PCT:
+        return None
+    if not AUTO_SELL_LOSS_CUT and profit < 0:
+        return None
+    # 장마감 수익권 정리
+    if is_after_or_equal_hhmm(AUTO_SELL_FORCE_EXIT_TIME):
+        if (not AUTO_SELL_FORCE_EXIT_ONLY_PROFIT) or profit > 0:
+            return f"장마감 수익권 자동정리: 현재수익={profit:.2f}%"
+    # 큰 수익 보호: 추세 확인보다 수익 보전을 우선
+    max_profit = pct(high, buy)
+    if max_profit >= AUTO_SELL_BIG_PROFIT_PCT and profit >= 0 and drop_from_high <= -AUTO_SELL_BIG_TRAIL_DROP_PCT:
+        return f"큰 수익권 고점이탈 자동매도: 최고수익={max_profit:.2f}%, 현재={profit:.2f}%, 고점대비={drop_from_high:.2f}%"
+    # 일반 수익 보호: 반대 방향/계열 약화 또는 WMA 약화가 같이 나오면 실행
+    if max_profit >= AUTO_SELL_PROFIT_START_PCT and profit >= AUTO_SELL_MIN_PROFIT_PCT and drop_from_high <= -AUTO_SELL_TRAIL_DROP_PCT:
+        wm = S.get("wma", {}).get(sym, {})
+        w5 = to_float(wm.get("wma5", 0))
+        w20 = to_float(wm.get("wma20", 0))
+        fam = symbol_family(sym)
+        fam_mode = family_mode(fam) if FAMILY_MODE_ENGINE else target_market_regime()
+        opps = opposite_symbols_for(sym)
+        opp_strong = any(low_rise_pct(o) >= 1.0 and price_change_pct(o) >= 0.2 for o in opps)
+        trend_weak = (w5 and w20 and w5 < w20) or opp_strong or (fam_mode == "DOWN" and not is_inverse_symbol(sym)) or (fam_mode in ["UP", "RECOVERY"] and is_inverse_symbol(sym))
+        if trend_weak:
+            return f"수익권 고점이탈 자동매도: 최고수익={max_profit:.2f}%, 현재={profit:.2f}%, 고점대비={drop_from_high:.2f}%, 계열={fam}:{fam_mode}"
+    return None
+
+def execute_real_auto_sell(sym, qty, reason):
+    if not ENABLE_REAL_ORDER:
+        write_alert_log("AUTOSELL", "blocked", sym, S["prices"].get(sym, 0), 0, "blocked", "ENABLE_REAL_ORDER=false", False, reason)
+        return False
+    sellable = int(get_sellable_quantity(sym, force=True))
+    qty = min(int(to_int(qty)), sellable)
+    if qty <= 0:
+        write_alert_log("AUTOSELL", "blocked", sym, S["prices"].get(sym, 0), 0, "blocked", "매도가능수량 없음", False, reason)
+        return False
+    result = place_order_manual(sym, "SELL", qty)
+    ok = bool(result.get("ok"))
+    price = S["prices"].get(sym, 0)
+    title = "🔴 수익보호 자동매도 완료" if ok else "⚠️ 수익보호 자동매도 실패"
+    msg = (
+        f"{title}\n"
+        f"종목: {name_of(sym)} ({sym})\n"
+        f"수량: {qty}주\n"
+        f"현재가: {fmt_won(price)}\n"
+        f"사유: {reason}\n"
+        f"결과: {result.get('message', '')}"
+    )
+    send_telegram(msg, [[telegram_button("📊 대시보드", APP_URL)]])
+    write_alert_log("AUTOSELL", "real_auto_sell", sym, price, 0, "SELL" if ok else "FAILED", reason, ok, json.dumps(result, ensure_ascii=False)[:300])
+    return ok
+
 def check_real_holding_management():
     # 내가 실제로 산 종목을 계속 감시한다.
     # 매수가 대비 손실뿐 아니라, 올라갔다가 꺾이는 수익보호/익절 알림도 보낸다.
@@ -1061,6 +1156,13 @@ def check_real_holding_management():
             changed = True
         profit = pct(price, buy)
         drop_from_high = pct(price, high) if high else 0
+
+        # V4.12: 매수는 사용자가 선택하더라도, 수익권 매도는 시스템이 자동으로 보호한다.
+        reason_auto = auto_sell_reason(sym, qty, price, buy, high, profit, drop_from_high)
+        if reason_auto:
+            if execute_real_auto_sell(sym, qty, reason_auto):
+                continue
+
         sig = signals.get(sym, {})
         score = to_float(sig.get("score", 50))
         stage = ""
@@ -1609,19 +1711,17 @@ def calc_scores():
             S["signals"][sym] = build_signal(sym)
 
 def maybe_alert():
-    """기본 알림은 위험/금지성만 보낸다.
-    실제 매수/매도 실행 신호는 run_daytrade_engine()과 보유관리에서만 보낸다.
+    """보조 알림.
+    V4.12에서는 사용자가 일하면서 헷갈리지 않도록 실제 행동 알림만 보낸다.
+    시장 경고/악재성 급락 의심은 CSV에는 남기되 텔레그램 전송은 기본 차단한다.
     """
+    if ALERT_ONLY_ACTIONABLE:
+        return
     if not is_market_watch_time():
         return
-    with LOCK:
-        signals = dict(S["signals"])
-        prices = dict(S["prices"])
     mode = operating_market_mode()
-    # CHOPPY/NO_TRADE는 매수 후보 알림 대신 금지성 메시지만 쿨다운 전송
     if mode in ["CHOPPY", "NO_TRADE"]:
         return
-
     for sym in ALERT_SYMBOLS:
         if bad_news_risk_detected(sym):
             send_alert_once(f"RISK_{sym}", sym, "⚠️ 악재성 급락 의심")
@@ -1643,6 +1743,94 @@ def target_pattern_reset_if_new_day():
                 "last_choice": {},
                 "last_action": "새 장 시작",
             }
+
+
+def recent_change_pct(sym, n=5):
+    hist = S.get("history", {}).get(sym, [])
+    if not hist or len(hist) <= n:
+        return 0.0
+    return pct(hist[-1], hist[-1-n])
+
+def family_groups():
+    return {
+        "HYNIX": {"long": [LEV, "494310", HYNIX], "inv": [INV]},
+        "SAMSUNG": {"long": ["0193W0", "005930"], "inv": ["0193L0"]},
+        "KOSPI": {"long": ["122630", "069500"], "inv": ["252670"]},
+        "KOSDAQ": {"long": ["233740", "229200"], "inv": ["251340"]},
+    }
+
+def family_mode(name):
+    g = family_groups().get(name, {})
+    long_syms = g.get("long", [])
+    inv_syms = g.get("inv", [])
+    def avg(fn, syms):
+        vals = [fn(s) for s in syms if S["prices"].get(s, 0) > 0]
+        return sum(vals) / len(vals) if vals else 0.0
+    long_chg = avg(price_change_pct, long_syms)
+    inv_chg = avg(price_change_pct, inv_syms)
+    long_low_rise = avg(low_rise_pct, long_syms)
+    inv_low_rise = avg(low_rise_pct, inv_syms)
+    long_high_drop = avg(high_drop_pct, long_syms)
+    inv_high_drop = avg(high_drop_pct, inv_syms)
+    if inv_chg >= 0.25 and inv_low_rise >= 0.7 and long_chg <= 0.1:
+        return "DOWN"
+    if long_chg >= 0.25 and long_low_rise >= 0.7 and inv_chg <= 0.3:
+        return "UP"
+    if long_high_drop <= -3.0 and long_low_rise >= RECOVERY_LOW_RISE_PCT and inv_chg <= 0.5:
+        return "RECOVERY"
+    if abs(long_chg) >= 0.25 or abs(inv_chg) >= 0.25 or long_low_rise >= 1.0 or inv_low_rise >= 1.0:
+        return "CHOPPY"
+    return "NO_TRADE"
+
+def symbol_family(sym):
+    for fname, g in family_groups().items():
+        if sym in g.get("long", []) or sym in g.get("inv", []):
+            return fname
+    return "OTHER"
+
+def opposite_symbols_for(sym):
+    fam = symbol_family(sym)
+    g = family_groups().get(fam, {})
+    return g.get("long", []) if is_inverse_symbol(sym) else g.get("inv", [])
+
+def opposite_weak(sym):
+    opps = opposite_symbols_for(sym)
+    if not opps:
+        return True
+    weak = 0
+    for o in opps:
+        if price_change_pct(o) <= 0.2 or high_drop_pct(o) <= -0.8:
+            weak += 1
+    return weak >= max(1, len(opps)//2)
+
+def recovery_candidate_ready(sym):
+    """V4.12 핵심: 현재 빨간색보다 당일/VI 이후 저점에서 살아나는지 확인."""
+    if not RECOVERY_CANDIDATE_ENGINE:
+        return False, "회복엔진 OFF"
+    if sym not in TRADE_ALLOWED_SYMBOLS or is_inverse_symbol(sym):
+        return False, "회복 후보 대상 아님"
+    price = S["prices"].get(sym, 0)
+    if price <= 0:
+        return False, "현재가 없음"
+    rise = low_rise_pct(sym)
+    r5 = recent_change_pct(sym, 5)
+    r10 = recent_change_pct(sym, 10)
+    wm = S.get("wma", {}).get(sym, {})
+    w5 = to_float(wm.get("wma5", 0))
+    w20 = to_float(wm.get("wma20", 0))
+    family = symbol_family(sym)
+    fam_mode = family_mode(family) if FAMILY_MODE_ENGINE else target_market_regime()
+    if rise < RECOVERY_LOW_RISE_PCT:
+        return False, f"저점대비 회복 부족 {rise:.2f}%"
+    if r5 < RECOVERY_RECENT_UP_PCT and r10 < RECOVERY_RECENT_UP_PCT:
+        return False, f"최근 상승 부족 5분={r5:.2f}% 10분={r10:.2f}%"
+    if w5 and w20 and w5 < w20 and rise < RECOVERY_STRONG_LOW_RISE_PCT:
+        return False, "WMA 회복 부족"
+    if not opposite_weak(sym):
+        return False, "반대 방향 약화 부족"
+    if fam_mode not in ["UP", "RECOVERY", "CHOPPY"]:
+        return False, f"계열모드 부적합 {family}:{fam_mode}"
+    return True, f"회복반등: {family} {fam_mode}, 저점대비={rise:.2f}%, 5분={r5:.2f}%, 10분={r10:.2f}%"
 
 def target_market_regime():
     """시장상황 분류: RECOVERY/UP/DOWN/CHOPPY/NO_TRADE.
@@ -1686,6 +1874,8 @@ def target_symbol_priority(mode):
     if mode == "DOWN":
         return REAL_INVERSE_PRIORITY
     if mode in ["UP", "RECOVERY"]:
+        # 하이닉스 레버리지/반도체/삼성/KOSPI/KOSDAQ 순서.
+        # 현재 빨간색 1등이 아니라 회복 후보도 target_choose_symbol에서 별도 평가한다.
         return REAL_LONG_PRIORITY
     return []
 
@@ -1752,6 +1942,23 @@ def target_rebreak_ready(sym, mode):
     return True, f"{mode} 재돌파 확인: 눌림={pullback:.2f}%, 저점대비={rise_from_low:.2f}%"
 
 def target_choose_symbol(mode):
+    # 1) V4.12 회복 반등 우선: 오늘 저점/VI 이후 저점에서 살아나는 종목
+    #    예: 인버스 매도 후 하이닉스 레버리지 회복.
+    if RECOVERY_CANDIDATE_ENGINE and mode in ["UP", "RECOVERY", "CHOPPY", "NO_TRADE"]:
+        recovery_candidates = [LEV, "494310", "0193W0", "122630", "233740", "069500", "229200"]
+        valid = []
+        for sym in recovery_candidates:
+            if S["prices"].get(sym, 0) <= 0:
+                continue
+            ok, reason = recovery_candidate_ready(sym)
+            if ok:
+                valid.append((low_rise_pct(sym) + recent_change_pct(sym, 10) * 2 + symbol_strength(sym) / 50, sym, reason))
+        if valid:
+            valid.sort(reverse=True)
+            _, sym, reason = valid[0]
+            return sym, reason
+
+    # 2) 기존 장중 스윙 패턴
     for sym in target_symbol_priority(mode):
         if S["prices"].get(sym, 0) <= 0:
             continue
@@ -1866,10 +2073,16 @@ def run_real_pattern_alert_engine():
         return
     with LOCK:
         sent_count = int(S.get("target_pattern", {}).get("sent_count", 0))
-    if sent_count >= min(TARGET_MAX_REAL_ALERTS_PER_DAY, WORK_SWING_MAX_REAL_ALERTS_PER_DAY):
+        active_watch = bool(S.get("real_watch", {}))
+    # V4.12: 하루 2번 제한으로 전환장을 막지 않는다.
+    # 보유 포지션이 없으면 인버스 1세트 후 레버리지 회복 2세트를 열 수 있도록 최대 4회 허용.
+    max_alerts = max(TARGET_MAX_REAL_ALERTS_PER_DAY, WORK_SWING_MAX_REAL_ALERTS_PER_DAY) if POSITION_SET_REENTRY else min(TARGET_MAX_REAL_ALERTS_PER_DAY, WORK_SWING_MAX_REAL_ALERTS_PER_DAY)
+    if sent_count >= max_alerts:
         return
     if mode in ["CHOPPY", "NO_TRADE"]:
-        return
+        # 전체 시장이 애매해도 계열별 회복 후보는 별도 확인한다.
+        if not (RECOVERY_CANDIDATE_ENGINE and FAMILY_MODE_ENGINE):
+            return
 
     sym, reason = target_choose_symbol(mode)
     if not sym:
@@ -2724,8 +2937,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "version": OPERATING_VERSION,
                 "symbols": len(ALL),
-                "real_auto_buy": False,
-                "real_auto_sell": False,
+                "real_auto_buy": ENABLE_REAL_AUTO_BUY,
+                "real_auto_sell": ENABLE_REAL_AUTO_SELL,
+                "auto_sell_profit_only": AUTO_SELL_PROFIT_ONLY,
+                "auto_sell_loss_cut": AUTO_SELL_LOSS_CUT,
                 "real_order_enabled": ENABLE_REAL_ORDER,
                 "app_url": APP_URL,
                 "telegram_configured": telegram_enabled(),
@@ -2737,7 +2952,7 @@ class Handler(BaseHTTPRequestHandler):
                 "paper_auto_time_open": paper_auto_time_open(),
                 "account_refresh_hours": f"{ACCOUNT_REFRESH_START}~{ACCOUNT_REFRESH_END}",
                 "account_api_time_open": account_api_time_open(),
-                "operating_modes": ["SEMI_LEADER_UP", "UP", "DOWN", "CHOPPY", "NO_TRADE"],
+                "operating_modes": ["SEMI_LEADER_UP", "UP", "DOWN", "RECOVERY", "CHOPPY", "NO_TRADE"],
                 "real_account_mode": "semi_auto_button_only",
                 "paper_account_mode": "auto_ai_when_ENABLE_PAPER_AUTO_true",
                 "refresh_sec": REFRESH_SEC,
@@ -2755,6 +2970,12 @@ class Handler(BaseHTTPRequestHandler):
                 "real_alert_mode": REAL_ALERT_MODE,
                 "fast_scalp_alert": ENABLE_FAST_SCALP_ALERT,
                 "fast_scalp_log_only": ENABLE_FAST_SCALP_LOG_ONLY,
+                "recovery_candidate_engine": RECOVERY_CANDIDATE_ENGINE,
+                "position_set_reentry": POSITION_SET_REENTRY,
+                "family_mode_engine": FAMILY_MODE_ENGINE,
+                "peak_profit_trailing_auto_sell": PEAK_PROFIT_TRAILING_AUTO_SELL,
+                "alert_only_actionable": ALERT_ONLY_ACTIONABLE,
+                "vi_after_recheck": VI_AFTER_RECHECK,
             })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "daytrade", "last_error"]})
