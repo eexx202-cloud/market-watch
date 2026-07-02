@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_12_RECOVERY_AUTOSELL_FINAL"
+OPERATING_VERSION = "OPERATING_V4_13_METHOD63_HYNIX_FINAL"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -139,7 +139,7 @@ SELLABLE_CACHE_SEC = int(os.environ.get("SELLABLE_CACHE_SEC", "180"))
 SELLABLE_MIN_QTY = int(os.environ.get("SELLABLE_MIN_QTY", "2"))
 
 # 시간 제한: 오늘 데이터 기준으로 확정
-NO_BUY_BEFORE = os.environ.get("NO_BUY_BEFORE", "09:05")
+NO_BUY_BEFORE = os.environ.get("NO_BUY_BEFORE", "09:15")
 NO_NEW_BUY_AFTER = "14:30"
 DAYTRADE_FORCE_EXIT_TIME = "15:20"
 # AI 가상계좌 자동운영 시간: 장중/정산 시간에만 작동한다.
@@ -214,6 +214,34 @@ VI_AFTER_RECHECK = os.environ.get("VI_AFTER_RECHECK", "true").lower() == "true"
 RECOVERY_LOW_RISE_PCT = float(os.environ.get("RECOVERY_LOW_RISE_PCT", "3.0"))
 RECOVERY_STRONG_LOW_RISE_PCT = float(os.environ.get("RECOVERY_STRONG_LOW_RISE_PCT", "5.0"))
 RECOVERY_RECENT_UP_PCT = float(os.environ.get("RECOVERY_RECENT_UP_PCT", "0.25"))
+
+# ============================================================
+# V4.13 METHOD 63 하이닉스 전용 엔진
+# - 6/24~7/2 리플레이 기준 최우선 후보
+# - 실계좌 자동매수 OFF 유지
+# - 매수는 사용자 판단, 매도는 자동매도
+# ============================================================
+METHOD63_HYNIX_ENGINE = os.environ.get("METHOD63_HYNIX_ENGINE", "true").lower() == "true"
+METHOD63_HYNIX_ONLY = os.environ.get("METHOD63_HYNIX_ONLY", "true").lower() == "true"
+
+METHOD63_START_TIME = os.environ.get("METHOD63_START_TIME", "09:15")
+METHOD63_NO_NEW_BUY_AFTER = os.environ.get("METHOD63_NO_NEW_BUY_AFTER", "14:30")
+
+METHOD63_MAX_SETS_PER_DAY = int(os.environ.get("METHOD63_MAX_SETS_PER_DAY", "2"))
+METHOD63_SAME_DIRECTION_REENTRY = os.environ.get("METHOD63_SAME_DIRECTION_REENTRY", "false").lower() == "true"
+METHOD63_REVERSE_WAIT_SEC = int(os.environ.get("METHOD63_REVERSE_WAIT_SEC", "600"))
+
+METHOD63_INV_LOW_RISE_PCT = float(os.environ.get("METHOD63_INV_LOW_RISE_PCT", "4.0"))
+METHOD63_LEV_LOW_RISE_PCT = float(os.environ.get("METHOD63_LEV_LOW_RISE_PCT", "6.0"))
+METHOD63_OPPOSITE_WEAK_PCT = float(os.environ.get("METHOD63_OPPOSITE_WEAK_PCT", "2.0"))
+METHOD63_RECENT_UP_PCT = float(os.environ.get("METHOD63_RECENT_UP_PCT", "0.2"))
+METHOD63_RECENT_POINTS = int(os.environ.get("METHOD63_RECENT_POINTS", "5"))
+METHOD63_ALERT_COOLDOWN_SEC = int(os.environ.get("METHOD63_ALERT_COOLDOWN_SEC", "300"))
+
+BREAKEVEN_GUARD_AUTO_SELL = os.environ.get("BREAKEVEN_GUARD_AUTO_SELL", "true").lower() == "true"
+BREAKEVEN_GUARD_TRIGGER_PCT = float(os.environ.get("BREAKEVEN_GUARD_TRIGGER_PCT", "2.0"))
+BREAKEVEN_GUARD_EXIT_PCT = float(os.environ.get("BREAKEVEN_GUARD_EXIT_PCT", "0.3"))
+
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
 TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200", "494310", "488080", "469150", "005930", "000660"]
@@ -294,6 +322,14 @@ S = {
         "sent_count": 0,
         "stages": {},
         "last_choice": {},
+        "last_action": "없음",
+    },
+    "method63": {
+        "date": "",
+        "set_count": 0,
+        "last_side": "",
+        "last_exit_ts": 0,
+        "last_alert_ts": {},
         "last_action": "없음",
     },
 }
@@ -1077,6 +1113,13 @@ def auto_sell_reason(sym, qty, price, buy, high, profit, drop_from_high):
         return None
     if price <= 0 or buy <= 0 or high <= 0:
         return None
+    # V4.13 본전방어:
+    # 최고수익 +2% 이상 찍은 뒤 현재수익이 +0.3% 이하로 밀리면 방어매도
+    max_profit = pct(high, buy)
+    if BREAKEVEN_GUARD_AUTO_SELL and max_profit >= BREAKEVEN_GUARD_TRIGGER_PCT:
+        if profit >= 0 and profit <= BREAKEVEN_GUARD_EXIT_PCT:
+            return f"본전방어 자동매도: 최고수익={max_profit:.2f}%, 현재={profit:.2f}%, 고점대비={drop_from_high:.2f}%"
+
     # 손실권 자동손절은 기본 OFF. 수익권 자동매도만 한다.
     if AUTO_SELL_PROFIT_ONLY and profit < AUTO_SELL_MIN_PROFIT_PCT:
         return None
@@ -1115,6 +1158,26 @@ def execute_real_auto_sell(sym, qty, reason):
         return False
     result = place_order_manual(sym, "SELL", qty)
     ok = bool(result.get("ok"))
+
+    if ok and sym in [LEV, INV]:
+        with LOCK:
+            m = S.setdefault("method63", {})
+            if m.get("date") != today():
+                m.update({
+                    "date": today(),
+                    "set_count": 0,
+                    "last_side": "",
+                    "last_exit_ts": 0,
+                    "last_alert_ts": {},
+                    "last_action": "새 장 시작",
+                })
+
+            m["set_count"] = int(to_int(m.get("set_count", 0))) + 1
+            m["last_side"] = "INV" if sym == INV else "LEV"
+            m["last_exit_ts"] = time.time()
+            m["last_action"] = f"{now_short()} METHOD63 자동매도 완료 {name_of(sym)}"
+
+        save_state()
     price = S["prices"].get(sym, 0)
     title = "🔴 수익보호 자동매도 완료" if ok else "⚠️ 수익보호 자동매도 실패"
     msg = (
@@ -1711,17 +1774,26 @@ def calc_scores():
             S["signals"][sym] = build_signal(sym)
 
 def maybe_alert():
-    """보조 알림.
-    V4.12에서는 사용자가 일하면서 헷갈리지 않도록 실제 행동 알림만 보낸다.
-    시장 경고/악재성 급락 의심은 CSV에는 남기되 텔레그램 전송은 기본 차단한다.
     """
-    if ALERT_ONLY_ACTIONABLE:
-        return
+    V4.13:
+    - 실계좌 행동 알림은 METHOD63 하이닉스 전용 신호를 최우선으로 보냄
+    - 09:05 기존 오신호는 NO_BUY_BEFORE=09:15로 차단
+    - 기존 보조 알림은 ALERT_ONLY_ACTIONABLE=true이면 계속 차단
+    """
     if not is_market_watch_time():
         return
+
+    # V4.13 최우선: 하이닉스 레버리지/인버스 METHOD63 후보
+    send_method63_alert()
+
+    # 기존 보조 알림은 사용자 혼란 방지를 위해 기본 차단
+    if ALERT_ONLY_ACTIONABLE:
+        return
+
     mode = operating_market_mode()
     if mode in ["CHOPPY", "NO_TRADE"]:
         return
+
     for sym in ALERT_SYMBOLS:
         if bad_news_risk_detected(sym):
             send_alert_once(f"RISK_{sym}", sym, "⚠️ 악재성 급락 의심")
@@ -1750,6 +1822,222 @@ def recent_change_pct(sym, n=5):
     if not hist or len(hist) <= n:
         return 0.0
     return pct(hist[-1], hist[-1-n])
+
+
+# ============================================================
+# V4.13 METHOD 63 하이닉스 전용 매수 후보 엔진
+# ============================================================
+
+def method63_reset_if_new_day():
+    with LOCK:
+        m = S.setdefault("method63", {})
+        if m.get("date") != today():
+            S["method63"] = {
+                "date": today(),
+                "set_count": 0,
+                "last_side": "",
+                "last_exit_ts": 0,
+                "last_alert_ts": {},
+                "last_action": "새 장 시작",
+            }
+
+
+def method63_time_open():
+    if is_before_hhmm(METHOD63_START_TIME):
+        return False
+    if is_after_or_equal_hhmm(METHOD63_NO_NEW_BUY_AFTER):
+        return False
+    return True
+
+
+def method63_side_blocked(side):
+    method63_reset_if_new_day()
+
+    with LOCK:
+        m = S.setdefault("method63", {})
+        set_count = int(to_int(m.get("set_count", 0)))
+        last_side = str(m.get("last_side", ""))
+        last_exit_ts = to_float(m.get("last_exit_ts", 0))
+
+    if set_count >= METHOD63_MAX_SETS_PER_DAY:
+        return True, "하루 최대 2세트 완료"
+
+    if (not METHOD63_SAME_DIRECTION_REENTRY) and last_side == side:
+        return True, "같은 방향 재진입 금지"
+
+    if last_side and last_side != side and last_exit_ts > 0:
+        passed = time.time() - last_exit_ts
+        if passed < METHOD63_REVERSE_WAIT_SEC:
+            remain = int(METHOD63_REVERSE_WAIT_SEC - passed)
+            return True, f"반대 방향 전환 대기 {remain}초"
+
+    return False, ""
+
+
+def method63_candidate():
+    """
+    METHOD63:
+    미래 데이터 없이 현재까지 쌓인 가격, high, low, history만 사용.
+    실계좌 자동매수는 하지 않고 매수 후보 알림만 만든다.
+    """
+    if not METHOD63_HYNIX_ENGINE:
+        return None
+
+    if not method63_time_open():
+        return None
+
+    lev_price = to_float(S.get("prices", {}).get(LEV, 0))
+    inv_price = to_float(S.get("prices", {}).get(INV, 0))
+
+    if lev_price <= 0 or inv_price <= 0:
+        return None
+
+    lev_lrise = low_rise_pct(LEV)
+    inv_lrise = low_rise_pct(INV)
+
+    lev_hdrop = high_drop_pct(LEV)
+    inv_hdrop = high_drop_pct(INV)
+
+    lev_recent = recent_change_pct(LEV, METHOD63_RECENT_POINTS)
+    inv_recent = recent_change_pct(INV, METHOD63_RECENT_POINTS)
+
+    inv_ok = (
+        inv_lrise >= METHOD63_INV_LOW_RISE_PCT
+        and lev_hdrop <= -METHOD63_OPPOSITE_WEAK_PCT
+        and inv_recent >= METHOD63_RECENT_UP_PCT
+    )
+
+    lev_ok = (
+        lev_lrise >= METHOD63_LEV_LOW_RISE_PCT
+        and inv_hdrop <= -METHOD63_OPPOSITE_WEAK_PCT
+        and lev_recent >= METHOD63_RECENT_UP_PCT
+    )
+
+    candidates = []
+
+    if inv_ok:
+        blocked, block_reason = method63_side_blocked("INV")
+        if not blocked:
+            candidates.append({
+                "side": "INV",
+                "symbol": INV,
+                "name": name_of(INV),
+                "price": inv_price,
+                "score": inv_lrise + abs(lev_hdrop) + inv_recent,
+                "reason": (
+                    f"인버스 저점대비 +{inv_lrise:.2f}% / "
+                    f"레버리지 고점대비 {lev_hdrop:.2f}% / "
+                    f"최근{METHOD63_RECENT_POINTS}분 +{inv_recent:.2f}%"
+                ),
+            })
+
+    if lev_ok:
+        blocked, block_reason = method63_side_blocked("LEV")
+        if not blocked:
+            candidates.append({
+                "side": "LEV",
+                "symbol": LEV,
+                "name": name_of(LEV),
+                "price": lev_price,
+                "score": lev_lrise + abs(inv_hdrop) + lev_recent,
+                "reason": (
+                    f"레버리지 저점대비 +{lev_lrise:.2f}% / "
+                    f"인버스 고점대비 {inv_hdrop:.2f}% / "
+                    f"최근{METHOD63_RECENT_POINTS}분 +{lev_recent:.2f}%"
+                ),
+            })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[0]
+
+
+def method63_alert_cooldown_ok(side):
+    method63_reset_if_new_day()
+
+    with LOCK:
+        m = S.setdefault("method63", {})
+        last_map = m.setdefault("last_alert_ts", {})
+        last = to_float(last_map.get(side, 0))
+
+    return time.time() - last >= METHOD63_ALERT_COOLDOWN_SEC
+
+
+def mark_method63_alert_sent(side):
+    method63_reset_if_new_day()
+
+    with LOCK:
+        m = S.setdefault("method63", {})
+        m.setdefault("last_alert_ts", {})[side] = time.time()
+        m["last_action"] = f"{now_short()} METHOD63 {side} 알림"
+
+
+def send_method63_alert():
+    """
+    METHOD63 전용 매수 후보 알림.
+    자동매수는 하지 않는다.
+    """
+    cand = method63_candidate()
+
+    if not cand:
+        return False
+
+    side = cand["side"]
+    sym = cand["symbol"]
+    price = cand["price"]
+
+    if not method63_alert_cooldown_ok(side):
+        return False
+
+    try:
+        step_cash = SWING_BUY_STEP_AMOUNTS[0] if SWING_BUY_STEP_AMOUNTS else 0
+        qty = int((step_cash * ORDER_SAFE_RATIO) // price) if price > 0 else 0
+    except Exception:
+        qty = 0
+
+    buy_url = confirm_url(sym, "BUY", qty)
+    dashboard_url = APP_URL or "https://market-watch-6zgo.onrender.com"
+
+    title = "하이닉스 인버스 우세" if side == "INV" else "하이닉스 레버리지 회복"
+
+    msg = (
+        f"🟢 METHOD63 하이닉스 매수 후보\n"
+        f"종목: {cand['name']} ({sym})\n"
+        f"현재가: {fmt_won(price)}\n"
+        f"추천수량: {qty}주\n"
+        f"판정: {title}\n"
+        f"근거: {cand['reason']}\n"
+        f"규칙: 09:15 이후 / 하루 최대 2세트 / 같은 방향 재진입 금지\n"
+        f"주의: 자동매수 아님. 매수는 사용자가 직접 결정."
+    )
+
+    ok, resp = send_telegram(
+        msg,
+        [
+            [telegram_button("🟢 매수 확인", buy_url)],
+            [telegram_button("📊 대시보드", dashboard_url)],
+        ],
+    )
+
+    write_alert_log(
+        "METHOD63",
+        "method63_buy_candidate",
+        sym,
+        price,
+        0,
+        "BUY_CANDIDATE",
+        cand["reason"],
+        ok,
+        resp,
+    )
+
+    add_alert(msg)
+    mark_method63_alert_sent(side)
+
+    return ok
+
 
 def family_groups():
     return {
@@ -2976,6 +3264,16 @@ class Handler(BaseHTTPRequestHandler):
                 "peak_profit_trailing_auto_sell": PEAK_PROFIT_TRAILING_AUTO_SELL,
                 "alert_only_actionable": ALERT_ONLY_ACTIONABLE,
                 "vi_after_recheck": VI_AFTER_RECHECK,
+                "method63_hynix_engine": METHOD63_HYNIX_ENGINE,
+                "method63_hynix_only": METHOD63_HYNIX_ONLY,
+                "method63_start_time": METHOD63_START_TIME,
+                "method63_max_sets_per_day": METHOD63_MAX_SETS_PER_DAY,
+                "method63_same_direction_reentry": METHOD63_SAME_DIRECTION_REENTRY,
+                "method63_reverse_wait_sec": METHOD63_REVERSE_WAIT_SEC,
+                "breakeven_guard_auto_sell": BREAKEVEN_GUARD_AUTO_SELL,
+                "breakeven_guard_trigger_pct": BREAKEVEN_GUARD_TRIGGER_PCT,
+                "breakeven_guard_exit_pct": BREAKEVEN_GUARD_EXIT_PCT,
+                "no_buy_before": NO_BUY_BEFORE,
             })
         if path == "/api":
             return self.json_response({k: S[k] for k in ["status", "updated", "cash", "total_value", "profit_loss", "profit_rate", "prices", "wma", "scores", "signals", "market_score", "news", "paper", "daytrade", "last_error"]})
