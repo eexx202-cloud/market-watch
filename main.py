@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_13_METHOD63_HYNIX_FINAL"
+OPERATING_VERSION = "OPERATING_V4_14_HYNIX_BUTTON_AUTOSELL_FINAL"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -182,8 +182,10 @@ ENABLE_WORK_SWING_ALERT = os.environ.get("ENABLE_WORK_SWING_ALERT", "true").lowe
 ENABLE_FAST_SCALP_ALERT = os.environ.get("ENABLE_FAST_SCALP_ALERT", "false").lower() == "true"
 ENABLE_FAST_SCALP_LOG_ONLY = os.environ.get("ENABLE_FAST_SCALP_LOG_ONLY", "true").lower() == "true"
 ENABLE_TELEGRAM_BUTTON_ORDER = os.environ.get("ENABLE_TELEGRAM_BUTTON_ORDER", "true").lower() == "true"
-TELEGRAM_BUTTON_TTL_SEC = int(os.environ.get("TELEGRAM_BUTTON_TTL_SEC", "30"))
+TELEGRAM_BUTTON_TTL_SEC = int(os.environ.get("TELEGRAM_BUTTON_TTL_SEC", "90"))
 MAX_BUTTON_PRICE_DRIFT_PCT = float(os.environ.get("MAX_BUTTON_PRICE_DRIFT_PCT", "0.5"))
+TELEGRAM_NOTIFY_START = os.environ.get("TELEGRAM_NOTIFY_START", "08:50")
+TELEGRAM_NOTIFY_END = os.environ.get("TELEGRAM_NOTIFY_END", "16:00")
 FAST_SCALP_SCORE_MIN = int(os.environ.get("FAST_SCALP_SCORE_MIN", "85"))
 FAST_SCALP_LOG_COOLDOWN_SEC = int(os.environ.get("FAST_SCALP_LOG_COOLDOWN_SEC", "60"))
 WORK_SWING_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("WORK_SWING_MAX_REAL_ALERTS_PER_DAY", "4"))
@@ -200,7 +202,7 @@ AUTO_SELL_PROFIT_ONLY = os.environ.get("AUTO_SELL_PROFIT_ONLY", "true").lower() 
 AUTO_SELL_LOSS_CUT = os.environ.get("AUTO_SELL_LOSS_CUT", "false").lower() == "true"
 AUTO_SELL_MIN_PROFIT_PCT = float(os.environ.get("AUTO_SELL_MIN_PROFIT_PCT", "1.0"))
 AUTO_SELL_PROFIT_START_PCT = float(os.environ.get("AUTO_SELL_PROFIT_START_PCT", "2.0"))
-AUTO_SELL_TRAIL_DROP_PCT = float(os.environ.get("AUTO_SELL_TRAIL_DROP_PCT", "1.5"))
+AUTO_SELL_TRAIL_DROP_PCT = float(os.environ.get("AUTO_SELL_TRAIL_DROP_PCT", "0.3"))
 AUTO_SELL_BIG_PROFIT_PCT = float(os.environ.get("AUTO_SELL_BIG_PROFIT_PCT", "5.0"))
 AUTO_SELL_BIG_TRAIL_DROP_PCT = float(os.environ.get("AUTO_SELL_BIG_TRAIL_DROP_PCT", "2.0"))
 AUTO_SELL_FORCE_EXIT_TIME = os.environ.get("AUTO_SELL_FORCE_EXIT_TIME", "15:15")
@@ -231,11 +233,11 @@ METHOD63_MAX_SETS_PER_DAY = int(os.environ.get("METHOD63_MAX_SETS_PER_DAY", "2")
 METHOD63_SAME_DIRECTION_REENTRY = os.environ.get("METHOD63_SAME_DIRECTION_REENTRY", "false").lower() == "true"
 METHOD63_REVERSE_WAIT_SEC = int(os.environ.get("METHOD63_REVERSE_WAIT_SEC", "600"))
 
-METHOD63_INV_LOW_RISE_PCT = float(os.environ.get("METHOD63_INV_LOW_RISE_PCT", "4.0"))
-METHOD63_LEV_LOW_RISE_PCT = float(os.environ.get("METHOD63_LEV_LOW_RISE_PCT", "6.0"))
-METHOD63_OPPOSITE_WEAK_PCT = float(os.environ.get("METHOD63_OPPOSITE_WEAK_PCT", "2.0"))
-METHOD63_RECENT_UP_PCT = float(os.environ.get("METHOD63_RECENT_UP_PCT", "0.2"))
-METHOD63_RECENT_POINTS = int(os.environ.get("METHOD63_RECENT_POINTS", "5"))
+METHOD63_INV_LOW_RISE_PCT = float(os.environ.get("METHOD63_INV_LOW_RISE_PCT", "3.0"))
+METHOD63_LEV_LOW_RISE_PCT = float(os.environ.get("METHOD63_LEV_LOW_RISE_PCT", "7.0"))
+METHOD63_OPPOSITE_WEAK_PCT = float(os.environ.get("METHOD63_OPPOSITE_WEAK_PCT", "1.0"))
+METHOD63_RECENT_UP_PCT = float(os.environ.get("METHOD63_RECENT_UP_PCT", "0.1"))
+METHOD63_RECENT_POINTS = int(os.environ.get("METHOD63_RECENT_POINTS", "10"))
 METHOD63_ALERT_COOLDOWN_SEC = int(os.environ.get("METHOD63_ALERT_COOLDOWN_SEC", "300"))
 
 BREAKEVEN_GUARD_AUTO_SELL = os.environ.get("BREAKEVEN_GUARD_AUTO_SELL", "true").lower() == "true"
@@ -245,6 +247,9 @@ BREAKEVEN_GUARD_EXIT_PCT = float(os.environ.get("BREAKEVEN_GUARD_EXIT_PCT", "0.3
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
 TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200", "494310", "488080", "469150", "005930", "000660"]
+# 신규 매수 버튼/매수 알림은 하이닉스 레버리지/인버스만 허용한다.
+# 기존 보유종목 자동매도는 TRADE_ALLOWED_SYMBOLS 기준으로 계속 보호한다.
+HYNIX_TRADE_SYMBOLS = {LEV, INV}
 FAST_SCALP_ALLOWED_SYMBOLS = TRADE_ALLOWED_SYMBOLS
 WORK_SWING_ALLOWED_SYMBOLS = TRADE_ALLOWED_SYMBOLS
 
@@ -586,12 +591,24 @@ def post_kakao_template(template):
 def telegram_enabled():
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
+def telegram_notify_time_open():
+    # 텔레그램 일반 알림은 08:50~16:00까지만 보낸다.
+    # 주문/자동매도 로직 자체는 막지 않고, 메시지만 시간 제한한다.
+    sh, sm = parse_hhmm(TELEGRAM_NOTIFY_START, 8, 50)
+    eh, em = parse_hhmm(TELEGRAM_NOTIFY_END, 16, 0)
+    n = now_kst()
+    return (sh, sm) <= (n.hour, n.minute) <= (eh, em)
+
 def telegram_button(text, url):
     return {"text": text, "url": url}
 
-def send_telegram(msg, buttons=None):
+def send_telegram(msg, buttons=None, force=False):
     # 텔레그램은 inline_keyboard 버튼이 카카오보다 안정적으로 보임.
-    # 버튼을 눌러도 바로 주문하지 않고 /confirm 확인 화면으로만 이동함.
+    # 일반 매수/매도/상태 알림은 16:00 이후 차단한다.
+    # 서버 오류처럼 꼭 필요한 알림은 force=True로 예외 전송할 수 있다.
+    if (not force) and (not telegram_notify_time_open()):
+        write_alert_log("SYSTEM", "telegram", "", 0, 0, "skipped", "TELEGRAM_NOTIFY_TIME_CLOSED", False, msg.split("\n")[0])
+        return False, f"TELEGRAM 알림 시간 아님({TELEGRAM_NOTIFY_START}~{TELEGRAM_NOTIFY_END})"
     if not telegram_enabled():
         write_alert_log("SYSTEM", "telegram", "", 0, 0, "not_sent", "TELEGRAM 설정 없음", False, "missing token/chat_id")
         return False, "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 없음"
@@ -687,6 +704,10 @@ def create_trade_button_url(sym, side, qty, alert_price, reason=""):
     return f"{base}/telegram_order?{qs}" if base else "/telegram_order?" + qs
 
 def handle_telegram_order(qs):
+    """텔레그램 버튼 주문 처리.
+    BUY는 하이닉스 2종목만 허용하고, 클릭 순간 METHOD/HYNIX 조건을 다시 검사한다.
+    조건 불충족이면 주문하지 않고 '매수 실패'로 종료한다.
+    """
     oid = (qs.get("oid") or [""])[0]
     with LOCK:
         item = S.setdefault("pending_orders", {}).get(oid)
@@ -694,26 +715,42 @@ def handle_telegram_order(qs):
         return {"ok": False, "message": "주문 버튼이 없거나 만료되었습니다."}
     if item.get("used"):
         return {"ok": False, "message": "이미 사용된 주문 버튼입니다."}
+
     age = time.time() - to_float(item.get("created_at", 0))
     if age > TELEGRAM_BUTTON_TTL_SEC:
         with LOCK:
             S["pending_orders"].pop(oid, None)
-        return {"ok": False, "message": f"주문 버튼 만료: {int(age)}초 경과. 새 신호를 기다리세요."}
+        return {"ok": False, "message": f"매수 실패: 주문 버튼 만료 {int(age)}초 경과. 새 신호를 기다리세요."}
+
     sym = str(item.get("symbol", ""))
     side = str(item.get("side", ""))
     qty = int(to_int(item.get("qty", 0)))
     alert_price = to_float(item.get("alert_price", 0))
     current_price = to_float(S.get("prices", {}).get(sym, 0))
-    if sym not in TRADE_ALLOWED_SYMBOLS:
-        return {"ok": False, "message": "허용되지 않은 실전 매매 후보입니다."}
+
+    if side == "BUY":
+        if not ENABLE_TELEGRAM_BUTTON_ORDER:
+            return {"ok": False, "message": "매수 실패: 텔레그램 버튼매수가 비활성화되어 있습니다."}
+        if ENABLE_REAL_AUTO_BUY:
+            return {"ok": False, "message": "매수 실패: 자동매수 ON 상태에서는 버튼매수 혼동 방지를 위해 차단합니다."}
+        if sym not in HYNIX_TRADE_SYMBOLS:
+            return {"ok": False, "message": "매수 실패: 신규매수는 하이닉스 레버리지/인버스만 허용합니다."}
+        ok_live, live_reason = method63_live_buy_ok(sym)
+        if not ok_live:
+            return {"ok": False, "message": f"매수 실패: {live_reason}"}
+    else:
+        if sym not in TRADE_ALLOWED_SYMBOLS:
+            return {"ok": False, "message": "허용되지 않은 실전 매매 후보입니다."}
+
     if current_price <= 0 or alert_price <= 0:
         return {"ok": False, "message": "현재가 확인 실패. 주문 차단."}
     drift = pct(current_price, alert_price)
     # 매수는 알림가보다 비싸지면 차단, 매도는 알림가보다 크게 밀리면 차단
     if side == "BUY" and drift > MAX_BUTTON_PRICE_DRIFT_PCT:
-        return {"ok": False, "message": f"가격 상승으로 매수 차단: 알림가 대비 {drift:.2f}%"}
+        return {"ok": False, "message": f"매수 실패: 알림가 대비 +{drift:.2f}% 상승. 추격매수 금지."}
     if side == "SELL" and drift < -MAX_BUTTON_PRICE_DRIFT_PCT:
-        return {"ok": False, "message": f"가격 하락으로 매도 재확인 필요: 알림가 대비 {drift:.2f}%"}
+        return {"ok": False, "message": f"매도 재확인 필요: 알림가 대비 {drift:.2f}%"}
+
     with LOCK:
         S.setdefault("pending_orders", {}).setdefault(oid, {})["used"] = True
     result = place_order_manual(sym, side, qty)
@@ -721,6 +758,11 @@ def handle_telegram_order(qs):
     result["alert_price"] = alert_price
     result["current_price"] = current_price
     result["price_drift_pct"] = round(drift, 3)
+
+    if result.get("ok") and side == "BUY" and sym in HYNIX_TRADE_SYMBOLS:
+        method63_mark_buy_success(sym)
+        result["auto_sell_watch"] = "ON"
+        result["message"] = str(result.get("message", "성공")) + " / 자동매도 감시 ON"
     return result
 
 def send_signal_kakao(sym, title):
@@ -1133,8 +1175,10 @@ def auto_sell_reason(sym, qty, price, buy, high, profit, drop_from_high):
     max_profit = pct(high, buy)
     if max_profit >= AUTO_SELL_BIG_PROFIT_PCT and profit >= 0 and drop_from_high <= -AUTO_SELL_BIG_TRAIL_DROP_PCT:
         return f"큰 수익권 고점이탈 자동매도: 최고수익={max_profit:.2f}%, 현재={profit:.2f}%, 고점대비={drop_from_high:.2f}%"
-    # 일반 수익 보호: 반대 방향/계열 약화 또는 WMA 약화가 같이 나오면 실행
+    # 일반 수익 보호: 하이닉스 버튼매수 종목은 +2% 이후 -0.3%p 이탈이면 즉시 보호매도.
     if max_profit >= AUTO_SELL_PROFIT_START_PCT and profit >= AUTO_SELL_MIN_PROFIT_PCT and drop_from_high <= -AUTO_SELL_TRAIL_DROP_PCT:
+        if sym in HYNIX_TRADE_SYMBOLS:
+            return f"하이닉스 수익권 고점이탈 자동매도: 최고수익={max_profit:.2f}%, 현재={profit:.2f}%, 고점대비={drop_from_high:.2f}%"
         wm = S.get("wma", {}).get(sym, {})
         w5 = to_float(wm.get("wma5", 0))
         w20 = to_float(wm.get("wma20", 0))
@@ -1160,24 +1204,9 @@ def execute_real_auto_sell(sym, qty, reason):
     ok = bool(result.get("ok"))
 
     if ok and sym in [LEV, INV]:
-        with LOCK:
-            m = S.setdefault("method63", {})
-            if m.get("date") != today():
-                m.update({
-                    "date": today(),
-                    "set_count": 0,
-                    "last_side": "",
-                    "last_exit_ts": 0,
-                    "last_alert_ts": {},
-                    "last_action": "새 장 시작",
-                })
-
-            m["set_count"] = int(to_int(m.get("set_count", 0))) + 1
-            m["last_side"] = "INV" if sym == INV else "LEV"
-            m["last_exit_ts"] = time.time()
-            m["last_action"] = f"{now_short()} METHOD63 자동매도 완료 {name_of(sym)}"
-
-        save_state()
+        # 세트 카운트는 매수 성공 시 이미 증가한다.
+        # 매도 완료 시에는 반대방향 10분 대기 기준 시간만 기록한다.
+        method63_mark_exit(sym)
     price = S["prices"].get(sym, 0)
     title = "🔴 수익보호 자동매도 완료" if ok else "⚠️ 수익보호 자동매도 실패"
     msg = (
@@ -1859,6 +1888,13 @@ def method63_side_blocked(side):
         last_side = str(m.get("last_side", ""))
         last_exit_ts = to_float(m.get("last_exit_ts", 0))
 
+    # 이미 하이닉스 레버리지/인버스 보유 중이면 새 매수 신호는 막는다.
+    with LOCK:
+        hold_qty_map = dict(S.get("hold_qty", {}))
+        real_watch_map = dict(S.get("real_watch", {}))
+    if to_float(hold_qty_map.get(LEV, 0)) > 1 or to_float(hold_qty_map.get(INV, 0)) > 1 or LEV in real_watch_map or INV in real_watch_map:
+        return True, "하이닉스 포지션 보유 중: 신규매수 금지"
+
     if set_count >= METHOD63_MAX_SETS_PER_DAY:
         return True, "하루 최대 2세트 완료"
 
@@ -1954,6 +1990,73 @@ def method63_candidate():
     return candidates[0]
 
 
+
+def method63_live_buy_ok(sym):
+    """텔레그램 버튼 클릭 순간 다시 확인하는 하이닉스 매수 조건."""
+    if sym not in HYNIX_TRADE_SYMBOLS:
+        return False, "하이닉스 레버리지/인버스가 아닙니다."
+    if not method63_time_open():
+        return False, f"매수 가능 시간이 아닙니다({METHOD63_START_TIME}~{METHOD63_NO_NEW_BUY_AFTER})."
+
+    lev_price = to_float(S.get("prices", {}).get(LEV, 0))
+    inv_price = to_float(S.get("prices", {}).get(INV, 0))
+    if lev_price <= 0 or inv_price <= 0:
+        return False, "하이닉스 레버리지/인버스 현재가 확인 실패"
+
+    lev_lrise = low_rise_pct(LEV)
+    inv_lrise = low_rise_pct(INV)
+    lev_hdrop = high_drop_pct(LEV)
+    inv_hdrop = high_drop_pct(INV)
+    lev_recent = recent_change_pct(LEV, METHOD63_RECENT_POINTS)
+    inv_recent = recent_change_pct(INV, METHOD63_RECENT_POINTS)
+
+    if sym == INV:
+        blocked, block_reason = method63_side_blocked("INV")
+        if blocked:
+            return False, block_reason
+        ok = inv_lrise >= METHOD63_INV_LOW_RISE_PCT and lev_hdrop <= -METHOD63_OPPOSITE_WEAK_PCT and inv_recent >= METHOD63_RECENT_UP_PCT
+        reason = f"인버스 조건 재검사: 저점대비 +{inv_lrise:.2f}%, 레버리지 고점대비 {lev_hdrop:.2f}%, 최근{METHOD63_RECENT_POINTS}개 {inv_recent:.2f}%"
+        return (True, reason) if ok else (False, reason)
+
+    if sym == LEV:
+        blocked, block_reason = method63_side_blocked("LEV")
+        if blocked:
+            return False, block_reason
+        ok = lev_lrise >= METHOD63_LEV_LOW_RISE_PCT and inv_hdrop <= -METHOD63_OPPOSITE_WEAK_PCT and lev_recent >= METHOD63_RECENT_UP_PCT
+        reason = f"레버리지 조건 재검사: 저점대비 +{lev_lrise:.2f}%, 인버스 고점대비 {inv_hdrop:.2f}%, 최근{METHOD63_RECENT_POINTS}개 {lev_recent:.2f}%"
+        return (True, reason) if ok else (False, reason)
+
+    return False, "알 수 없는 종목"
+
+
+def method63_mark_buy_success(sym):
+    """텔레그램 버튼매수 성공 시 1세트를 사용한 것으로 기록한다."""
+    method63_reset_if_new_day()
+    side = "INV" if sym == INV else "LEV" if sym == LEV else ""
+    if not side:
+        return
+    with LOCK:
+        m = S.setdefault("method63", {})
+        m["set_count"] = int(to_int(m.get("set_count", 0))) + 1
+        m["last_side"] = side
+        m["last_action"] = f"{now_short()} METHOD/HYNIX 버튼매수 성공 {name_of(sym)}"
+    save_state()
+
+
+def method63_mark_exit(sym):
+    """하이닉스 자동매도 완료 시 반대방향 10분 대기 기준 시간을 기록한다."""
+    method63_reset_if_new_day()
+    side = "INV" if sym == INV else "LEV" if sym == LEV else ""
+    if not side:
+        return
+    with LOCK:
+        m = S.setdefault("method63", {})
+        m["last_side"] = side
+        m["last_exit_ts"] = time.time()
+        m["last_action"] = f"{now_short()} METHOD/HYNIX 자동매도 완료 {name_of(sym)}"
+    save_state()
+
+
 def method63_alert_cooldown_ok(side):
     method63_reset_if_new_day()
 
@@ -1997,7 +2100,8 @@ def send_method63_alert():
     except Exception:
         qty = 0
 
-    buy_url = confirm_url(sym, "BUY", qty)
+    buy_url = create_trade_button_url(sym, "BUY", qty, price, "METHOD/HYNIX 버튼매수 후보")
+    confirm = confirm_url(sym, "BUY", qty)
     dashboard_url = APP_URL or "https://market-watch-6zgo.onrender.com"
 
     title = "하이닉스 인버스 우세" if side == "INV" else "하이닉스 레버리지 회복"
@@ -2010,14 +2114,14 @@ def send_method63_alert():
         f"판정: {title}\n"
         f"근거: {cand['reason']}\n"
         f"규칙: 09:15 이후 / 하루 최대 2세트 / 같은 방향 재진입 금지\n"
-        f"주의: 자동매수 아님. 매수는 사용자가 직접 결정."
+        f"주의: 자동매수 아님. 텔레그램 버튼은 {TELEGRAM_BUTTON_TTL_SEC}초 안에만 유효. 클릭 시 조건 재검사."
     )
 
     ok, resp = send_telegram(
         msg,
         [
-            [telegram_button("🟢 매수 확인", buy_url)],
-            [telegram_button("📊 대시보드", dashboard_url)],
+            [telegram_button(f"🟢 {TELEGRAM_BUTTON_TTL_SEC}초 매수 실행", buy_url)],
+            [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", dashboard_url)],
         ],
     )
 
@@ -2264,6 +2368,11 @@ def target_next_stage_amount(sym):
     return SWING_BUY_STEP_AMOUNTS[stage], stage + 1
 
 def send_real_pattern_buy_alert(sym, amount, stage, reason):
+    # 신규매수 텔레그램 알림은 하이닉스 레버리지/인버스만 허용한다.
+    # 삼성/코스피/코스닥/반도체/AI 점수 후보는 화면/CSV 참고용으로만 둔다.
+    if sym not in HYNIX_TRADE_SYMBOLS:
+        write_alert_log("REAL", "target_buy_blocked", sym, S["prices"].get(sym, 0), 0, "BLOCKED", "신규매수 알림은 하이닉스 2종목만 허용", False, "hynix_only")
+        return False
     price = S["prices"].get(sym, 0)
     qty = int((amount * ORDER_SAFE_RATIO) // price) if price > 0 else 0
     if qty <= 0:
@@ -2287,12 +2396,12 @@ def send_real_pattern_buy_alert(sym, amount, stage, reason):
         f"현재가: {fmt_won(price)}\n"
         f"시장: {target_market_regime()}\n"
         f"이유: {reason}\n"
-        f"실제 주문: 텔레그램 버튼 30초 유효 / 클릭 시 현재가 재확인"
+        f"실제 주문: 텔레그램 버튼 90초 유효 / 클릭 시 현재가·조건 재확인"
     )
     url = create_trade_button_url(sym, "BUY", qty, price, reason)
     confirm = confirm_url(sym, "BUY", qty)
     add_alert(msg)
-    send_telegram(msg, [[telegram_button("🟢 30초 매수 실행", url)], [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", APP_URL)]])
+    send_telegram(msg, [[telegram_button(f"🟢 {TELEGRAM_BUTTON_TTL_SEC}초 매수 실행", url)], [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", APP_URL)]])
     write_alert_log("REAL", "target_buy", sym, price, 0, "BUY", reason, True, "telegram")
     return True
 
@@ -2315,12 +2424,12 @@ def send_real_pattern_sell_alert(sym, qty, reason):
         f"수량: {qty}주\n"
         f"현재가: {fmt_won(price)}\n"
         f"이유: {reason}\n"
-        f"실제 주문: 텔레그램 버튼 30초 유효 / 클릭 시 현재가 재확인"
+        f"실제 주문: 텔레그램 버튼 90초 유효 / 클릭 시 현재가·조건 재확인"
     )
     url = create_trade_button_url(sym, "SELL", qty, price, reason)
     confirm = confirm_url(sym, "SELL", qty)
     add_alert(msg)
-    send_telegram(msg, [[telegram_button("🔴 30초 매도 실행", url)], [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", APP_URL)]])
+    send_telegram(msg, [[telegram_button(f"🔴 {TELEGRAM_BUTTON_TTL_SEC}초 매도 실행", url)], [telegram_button("확인화면", confirm), telegram_button("📊 대시보드", APP_URL)]])
     write_alert_log("REAL", "target_sell", sym, price, 0, "SELL", reason, True, "telegram")
     return True
 
@@ -3254,7 +3363,9 @@ class Handler(BaseHTTPRequestHandler):
                 "real_target_symbols": REAL_TARGET_SYMBOLS,
                 "paper_alert_enabled": False,
                 "real_pattern_alert_enabled": True,
-                "telegram_trade_buttons": "30sec_direct_button_with_price_recheck",
+                "telegram_trade_buttons": f"{TELEGRAM_BUTTON_TTL_SEC}sec_direct_button_with_live_condition_recheck",
+                "telegram_notify_hours": f"{TELEGRAM_NOTIFY_START}~{TELEGRAM_NOTIFY_END}",
+                "hynix_trade_symbols": sorted(list(HYNIX_TRADE_SYMBOLS)),
                 "real_alert_mode": REAL_ALERT_MODE,
                 "fast_scalp_alert": ENABLE_FAST_SCALP_ALERT,
                 "fast_scalp_log_only": ENABLE_FAST_SCALP_LOG_ONLY,
@@ -3273,6 +3384,10 @@ class Handler(BaseHTTPRequestHandler):
                 "breakeven_guard_auto_sell": BREAKEVEN_GUARD_AUTO_SELL,
                 "breakeven_guard_trigger_pct": BREAKEVEN_GUARD_TRIGGER_PCT,
                 "breakeven_guard_exit_pct": BREAKEVEN_GUARD_EXIT_PCT,
+                "auto_sell_profit_start_pct": AUTO_SELL_PROFIT_START_PCT,
+                "auto_sell_trail_drop_pct": AUTO_SELL_TRAIL_DROP_PCT,
+                "button_price_drift_pct": MAX_BUTTON_PRICE_DRIFT_PCT,
+                "telegram_button_ttl_sec": TELEGRAM_BUTTON_TTL_SEC,
                 "no_buy_before": NO_BUY_BEFORE,
             })
         if path == "/api":
