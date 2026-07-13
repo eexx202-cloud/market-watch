@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true"
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
-ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "true").lower() == "true"
+ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "false").lower() == "true"
 NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
 REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "30"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_14_HYNIX_BUTTON_AUTOSELL_FINAL"
+OPERATING_VERSION = "OPERATING_V4_18_FINAL_CONFIGCHECK_SHADOW_WEEKDAY_BACKUP1535"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -185,7 +185,7 @@ ENABLE_TELEGRAM_BUTTON_ORDER = os.environ.get("ENABLE_TELEGRAM_BUTTON_ORDER", "t
 TELEGRAM_BUTTON_TTL_SEC = int(os.environ.get("TELEGRAM_BUTTON_TTL_SEC", "90"))
 MAX_BUTTON_PRICE_DRIFT_PCT = float(os.environ.get("MAX_BUTTON_PRICE_DRIFT_PCT", "0.5"))
 TELEGRAM_NOTIFY_START = os.environ.get("TELEGRAM_NOTIFY_START", "08:50")
-TELEGRAM_NOTIFY_END = os.environ.get("TELEGRAM_NOTIFY_END", "16:00")
+TELEGRAM_NOTIFY_END = os.environ.get("TELEGRAM_NOTIFY_END", "15:30")
 FAST_SCALP_SCORE_MIN = int(os.environ.get("FAST_SCALP_SCORE_MIN", "85"))
 FAST_SCALP_LOG_COOLDOWN_SEC = int(os.environ.get("FAST_SCALP_LOG_COOLDOWN_SEC", "60"))
 WORK_SWING_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("WORK_SWING_MAX_REAL_ALERTS_PER_DAY", "4"))
@@ -243,6 +243,34 @@ METHOD63_ALERT_COOLDOWN_SEC = int(os.environ.get("METHOD63_ALERT_COOLDOWN_SEC", 
 BREAKEVEN_GUARD_AUTO_SELL = os.environ.get("BREAKEVEN_GUARD_AUTO_SELL", "true").lower() == "true"
 BREAKEVEN_GUARD_TRIGGER_PCT = float(os.environ.get("BREAKEVEN_GUARD_TRIGGER_PCT", "2.0"))
 BREAKEVEN_GUARD_EXIT_PCT = float(os.environ.get("BREAKEVEN_GUARD_EXIT_PCT", "0.3"))
+
+
+# ============================================================
+# SHADOW FIXED V1 실전가정 가상체결
+# - 실계좌 주문을 절대 호출하지 않는 독립 가상계좌
+# - 6/24~7/10 분석에서 확정한 고정시간 조합 규칙을 그대로 검증
+# - 검증기간에는 아래 조건값을 바꾸지 않는다.
+# ============================================================
+SHADOW_FIXED_ENABLED = os.environ.get("SHADOW_FIXED_ENABLED", "true").lower() == "true"
+SHADOW_FIXED_START_CASH = int(float(os.environ.get("SHADOW_FIXED_START_CASH", "10000000")))
+SHADOW_FIXED_NOTIFY = os.environ.get("SHADOW_FIXED_NOTIFY", "true").lower() == "true"
+SHADOW_FIXED_STRATEGY_ID = "HYNIX_FIXED_REPLAY_V1"
+
+# 오전 인버스: 09:15~09:45 등락률 범위, 09:46 체결
+SHADOW_INV_BASE_TIME = "09:15"
+SHADOW_INV_SIGNAL_TIME = "09:45"
+SHADOW_INV_ENTRY_TIME = "09:46"
+SHADOW_INV_EXIT_TIME = "14:00"
+SHADOW_INV_MOVE_MIN_PCT = float(os.environ.get("SHADOW_INV_MOVE_MIN_PCT", "-7.5"))
+SHADOW_INV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_INV_MOVE_MAX_PCT", "4.0"))
+
+# 오후 레버리지: 11:45~12:45 등락률 범위, 12:46 체결, 15:00 청산
+SHADOW_LEV_BASE_TIME = "11:45"
+SHADOW_LEV_SIGNAL_TIME = "12:45"
+SHADOW_LEV_ENTRY_TIME = "12:46"
+SHADOW_LEV_EXIT_TIME = "15:00"
+SHADOW_LEV_MOVE_MIN_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MIN_PCT", "-4.0"))
+SHADOW_LEV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MAX_PCT", "1.0"))
 
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
@@ -312,6 +340,22 @@ S = {
         "profit_rate": 0,
         "last_action": "없음",
     },
+    "shadow_fixed": {
+        "date": "",
+        "start_cash": SHADOW_FIXED_START_CASH,
+        "cash": SHADOW_FIXED_START_CASH,
+        "position": None,
+        "realized_pl": 0,
+        "asset": SHADOW_FIXED_START_CASH,
+        "profit_rate": 0,
+        "checkpoints": {},
+        "inv_evaluated": False,
+        "lev_evaluated": False,
+        "inv_signal": False,
+        "lev_signal": False,
+        "last_action": "초기화",
+        "trades": [],
+    },
     "daytrade": {
         "date": "",
         "cash": 0,
@@ -345,6 +389,10 @@ S = {
 
 def now_kst():
     return datetime.now(KST)
+
+def is_weekend_kst():
+    """토요일(5), 일요일(6)이면 True."""
+    return now_kst().weekday() >= 5
 
 def today():
     return now_kst().strftime("%Y-%m-%d")
@@ -467,6 +515,16 @@ def paper_path():
 def fast_scalp_path():
     return os.path.join(day_dir(), f"fast_scalp_signals_{today()}.csv")
 
+
+def shadow_fixed_path():
+    return os.path.join(day_dir(), f"shadow_fixed_trades_{today()}.csv")
+
+def shadow_fixed_signal_path():
+    return os.path.join(day_dir(), f"shadow_fixed_signals_{today()}.csv")
+
+def shadow_fixed_summary_path():
+    return os.path.join(day_dir(), f"shadow_fixed_summary_{today()}.csv")
+
 def orders_path():
     return os.path.join(day_dir(), f"real_orders_{today()}.csv")
 
@@ -516,7 +574,12 @@ def write_alert_log(level, kind, sym, price, profit_rate, decision, reason, sent
 def save_state():
     try:
         with LOCK:
-            data = {"real_base_cash": S["real_base_cash"], "paper": S["paper"], "real_watch": S.get("real_watch", {})}
+            data = {
+                "real_base_cash": S["real_base_cash"],
+                "paper": S["paper"],
+                "shadow_fixed": S.get("shadow_fixed", {}),
+                "real_watch": S.get("real_watch", {}),
+            }
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -536,6 +599,9 @@ def load_state():
             paper = data.get("paper")
             if isinstance(paper, dict):
                 S["paper"].update(paper)
+            shadow = data.get("shadow_fixed")
+            if isinstance(shadow, dict):
+                S["shadow_fixed"].update(shadow)
             rw = data.get("real_watch")
             if isinstance(rw, dict):
                 S["real_watch"] = rw
@@ -592,10 +658,12 @@ def telegram_enabled():
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 def telegram_notify_time_open():
-    # 텔레그램 일반 알림은 08:50~16:00까지만 보낸다.
+    # 텔레그램 일반 알림은 평일 08:50~15:30까지만 보낸다.
     # 주문/자동매도 로직 자체는 막지 않고, 메시지만 시간 제한한다.
+    if is_weekend_kst():
+        return False
     sh, sm = parse_hhmm(TELEGRAM_NOTIFY_START, 8, 50)
-    eh, em = parse_hhmm(TELEGRAM_NOTIFY_END, 16, 0)
+    eh, em = parse_hhmm(TELEGRAM_NOTIFY_END, 15, 30)
     n = now_kst()
     return (sh, sm) <= (n.hour, n.minute) <= (eh, em)
 
@@ -632,7 +700,9 @@ def send_telegram(msg, buttons=None, force=False):
         write_alert_log("ERROR", "telegram", "", 0, 0, "exception", msg.split("\n")[0], False, str(e))
         return False, str(e)
 
-def send_telegram_file(filepath, caption=""):
+def send_telegram_file(filepath, caption="", force=False):
+    if (not force) and (not telegram_notify_time_open()):
+        return False, f"TELEGRAM 알림 시간 아님({TELEGRAM_NOTIFY_START}~{TELEGRAM_NOTIFY_END}, 주말 제외)"
     if not telegram_enabled():
         return False, "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 없음"
     if not os.path.exists(filepath):
@@ -3032,6 +3102,302 @@ def run_paper_ai_if_enabled():
     update_paper_asset()
     save_state()
 
+# ============================================================
+# SHADOW FIXED V1 실전가정 가상체결 엔진
+# ============================================================
+
+def _shadow_default_state(cash=None):
+    start = int(cash or SHADOW_FIXED_START_CASH)
+    return {
+        "date": today(),
+        "start_cash": start,
+        "cash": start,
+        "position": None,
+        "realized_pl": 0,
+        "asset": start,
+        "profit_rate": 0,
+        "checkpoints": {},
+        "inv_evaluated": False,
+        "lev_evaluated": False,
+        "inv_signal": False,
+        "lev_signal": False,
+        "last_action": "일일 초기화",
+        "trades": [],
+    }
+
+
+def _shadow_roll_date():
+    """날짜가 바뀌어도 누적 현금은 유지하고 일일 판정 플래그만 초기화."""
+    with LOCK:
+        st = S.get("shadow_fixed") or _shadow_default_state()
+        if st.get("date") == today():
+            return
+        carry_cash = int(to_float(st.get("cash", SHADOW_FIXED_START_CASH)))
+        # 비정상적으로 전일 포지션이 남으면 현재가로 정리해 누적자산을 보존한다.
+        pos = st.get("position")
+        if isinstance(pos, dict):
+            sym = str(pos.get("symbol", ""))
+            qty = int(to_float(pos.get("qty", 0)))
+            px = to_float(S.get("prices", {}).get(sym, pos.get("entry_price", 0)))
+            if qty > 0 and px > 0:
+                carry_cash += int(qty * px)
+        start_cash = int(to_float(st.get("start_cash", SHADOW_FIXED_START_CASH)))
+        fresh = _shadow_default_state(carry_cash)
+        fresh["start_cash"] = start_cash
+        fresh["cash"] = carry_cash
+        fresh["asset"] = carry_cash
+        fresh["profit_rate"] = pct(carry_cash, start_cash) if start_cash else 0
+        S["shadow_fixed"] = fresh
+    save_state()
+
+
+def _shadow_checkpoint(hhmm, sym):
+    """해당 분 안에서 마지막 수집가격을 계속 덮어써 1분 종가처럼 고정."""
+    n = now_kst()
+    if n.strftime("%H:%M") != hhmm:
+        return
+    price = to_float(S.get("prices", {}).get(sym, 0))
+    if price <= 0:
+        return
+    key = f"{sym}_{hhmm}"
+    with LOCK:
+        S["shadow_fixed"].setdefault("checkpoints", {})[key] = {
+            "price": price,
+            "captured_at": now_text(),
+        }
+
+
+def _shadow_get_checkpoint(sym, hhmm):
+    key = f"{sym}_{hhmm}"
+    with LOCK:
+        item = S.get("shadow_fixed", {}).get("checkpoints", {}).get(key, {})
+    return to_float(item.get("price", 0)) if isinstance(item, dict) else 0
+
+
+def _shadow_update_asset():
+    with LOCK:
+        st = S["shadow_fixed"]
+        cash = to_float(st.get("cash", 0))
+        pos = st.get("position")
+        total = cash
+        if isinstance(pos, dict):
+            sym = str(pos.get("symbol", ""))
+            qty = to_float(pos.get("qty", 0))
+            px = to_float(S.get("prices", {}).get(sym, pos.get("entry_price", 0)))
+            total += qty * px
+        st["asset"] = int(total)
+        start = to_float(st.get("start_cash", SHADOW_FIXED_START_CASH))
+        st["profit_rate"] = pct(total, start) if start else 0
+
+
+def _shadow_write_signal(kind, sym, move_pct, passed, reason):
+    row = {
+        "time": now_text(),
+        "strategy": SHADOW_FIXED_STRATEGY_ID,
+        "kind": kind,
+        "symbol": sym,
+        "name": name_of(sym),
+        "move_pct": round(move_pct, 4),
+        "passed": bool(passed),
+        "reason": reason,
+        "real_order": False,
+    }
+    write_row(shadow_fixed_signal_path(),
+              ["time", "strategy", "kind", "symbol", "name", "move_pct", "passed", "reason", "real_order"], row)
+
+
+def _shadow_record(action, sym, price, qty, pl, reason):
+    _shadow_update_asset()
+    with LOCK:
+        st = S["shadow_fixed"]
+        row = {
+            "time": now_text(),
+            "strategy": SHADOW_FIXED_STRATEGY_ID,
+            "action": action,
+            "symbol": sym,
+            "name": name_of(sym),
+            "price": round(to_float(price), 2),
+            "qty": int(qty),
+            "pl": int(pl),
+            "cash": int(to_float(st.get("cash", 0))),
+            "asset": int(to_float(st.get("asset", 0))),
+            "profit_rate": round(to_float(st.get("profit_rate", 0)), 4),
+            "reason": reason,
+            "real_order": False,
+        }
+        st.setdefault("trades", []).insert(0, row)
+        st["trades"] = st["trades"][:100]
+        st["last_action"] = f"{now_short()} {action} {name_of(sym)}"
+    write_row(shadow_fixed_path(),
+              ["time", "strategy", "action", "symbol", "name", "price", "qty", "pl", "cash", "asset", "profit_rate", "reason", "real_order"], row)
+    save_state()
+
+
+def shadow_fixed_buy(sym, reason):
+    """가상 전액매수. 실제 주문 함수는 절대 호출하지 않는다."""
+    price = to_float(S.get("prices", {}).get(sym, 0))
+    if price <= 0:
+        return False
+    with LOCK:
+        st = S["shadow_fixed"]
+        if st.get("position"):
+            return False
+        cash = int(to_float(st.get("cash", 0)))
+        qty = int(cash // price)
+        if qty <= 0:
+            return False
+        cost = int(qty * price)
+        st["cash"] = cash - cost
+        st["position"] = {
+            "symbol": sym,
+            "qty": qty,
+            "entry_price": price,
+            "entry_time": now_text(),
+        }
+    _shadow_record("가상매수", sym, price, qty, 0, reason)
+    if SHADOW_FIXED_NOTIFY:
+        send_telegram(
+            f"🟢 고정전략 가상매수\n종목: {name_of(sym)} ({sym})\n"
+            f"체결가: {fmt_won(price)} / 수량: {qty}주\n"
+            f"사유: {reason}\n실계좌 주문: 없음",
+            [[telegram_button("📊 대시보드", APP_URL)]],
+        )
+    return True
+
+
+def shadow_fixed_sell(reason):
+    """현재 가상포지션 전량매도. 실제 주문 함수는 절대 호출하지 않는다."""
+    with LOCK:
+        st = S["shadow_fixed"]
+        pos = st.get("position")
+        if not isinstance(pos, dict):
+            return False
+        sym = str(pos.get("symbol", ""))
+        qty = int(to_float(pos.get("qty", 0)))
+        entry = to_float(pos.get("entry_price", 0))
+        price = to_float(S.get("prices", {}).get(sym, 0))
+        if qty <= 0 or price <= 0:
+            return False
+        proceeds = int(qty * price)
+        pl = int((price - entry) * qty)
+        st["cash"] = int(to_float(st.get("cash", 0))) + proceeds
+        st["realized_pl"] = int(to_float(st.get("realized_pl", 0))) + pl
+        st["position"] = None
+    _shadow_record("가상매도", sym, price, qty, pl, reason)
+    if SHADOW_FIXED_NOTIFY:
+        rate = pct(price, entry) if entry else 0
+        send_telegram(
+            f"🔴 고정전략 가상매도\n종목: {name_of(sym)} ({sym})\n"
+            f"매수가: {fmt_won(entry)} / 매도가: {fmt_won(price)}\n"
+            f"수익률: {rate:+.2f}% / 가상손익: {fmt_won(pl)}\n"
+            f"사유: {reason}\n실계좌 주문: 없음",
+            [[telegram_button("📊 대시보드", APP_URL)]],
+        )
+    return True
+
+
+def write_shadow_fixed_summary():
+    _shadow_update_asset()
+    with LOCK:
+        st = dict(S.get("shadow_fixed", {}))
+        pos = st.get("position") or {}
+    row = {
+        "time": now_text(),
+        "strategy": SHADOW_FIXED_STRATEGY_ID,
+        "start_cash": int(to_float(st.get("start_cash", 0))),
+        "cash": int(to_float(st.get("cash", 0))),
+        "asset": int(to_float(st.get("asset", 0))),
+        "profit_rate": round(to_float(st.get("profit_rate", 0)), 4),
+        "realized_pl": int(to_float(st.get("realized_pl", 0))),
+        "position_symbol": pos.get("symbol", ""),
+        "position_qty": int(to_float(pos.get("qty", 0))),
+        "position_entry": to_float(pos.get("entry_price", 0)),
+        "inv_signal": bool(st.get("inv_signal", False)),
+        "lev_signal": bool(st.get("lev_signal", False)),
+        "last_action": st.get("last_action", ""),
+    }
+    write_row(shadow_fixed_summary_path(),
+              ["time", "strategy", "start_cash", "cash", "asset", "profit_rate", "realized_pl", "position_symbol", "position_qty", "position_entry", "inv_signal", "lev_signal", "last_action"], row)
+
+
+def run_shadow_fixed_strategy():
+    """고정 규칙 실전가정 가상체결.
+
+    주의: 판단은 각 신호시각까지 저장된 체크포인트만 사용한다.
+    실제 주문 관련 함수(place_order_manual/api_post)는 호출하지 않는다.
+    """
+    if not SHADOW_FIXED_ENABLED:
+        return
+    _shadow_roll_date()
+
+    # 분 종가 체크포인트 수집
+    _shadow_checkpoint(SHADOW_INV_BASE_TIME, INV)
+    _shadow_checkpoint(SHADOW_INV_SIGNAL_TIME, INV)
+    _shadow_checkpoint(SHADOW_LEV_BASE_TIME, LEV)
+    _shadow_checkpoint(SHADOW_LEV_SIGNAL_TIME, LEV)
+
+    hhmm = now_kst().strftime("%H:%M")
+
+    # 09:46: 오전 인버스 신호 평가 및 체결
+    if hhmm == SHADOW_INV_ENTRY_TIME:
+        with LOCK:
+            done = bool(S["shadow_fixed"].get("inv_evaluated", False))
+        if not done:
+            p0 = _shadow_get_checkpoint(INV, SHADOW_INV_BASE_TIME)
+            p1 = _shadow_get_checkpoint(INV, SHADOW_INV_SIGNAL_TIME)
+            move = pct(p1, p0) if p0 > 0 and p1 > 0 else 999.0
+            passed = p0 > 0 and p1 > 0 and SHADOW_INV_MOVE_MIN_PCT <= move <= SHADOW_INV_MOVE_MAX_PCT
+            reason = (f"09:15→09:45 인버스 {move:+.2f}% / "
+                      f"허용 {SHADOW_INV_MOVE_MIN_PCT:+.2f}~{SHADOW_INV_MOVE_MAX_PCT:+.2f}%")
+            with LOCK:
+                S["shadow_fixed"]["inv_evaluated"] = True
+                S["shadow_fixed"]["inv_signal"] = passed
+            _shadow_write_signal("INVERSE_ENTRY", INV, move, passed, reason)
+            if passed:
+                shadow_fixed_buy(INV, reason)
+
+    # 12:46: 오후 레버리지 신호 평가. 통과 시 인버스 청산 후 전환
+    if hhmm == SHADOW_LEV_ENTRY_TIME:
+        with LOCK:
+            done = bool(S["shadow_fixed"].get("lev_evaluated", False))
+        if not done:
+            p0 = _shadow_get_checkpoint(LEV, SHADOW_LEV_BASE_TIME)
+            p1 = _shadow_get_checkpoint(LEV, SHADOW_LEV_SIGNAL_TIME)
+            move = pct(p1, p0) if p0 > 0 and p1 > 0 else 999.0
+            passed = p0 > 0 and p1 > 0 and SHADOW_LEV_MOVE_MIN_PCT <= move <= SHADOW_LEV_MOVE_MAX_PCT
+            reason = (f"11:45→12:45 레버리지 {move:+.2f}% / "
+                      f"허용 {SHADOW_LEV_MOVE_MIN_PCT:+.2f}~{SHADOW_LEV_MOVE_MAX_PCT:+.2f}%")
+            with LOCK:
+                S["shadow_fixed"]["lev_evaluated"] = True
+                S["shadow_fixed"]["lev_signal"] = passed
+                pos = S["shadow_fixed"].get("position")
+            _shadow_write_signal("LEVERAGE_ENTRY", LEV, move, passed, reason)
+            if passed:
+                if isinstance(pos, dict) and pos.get("symbol") == INV:
+                    shadow_fixed_sell("12:46 레버리지 신호 확정: 인버스→레버리지 전환")
+                with LOCK:
+                    no_pos = not bool(S["shadow_fixed"].get("position"))
+                if no_pos:
+                    shadow_fixed_buy(LEV, reason)
+
+    # 14:00: 레버리지 전환이 없었던 인버스만 종료
+    if hhmm == SHADOW_INV_EXIT_TIME:
+        with LOCK:
+            pos = S["shadow_fixed"].get("position")
+        if isinstance(pos, dict) and pos.get("symbol") == INV:
+            shadow_fixed_sell("14:00 인버스 고정 종료")
+
+    # 15:00: 레버리지 종료. 안전상 남은 인버스도 종료
+    if hhmm == SHADOW_LEV_EXIT_TIME:
+        with LOCK:
+            pos = S["shadow_fixed"].get("position")
+        if isinstance(pos, dict):
+            shadow_fixed_sell("15:00 고정전략 전량 종료")
+
+    _shadow_update_asset()
+    write_shadow_fixed_summary()
+
+
 def reset_base_and_paper():
     refresh_account_all(force=True)
     with LOCK:
@@ -3215,7 +3581,7 @@ def create_backup_zip():
 
 def maybe_send_daily_backup():
     n = now_kst()
-    if not (n.hour == 15 and 35 <= n.minute <= 39):
+    if is_weekend_kst() or not (n.hour == 15 and 35 <= n.minute <= 37):
         return
     key = f"BACKUP_SENT_{today()}"
     with LOCK:
@@ -3225,22 +3591,33 @@ def maybe_send_daily_backup():
     path = create_backup_zip()
     url = f"{APP_URL}/download_backup" if APP_URL else "/download_backup"
     caption = f"📦 오늘 데이터 백업 완료\n날짜: {today()}\n시간: {now_short()}\n다운로드 링크: {url}"
-    ok, msg = send_telegram_file(path, caption)
+    ok, msg = send_telegram_file(path, caption, force=True)
     if not ok:
-        send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]])
+        send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]], force=True)
 
 def loop():
     load_state()
-    get_token()
-    refresh_account_all()
-    load_prices()
-    calc_wma_all()
-    analyze_news_keywords()
-    calc_scores()
     counter = 0
     last_news = 0
+    initialized = False
     while True:
         try:
+            # 토요일·일요일에는 데이터 수집, 계좌조회, 신호계산, 가상/실거래, 알림을 전부 중지한다.
+            # 서버와 대시보드는 살아 있고 월요일이 되면 자동으로 다시 정상 운영한다.
+            if is_weekend_kst():
+                set_status_once("WEEKEND_PAUSE", "주말 휴무: 매매·알림·데이터수집 중지", 1800)
+                time.sleep(max(60, REFRESH_SEC))
+                continue
+
+            if not initialized:
+                get_token()
+                refresh_account_all()
+                load_prices()
+                calc_wma_all()
+                analyze_news_keywords()
+                calc_scores()
+                initialized = True
+
             # 1) 가격과 계좌를 같은 루프에서 30초마다 갱신
             load_prices()
             refresh_account_all()
@@ -3292,6 +3669,11 @@ def loop():
                 set_error(f"가상매매 오류: {e}")
 
             try:
+                run_shadow_fixed_strategy()
+            except Exception as e:
+                set_error(f"고정전략 가상체결 오류: {e}")
+
+            try:
                 maybe_send_daily_backup()
             except Exception as e:
                 set_error(f"백업 오류: {e}")
@@ -3329,7 +3711,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body.encode("utf-8"))
             return
 
-        if path == "/selfcheck":
+        if path in ["/selfcheck", "/configcheck"]:
             return self.json_response({
                 "ok": True,
                 "version": OPERATING_VERSION,
@@ -3365,6 +3747,27 @@ class Handler(BaseHTTPRequestHandler):
                 "real_pattern_alert_enabled": True,
                 "telegram_trade_buttons": f"{TELEGRAM_BUTTON_TTL_SEC}sec_direct_button_with_live_condition_recheck",
                 "telegram_notify_hours": f"{TELEGRAM_NOTIFY_START}~{TELEGRAM_NOTIFY_END}",
+                "shadow_fixed_enabled": SHADOW_FIXED_ENABLED,
+                "shadow_fixed_start_cash": SHADOW_FIXED_START_CASH,
+                "shadow_fixed_notify": SHADOW_FIXED_NOTIFY,
+                "shadow_fixed_strategy_id": SHADOW_FIXED_STRATEGY_ID,
+                "shadow_fixed_state": {
+                    "date": S.get("shadow_fixed", {}).get("date", ""),
+                    "cash": int(to_float(S.get("shadow_fixed", {}).get("cash", 0))),
+                    "asset": int(to_float(S.get("shadow_fixed", {}).get("asset", 0))),
+                    "profit_rate": round(to_float(S.get("shadow_fixed", {}).get("profit_rate", 0)), 4),
+                    "position": S.get("shadow_fixed", {}).get("position"),
+                    "last_action": S.get("shadow_fixed", {}).get("last_action", ""),
+                },
+                "weekend_disabled": True,
+                "is_weekend_now": is_weekend_kst(),
+                "backup_time": "15:35",
+                "backup_send_window": "15:35~15:37",
+                "toss_client_id": "설정됨" if CLIENT_ID else "없음",
+                "toss_client_secret": "설정됨" if CLIENT_SECRET else "없음",
+                "telegram_bot_token": "설정됨" if TELEGRAM_BOT_TOKEN else "없음",
+                "telegram_chat_id": "설정됨" if TELEGRAM_CHAT_ID else "없음",
+                "kakao_token": "설정됨" if KAKAO_TOKEN else "없음",
                 "hynix_trade_symbols": sorted(list(HYNIX_TRADE_SYMBOLS)),
                 "real_alert_mode": REAL_ALERT_MODE,
                 "fast_scalp_alert": ENABLE_FAST_SCALP_ALERT,
@@ -3420,6 +3823,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.download_file(orders_path(), f"real_orders_{today()}.csv")
         if path == "/download_paper":
             return self.download_file(paper_path(), f"paper_trades_{today()}.csv")
+        if path == "/download_shadow_trades":
+            return self.download_file(shadow_fixed_path(), f"shadow_fixed_trades_{today()}.csv")
+        if path == "/download_shadow_signals":
+            return self.download_file(shadow_fixed_signal_path(), f"shadow_fixed_signals_{today()}.csv")
+        if path == "/download_shadow_summary":
+            return self.download_file(shadow_fixed_summary_path(), f"shadow_fixed_summary_{today()}.csv")
         if path == "/download_portfolio":
             return self.download_file(portfolio_path(), f"portfolio_{today()}.csv")
         if path == "/download_swing":
@@ -3553,7 +3962,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">가상매매 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
@@ -3614,7 +4023,32 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
     def log_message(self, fmt, *args):
         pass
 
+def print_operating_config():
+    """Render 로그에 비밀값 원문 없이 현재 운영 설정을 한 번에 표시."""
+    print("=" * 60, flush=True)
+    print("[운영 설정 확인]", flush=True)
+    print(f"version={OPERATING_VERSION}", flush=True)
+    print(f"real_order={ENABLE_REAL_ORDER}", flush=True)
+    print(f"real_auto_buy={ENABLE_REAL_AUTO_BUY}", flush=True)
+    print(f"real_auto_sell={ENABLE_REAL_AUTO_SELL}", flush=True)
+    print(f"paper_auto={ENABLE_PAPER_AUTO}", flush=True)
+    print(f"shadow_fixed={SHADOW_FIXED_ENABLED}", flush=True)
+    print(f"shadow_start_cash={SHADOW_FIXED_START_CASH:,}", flush=True)
+    print(f"shadow_notify={SHADOW_FIXED_NOTIFY}", flush=True)
+    print(f"telegram={TELEGRAM_NOTIFY_START}~{TELEGRAM_NOTIFY_END}", flush=True)
+    print(f"account_refresh={ACCOUNT_REFRESH_START}~{ACCOUNT_REFRESH_END}", flush=True)
+    print("backup=15:35~15:37", flush=True)
+    print("weekend_disabled=True", flush=True)
+    print(f"TOSS_CLIENT_ID={'SET' if CLIENT_ID else 'MISSING'}", flush=True)
+    print(f"TOSS_CLIENT_SECRET={'SET' if CLIENT_SECRET else 'MISSING'}", flush=True)
+    print(f"TELEGRAM_BOT_TOKEN={'SET' if TELEGRAM_BOT_TOKEN else 'MISSING'}", flush=True)
+    print(f"TELEGRAM_CHAT_ID={'SET' if TELEGRAM_CHAT_ID else 'MISSING'}", flush=True)
+    print(f"KAKAO_TOKEN={'SET' if KAKAO_TOKEN else 'MISSING'}", flush=True)
+    print(f"configcheck={APP_URL}/configcheck", flush=True)
+    print("=" * 60, flush=True)
+
 if __name__ == "__main__":
-    print("80억 프로젝트 실전 반자동 관제센터 시작:", PORT)
+    print_operating_config()
+    print("80억 프로젝트 실전 반자동 관제센터 시작:", PORT, flush=True)
     threading.Thread(target=loop, daemon=True).start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
