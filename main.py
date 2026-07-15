@@ -3996,25 +3996,95 @@ class Handler(BaseHTTPRequestHandler):
         html_doc = f"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>80억 프로젝트 실전 반자동 관제센터</title><meta http-equiv="refresh" content="60">{CSS}</head><body>
 <h1>80억 프로젝트 실전 반자동 관제센터</h1>
-<div class="sub">업데이트 {safe(S['updated'])} | 상태 {safe(S['status'])} | 계좌 {safe(S['account_seq'])}</div>
-<div class="grid"><div>{self.account_card()}{self.paper_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.signal_card(LEV,'red')}{self.signal_card(INV,'blue')}{self.basic_card(HYNIX)}{self.stock_table()}</div><div>{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}{self.paper_trade_card()}</div></div>
+<div class="sub">버전 {safe(OPERATING_VERSION)} | 전략 {safe(SHADOW_FIXED_STRATEGY_ID)} | 업데이트 {safe(S['updated'])} | 상태 {safe(S['status'])} | 계좌 {safe(S['account_seq'])}</div>
+<div class="grid"><div>{self.account_card()}{self.shadow_fixed_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.signal_card(SHADOW_LEV_SYMBOL,'red')}{self.signal_card(SHADOW_INV_SYMBOL,'blue')}{self.basic_card(HYNIX)}{self.stock_table()}</div><div>{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}{self.shadow_trade_card()}</div></div>
 <script>
 async function postJson(path, body){{const res=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body||{{}})}});return await res.json();}}
 async function order(symbol,side,qtyId){{const qty=document.getElementById(qtyId).value;const sideText=side==='BUY'?'매수':'매도';if(!qty||Number(qty)<=0){{alert('수량이 0입니다.');return;}}if(!confirm(symbol+' '+qty+'주 실계좌 '+sideText+' 주문 전송?'))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty}});alert(JSON.stringify(data));location.reload();}}
 async function paperBuy(symbol){{const data=await postJson('/paper_buy',{{symbol:symbol,ratio:0.5}});alert(data.ok?'가상매수 완료':'가상매수 실패');location.reload();}}
 async function paperSell(symbol){{const data=await postJson('/paper_sell',{{symbol:symbol}});alert(data.ok?'가상매도 완료':'가상매도 실패');location.reload();}}
-async function resetBase(){{if(!confirm('현재 토스 총자산으로 기준금과 AI 가상계좌를 리셋할까요?'))return;const data=await postJson('/reset_base',{{}});alert(JSON.stringify(data));location.reload();}}
+async function resetBase(){{if(!confirm('현재 토스 총자산으로 실계좌 기준금과 구 AI 가상계좌를 리셋할까요? 고정전략 1천만원 계좌는 유지됩니다.'))return;const data=await postJson('/reset_base',{{}});alert(JSON.stringify(data));location.reload();}}
 function setQty(id,qty){{document.getElementById(id).value=qty;}}
 </script></body></html>"""
         self.html_response(html_doc)
 
     def account_card(self):
         real_rate = pct(S["total_value"], S["real_base_cash"]) if S["real_base_cash"] else 0
-        return f"""<div class="card"><h2>실계좌</h2><div class="small">실제 기준금</div><div class="mid yellow">{fmt_won(S['real_base_cash'])}</div><br><div class="small">총자산</div><div class="big yellow">{fmt_won(S['total_value'])}</div><div class="small">기준금 대비 {real_rate:.2f}%</div><br><div class="small">매수가능금액</div><div class="mid">{fmt_won(S['cash'])}</div><br><div class="small">평가손익</div><div class="mid {color_class(S['profit_loss'])}">{fmt_won(S['profit_loss'])}</div><div class="{color_class(S['profit_rate'])}">{S['profit_rate']}%</div><br><div class="small">실주문 상태</div><div class="{'green' if ENABLE_REAL_ORDER else 'red'}">{'활성화' if ENABLE_REAL_ORDER else '비활성화'}</div><button class="gold" onclick="resetBase()">기준금/가상 리셋</button></div>"""
+        return f"""<div class="card"><h2>실계좌</h2><div class="small">실제 기준금</div><div class="mid yellow">{fmt_won(S['real_base_cash'])}</div><br><div class="small">총자산</div><div class="big yellow">{fmt_won(S['total_value'])}</div><div class="small">기준금 대비 {real_rate:.2f}%</div><br><div class="small">매수가능금액</div><div class="mid">{fmt_won(S['cash'])}</div><br><div class="small">평가손익</div><div class="mid {color_class(S['profit_loss'])}">{fmt_won(S['profit_loss'])}</div><div class="{color_class(S['profit_rate'])}">{S['profit_rate']}%</div><br><div class="small">실주문 상태</div><div class="{'green' if ENABLE_REAL_ORDER else 'red'}">{'활성화' if ENABLE_REAL_ORDER else '비활성화'}</div><button class="gold" onclick="resetBase()">실계좌 기준금 리셋</button></div>"""
 
 
     def daytrade_card(self):
         return ""
+
+    def shadow_fixed_card(self):
+        _shadow_update_asset()
+        with LOCK:
+            st = dict(S.get("shadow_fixed", {}))
+            pos = st.get("position") if isinstance(st.get("position"), dict) else None
+            checkpoints = dict(st.get("checkpoints", {}))
+
+        asset = to_float(st.get("asset", SHADOW_FIXED_START_CASH))
+        start_cash = to_float(st.get("start_cash", SHADOW_FIXED_START_CASH))
+        cash = to_float(st.get("cash", SHADOW_FIXED_START_CASH))
+        profit_rate = to_float(st.get("profit_rate", 0))
+        realized_pl = to_float(st.get("realized_pl", 0))
+        stopped = bool(st.get("stopped_today", False))
+
+        pos_html = "<span class='gray'>보유 없음</span>"
+        stop_html = "-"
+        if pos:
+            sym = str(pos.get("symbol", ""))
+            qty = int(to_float(pos.get("qty", 0)))
+            entry = to_float(pos.get("entry_price", 0))
+            cur = to_float(S.get("prices", {}).get(sym, 0))
+            pos_pl = (cur - entry) * qty if cur and entry else 0
+            pos_rate = pct(cur, entry) if cur and entry else 0
+            stop_price = entry * (1.0 - SHADOW_STOP_LOSS_PCT / 100.0) if entry else 0
+            stop_html = fmt_won(stop_price)
+            pos_html = (
+                f"<b>{safe(name_of(sym))}</b> <span class='small'>({safe(sym)})</span><br>"
+                f"{qty:,}주 / 매수가 {fmt_won(entry)} / 현재가 {fmt_won(cur)}<br>"
+                f"평가손익 <span class='{color_class(pos_pl)}'>{fmt_won(pos_pl)} ({pos_rate:+.2f}%)</span>"
+            )
+
+        inv_state = "통과" if st.get("inv_signal") else ("탈락" if st.get("inv_evaluated") else "대기")
+        lev_state = "통과" if st.get("lev_signal") else ("탈락" if st.get("lev_evaluated") else "대기")
+        inv_cls = "green" if inv_state == "통과" else ("red" if inv_state == "탈락" else "gray")
+        lev_cls = "green" if lev_state == "통과" else ("red" if lev_state == "탈락" else "gray")
+
+        return f"""<div class='card'>
+        <h2>고정전략 가상계좌</h2>
+        <div class='small'>실계좌 주문 없음 / 자동 가상운영 {'ON' if SHADOW_FIXED_ENABLED else 'OFF'}</div>
+        <div class='big yellow'>{fmt_won(asset)}</div>
+        <div class='{color_class(asset-start_cash)}'>누적 {profit_rate:+.2f}% / 실현손익 {fmt_won(realized_pl)}</div>
+        <table>
+        <tr><td>시작금</td><td>{fmt_won(start_cash)}</td></tr>
+        <tr><td>현금</td><td>{fmt_won(cash)}</td></tr>
+        <tr><td>오전 종목</td><td>{safe(name_of(SHADOW_INV_SYMBOL))} ({SHADOW_INV_SYMBOL})</td></tr>
+        <tr><td>오전 밴드</td><td>{SHADOW_INV_MOVE_MIN_PCT:+.1f}% ~ {SHADOW_INV_MOVE_MAX_PCT:+.1f}%</td></tr>
+        <tr><td>오전 신호</td><td class='{inv_cls}'>{inv_state}</td></tr>
+        <tr><td>오후 종목</td><td>{safe(name_of(SHADOW_LEV_SYMBOL))} ({SHADOW_LEV_SYMBOL})</td></tr>
+        <tr><td>오후 밴드</td><td>{SHADOW_LEV_MOVE_MIN_PCT:+.1f}% ~ {SHADOW_LEV_MOVE_MAX_PCT:+.1f}%</td></tr>
+        <tr><td>오후 신호</td><td class='{lev_cls}'>{lev_state}</td></tr>
+        <tr><td>자동손절</td><td>-{SHADOW_STOP_LOSS_PCT:.1f}% / 현재 손절가 {stop_html}</td></tr>
+        <tr><td>당일 손절</td><td class='{'red' if stopped else 'green'}'>{'발생·재진입 금지' if stopped else '없음'}</td></tr>
+        </table>
+        <div class='small'>현재 포지션</div><div>{pos_html}</div><br>
+        <div class='small'>마지막 행동</div><div>{safe(st.get('last_action','없음'))}</div>
+        </div>"""
+
+    def shadow_trade_card(self):
+        with LOCK:
+            trades = list(S.get("shadow_fixed", {}).get("trades", []))
+        rows = "".join(
+            f"<tr><td class='small'>{safe(t.get('time',''))}</td>"
+            f"<td>{safe(t.get('action',''))}</td>"
+            f"<td>{safe(t.get('name', name_of(t.get('symbol',''))))} {int(to_float(t.get('qty',0)))}주</td>"
+            f"<td class='{color_class(t.get('pl',0))}'>{fmt_won(t.get('pl',0))}</td>"
+            f"<td class='small'>{safe(t.get('reason',''))}</td></tr>"
+            for t in trades[:20]
+        ) or "<tr><td colspan='5' class='gray'>아직 고정전략 거래 없음</td></tr>"
+        return f"<div class='card'><h2>고정전략 가상매매 기록</h2><table><tr><th>시간</th><th>행동</th><th>종목</th><th>손익</th><th>사유</th></tr>{rows}</table></div>"
 
     def paper_card(self):
         p = S["paper"]
@@ -4087,7 +4157,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
