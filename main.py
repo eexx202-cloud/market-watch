@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_18_FINAL_CONFIGCHECK_SHADOW_WEEKDAY_BACKUP1535"
+OPERATING_VERSION = "OPERATING_V4_19_SHADOW_BALANCED_STOP3_SUMMARYONCE"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -254,23 +254,32 @@ BREAKEVEN_GUARD_EXIT_PCT = float(os.environ.get("BREAKEVEN_GUARD_EXIT_PCT", "0.3
 SHADOW_FIXED_ENABLED = os.environ.get("SHADOW_FIXED_ENABLED", "true").lower() == "true"
 SHADOW_FIXED_START_CASH = int(float(os.environ.get("SHADOW_FIXED_START_CASH", "10000000")))
 SHADOW_FIXED_NOTIFY = os.environ.get("SHADOW_FIXED_NOTIFY", "true").lower() == "true"
-SHADOW_FIXED_STRATEGY_ID = "HYNIX_FIXED_REPLAY_V1"
+
+# V4.19 균형형 고정전략
+# 오전: 하이닉스 인버스(0197X0), 오후: KODEX 레버리지(122630)
+# 실계좌 주문 함수는 절대 호출하지 않는 독립 가상계좌다.
+SHADOW_FIXED_STRATEGY_ID = "HYNIX_INV_KODEX_LEV_BALANCED_V1"
+SHADOW_INV_SYMBOL = "0197X0"
+SHADOW_LEV_SYMBOL = "122630"
+SHADOW_STOP_LOSS_PCT = float(os.environ.get("SHADOW_STOP_LOSS_PCT", "3.0"))
+# 백테스트의 왕복비용 0.20%와 맞추기 위한 편도 비용 기본값 0.10%
+SHADOW_FEE_SIDE_PCT = float(os.environ.get("SHADOW_FEE_SIDE_PCT", "0.10"))
 
 # 오전 인버스: 09:15~09:45 등락률 범위, 09:46 체결
 SHADOW_INV_BASE_TIME = "09:15"
 SHADOW_INV_SIGNAL_TIME = "09:45"
 SHADOW_INV_ENTRY_TIME = "09:46"
 SHADOW_INV_EXIT_TIME = "14:00"
-SHADOW_INV_MOVE_MIN_PCT = float(os.environ.get("SHADOW_INV_MOVE_MIN_PCT", "-7.5"))
-SHADOW_INV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_INV_MOVE_MAX_PCT", "4.0"))
+SHADOW_INV_MOVE_MIN_PCT = float(os.environ.get("SHADOW_INV_MOVE_MIN_PCT", "-5.0"))
+SHADOW_INV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_INV_MOVE_MAX_PCT", "6.0"))
 
-# 오후 레버리지: 11:45~12:45 등락률 범위, 12:46 체결, 15:00 청산
+# 오후 KODEX 레버리지: 11:45~12:45 등락률 범위, 12:46 체결, 15:00 청산
 SHADOW_LEV_BASE_TIME = "11:45"
 SHADOW_LEV_SIGNAL_TIME = "12:45"
 SHADOW_LEV_ENTRY_TIME = "12:46"
 SHADOW_LEV_EXIT_TIME = "15:00"
 SHADOW_LEV_MOVE_MIN_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MIN_PCT", "-4.0"))
-SHADOW_LEV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MAX_PCT", "1.0"))
+SHADOW_LEV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MAX_PCT", "0.0"))
 
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
@@ -342,6 +351,7 @@ S = {
     },
     "shadow_fixed": {
         "date": "",
+        "strategy_id": SHADOW_FIXED_STRATEGY_ID,
         "start_cash": SHADOW_FIXED_START_CASH,
         "cash": SHADOW_FIXED_START_CASH,
         "position": None,
@@ -353,6 +363,8 @@ S = {
         "lev_evaluated": False,
         "inv_signal": False,
         "lev_signal": False,
+        "stopped_today": False,
+        "summary_saved": False,
         "last_action": "초기화",
         "trades": [],
     },
@@ -3107,9 +3119,10 @@ def run_paper_ai_if_enabled():
 # ============================================================
 
 def _shadow_default_state(cash=None):
-    start = int(cash or SHADOW_FIXED_START_CASH)
+    start = int(cash if cash is not None else SHADOW_FIXED_START_CASH)
     return {
         "date": today(),
+        "strategy_id": SHADOW_FIXED_STRATEGY_ID,
         "start_cash": start,
         "cash": start,
         "position": None,
@@ -3121,26 +3134,48 @@ def _shadow_default_state(cash=None):
         "lev_evaluated": False,
         "inv_signal": False,
         "lev_signal": False,
+        "stopped_today": False,
+        "summary_saved": False,
         "last_action": "일일 초기화",
         "trades": [],
     }
 
 
+def _shadow_ensure_strategy_state():
+    """전략 버전이 바뀌면 과거 엔진 자산과 섞지 않고 1,000만원으로 새로 시작."""
+    with LOCK:
+        st = S.get("shadow_fixed")
+        if not isinstance(st, dict) or st.get("strategy_id") != SHADOW_FIXED_STRATEGY_ID:
+            S["shadow_fixed"] = _shadow_default_state(SHADOW_FIXED_START_CASH)
+            changed = True
+        else:
+            # 구 state.json에 새 필드가 없어도 안전하게 보완
+            st.setdefault("stopped_today", False)
+            st.setdefault("summary_saved", False)
+            st.setdefault("strategy_id", SHADOW_FIXED_STRATEGY_ID)
+            changed = False
+    if changed:
+        save_state()
+
+
 def _shadow_roll_date():
     """날짜가 바뀌어도 누적 현금은 유지하고 일일 판정 플래그만 초기화."""
+    _shadow_ensure_strategy_state()
     with LOCK:
         st = S.get("shadow_fixed") or _shadow_default_state()
         if st.get("date") == today():
             return
         carry_cash = int(to_float(st.get("cash", SHADOW_FIXED_START_CASH)))
-        # 비정상적으로 전일 포지션이 남으면 현재가로 정리해 누적자산을 보존한다.
+        # 비정상적으로 전일 포지션이 남으면 현재가로 강제 정리해 누적자산을 보존한다.
         pos = st.get("position")
         if isinstance(pos, dict):
             sym = str(pos.get("symbol", ""))
             qty = int(to_float(pos.get("qty", 0)))
             px = to_float(S.get("prices", {}).get(sym, pos.get("entry_price", 0)))
             if qty > 0 and px > 0:
-                carry_cash += int(qty * px)
+                gross = qty * px
+                fee = int(round(gross * SHADOW_FEE_SIDE_PCT / 100))
+                carry_cash += int(gross - fee)
         start_cash = int(to_float(st.get("start_cash", SHADOW_FIXED_START_CASH)))
         fresh = _shadow_default_state(carry_cash)
         fresh["start_cash"] = start_cash
@@ -3202,11 +3237,14 @@ def _shadow_write_signal(kind, sym, move_pct, passed, reason):
         "reason": reason,
         "real_order": False,
     }
-    write_row(shadow_fixed_signal_path(),
-              ["time", "strategy", "kind", "symbol", "name", "move_pct", "passed", "reason", "real_order"], row)
+    write_row(
+        shadow_fixed_signal_path(),
+        ["time", "strategy", "kind", "symbol", "name", "move_pct", "passed", "reason", "real_order"],
+        row,
+    )
 
 
-def _shadow_record(action, sym, price, qty, pl, reason):
+def _shadow_record(action, sym, price, qty, pl, reason, fee=0):
     _shadow_update_asset()
     with LOCK:
         st = S["shadow_fixed"]
@@ -3218,6 +3256,7 @@ def _shadow_record(action, sym, price, qty, pl, reason):
             "name": name_of(sym),
             "price": round(to_float(price), 2),
             "qty": int(qty),
+            "fee": int(fee),
             "pl": int(pl),
             "cash": int(to_float(st.get("cash", 0))),
             "asset": int(to_float(st.get("asset", 0))),
@@ -3228,8 +3267,11 @@ def _shadow_record(action, sym, price, qty, pl, reason):
         st.setdefault("trades", []).insert(0, row)
         st["trades"] = st["trades"][:100]
         st["last_action"] = f"{now_short()} {action} {name_of(sym)}"
-    write_row(shadow_fixed_path(),
-              ["time", "strategy", "action", "symbol", "name", "price", "qty", "pl", "cash", "asset", "profit_rate", "reason", "real_order"], row)
+    write_row(
+        shadow_fixed_path(),
+        ["time", "strategy", "action", "symbol", "name", "price", "qty", "fee", "pl", "cash", "asset", "profit_rate", "reason", "real_order"],
+        row,
+    )
     save_state()
 
 
@@ -3240,32 +3282,45 @@ def shadow_fixed_buy(sym, reason):
         return False
     with LOCK:
         st = S["shadow_fixed"]
-        if st.get("position"):
+        if st.get("position") or st.get("stopped_today"):
             return False
         cash = int(to_float(st.get("cash", 0)))
-        qty = int(cash // price)
+        fee_rate = SHADOW_FEE_SIDE_PCT / 100
+        qty = int(cash // (price * (1 + fee_rate)))
         if qty <= 0:
             return False
-        cost = int(qty * price)
-        st["cash"] = cash - cost
+        gross = int(qty * price)
+        fee = int(round(gross * fee_rate))
+        total_cost = gross + fee
+        if total_cost > cash:
+            qty -= 1
+            if qty <= 0:
+                return False
+            gross = int(qty * price)
+            fee = int(round(gross * fee_rate))
+            total_cost = gross + fee
+        st["cash"] = cash - total_cost
         st["position"] = {
             "symbol": sym,
             "qty": qty,
             "entry_price": price,
             "entry_time": now_text(),
+            "entry_gross": gross,
+            "entry_fee": fee,
+            "entry_total_cost": total_cost,
         }
-    _shadow_record("가상매수", sym, price, qty, 0, reason)
+    _shadow_record("가상매수", sym, price, qty, 0, reason, fee)
     if SHADOW_FIXED_NOTIFY:
         send_telegram(
-            f"🟢 고정전략 가상매수\n종목: {name_of(sym)} ({sym})\n"
-            f"체결가: {fmt_won(price)} / 수량: {qty}주\n"
+            f"🟢 균형형 가상매수\n종목: {name_of(sym)} ({sym})\n"
+            f"체결가: {fmt_won(price)} / 수량: {qty}주 / 매수비용: {fmt_won(fee)}\n"
             f"사유: {reason}\n실계좌 주문: 없음",
             [[telegram_button("📊 대시보드", APP_URL)]],
         )
     return True
 
 
-def shadow_fixed_sell(reason):
+def shadow_fixed_sell(reason, mark_stop=False):
     """현재 가상포지션 전량매도. 실제 주문 함수는 절대 호출하지 않는다."""
     with LOCK:
         st = S["shadow_fixed"]
@@ -3275,28 +3330,57 @@ def shadow_fixed_sell(reason):
         sym = str(pos.get("symbol", ""))
         qty = int(to_float(pos.get("qty", 0)))
         entry = to_float(pos.get("entry_price", 0))
+        entry_total_cost = int(to_float(pos.get("entry_total_cost", qty * entry)))
         price = to_float(S.get("prices", {}).get(sym, 0))
         if qty <= 0 or price <= 0:
             return False
-        proceeds = int(qty * price)
-        pl = int((price - entry) * qty)
-        st["cash"] = int(to_float(st.get("cash", 0))) + proceeds
+        gross = int(qty * price)
+        fee = int(round(gross * SHADOW_FEE_SIDE_PCT / 100))
+        net_proceeds = gross - fee
+        pl = int(net_proceeds - entry_total_cost)
+        st["cash"] = int(to_float(st.get("cash", 0))) + net_proceeds
         st["realized_pl"] = int(to_float(st.get("realized_pl", 0))) + pl
         st["position"] = None
-    _shadow_record("가상매도", sym, price, qty, pl, reason)
+        if mark_stop:
+            st["stopped_today"] = True
+    _shadow_record("가상손절" if mark_stop else "가상매도", sym, price, qty, pl, reason, fee)
     if SHADOW_FIXED_NOTIFY:
         rate = pct(price, entry) if entry else 0
+        title = "⛔ 균형형 가상손절" if mark_stop else "🔴 균형형 가상매도"
         send_telegram(
-            f"🔴 고정전략 가상매도\n종목: {name_of(sym)} ({sym})\n"
+            f"{title}\n종목: {name_of(sym)} ({sym})\n"
             f"매수가: {fmt_won(entry)} / 매도가: {fmt_won(price)}\n"
-            f"수익률: {rate:+.2f}% / 가상손익: {fmt_won(pl)}\n"
+            f"가격수익률: {rate:+.2f}% / 순가상손익: {fmt_won(pl)} / 매도비용: {fmt_won(fee)}\n"
             f"사유: {reason}\n실계좌 주문: 없음",
             [[telegram_button("📊 대시보드", APP_URL)]],
         )
     return True
 
 
+def _shadow_check_stop_loss():
+    """장중 매 루프마다 -3% 손절을 정규청산보다 먼저 검사."""
+    with LOCK:
+        st = S.get("shadow_fixed", {})
+        pos = st.get("position")
+        already_stopped = bool(st.get("stopped_today", False))
+    if already_stopped or not isinstance(pos, dict):
+        return False
+    sym = str(pos.get("symbol", ""))
+    entry = to_float(pos.get("entry_price", 0))
+    current = to_float(S.get("prices", {}).get(sym, 0))
+    if entry <= 0 or current <= 0:
+        return False
+    rate = pct(current, entry)
+    if rate <= -abs(SHADOW_STOP_LOSS_PCT):
+        return shadow_fixed_sell(
+            f"자동손절: 매수가 대비 {rate:.2f}% ≤ -{abs(SHADOW_STOP_LOSS_PCT):.2f}%",
+            mark_stop=True,
+        )
+    return False
+
+
 def write_shadow_fixed_summary():
+    """당일 최종요약은 하루 한 번만 저장."""
     _shadow_update_asset()
     with LOCK:
         st = dict(S.get("shadow_fixed", {}))
@@ -3314,88 +3398,123 @@ def write_shadow_fixed_summary():
         "position_entry": to_float(pos.get("entry_price", 0)),
         "inv_signal": bool(st.get("inv_signal", False)),
         "lev_signal": bool(st.get("lev_signal", False)),
+        "stopped_today": bool(st.get("stopped_today", False)),
         "last_action": st.get("last_action", ""),
     }
-    write_row(shadow_fixed_summary_path(),
-              ["time", "strategy", "start_cash", "cash", "asset", "profit_rate", "realized_pl", "position_symbol", "position_qty", "position_entry", "inv_signal", "lev_signal", "last_action"], row)
+    write_row(
+        shadow_fixed_summary_path(),
+        ["time", "strategy", "start_cash", "cash", "asset", "profit_rate", "realized_pl",
+         "position_symbol", "position_qty", "position_entry", "inv_signal", "lev_signal",
+         "stopped_today", "last_action"],
+        row,
+    )
 
 
 def run_shadow_fixed_strategy():
-    """고정 규칙 실전가정 가상체결.
+    """균형형 고정규칙 실전가정 가상체결.
 
-    주의: 판단은 각 신호시각까지 저장된 체크포인트만 사용한다.
-    실제 주문 관련 함수(place_order_manual/api_post)는 호출하지 않는다.
+    오전 하이닉스 인버스(0197X0), 오후 KODEX 레버리지(122630).
+    각 시점까지 수집된 가격만 사용하고 실제 주문 함수는 절대 호출하지 않는다.
     """
-    if not SHADOW_FIXED_ENABLED:
+    if not SHADOW_FIXED_ENABLED or is_weekend_kst():
         return
+
     _shadow_roll_date()
 
     # 분 종가 체크포인트 수집
-    _shadow_checkpoint(SHADOW_INV_BASE_TIME, INV)
-    _shadow_checkpoint(SHADOW_INV_SIGNAL_TIME, INV)
-    _shadow_checkpoint(SHADOW_LEV_BASE_TIME, LEV)
-    _shadow_checkpoint(SHADOW_LEV_SIGNAL_TIME, LEV)
+    _shadow_checkpoint(SHADOW_INV_BASE_TIME, SHADOW_INV_SYMBOL)
+    _shadow_checkpoint(SHADOW_INV_SIGNAL_TIME, SHADOW_INV_SYMBOL)
+    _shadow_checkpoint(SHADOW_LEV_BASE_TIME, SHADOW_LEV_SYMBOL)
+    _shadow_checkpoint(SHADOW_LEV_SIGNAL_TIME, SHADOW_LEV_SYMBOL)
+
+    # 손절은 신호 평가와 정규청산보다 항상 먼저 실행
+    _shadow_check_stop_loss()
 
     hhmm = now_kst().strftime("%H:%M")
 
-    # 09:46: 오전 인버스 신호 평가 및 체결
+    # 09:46: 오전 하이닉스 인버스 신호 평가 및 체결
     if hhmm == SHADOW_INV_ENTRY_TIME:
         with LOCK:
             done = bool(S["shadow_fixed"].get("inv_evaluated", False))
+            stopped = bool(S["shadow_fixed"].get("stopped_today", False))
         if not done:
-            p0 = _shadow_get_checkpoint(INV, SHADOW_INV_BASE_TIME)
-            p1 = _shadow_get_checkpoint(INV, SHADOW_INV_SIGNAL_TIME)
+            p0 = _shadow_get_checkpoint(SHADOW_INV_SYMBOL, SHADOW_INV_BASE_TIME)
+            p1 = _shadow_get_checkpoint(SHADOW_INV_SYMBOL, SHADOW_INV_SIGNAL_TIME)
             move = pct(p1, p0) if p0 > 0 and p1 > 0 else 999.0
-            passed = p0 > 0 and p1 > 0 and SHADOW_INV_MOVE_MIN_PCT <= move <= SHADOW_INV_MOVE_MAX_PCT
-            reason = (f"09:15→09:45 인버스 {move:+.2f}% / "
-                      f"허용 {SHADOW_INV_MOVE_MIN_PCT:+.2f}~{SHADOW_INV_MOVE_MAX_PCT:+.2f}%")
+            passed = (
+                not stopped
+                and p0 > 0 and p1 > 0
+                and SHADOW_INV_MOVE_MIN_PCT <= move <= SHADOW_INV_MOVE_MAX_PCT
+            )
+            reason = (
+                f"09:15→09:45 {name_of(SHADOW_INV_SYMBOL)} {move:+.2f}% / "
+                f"허용 {SHADOW_INV_MOVE_MIN_PCT:+.2f}~{SHADOW_INV_MOVE_MAX_PCT:+.2f}%"
+            )
             with LOCK:
                 S["shadow_fixed"]["inv_evaluated"] = True
                 S["shadow_fixed"]["inv_signal"] = passed
-            _shadow_write_signal("INVERSE_ENTRY", INV, move, passed, reason)
+            _shadow_write_signal("INVERSE_ENTRY", SHADOW_INV_SYMBOL, move, passed, reason)
             if passed:
-                shadow_fixed_buy(INV, reason)
+                shadow_fixed_buy(SHADOW_INV_SYMBOL, reason)
 
-    # 12:46: 오후 레버리지 신호 평가. 통과 시 인버스 청산 후 전환
+    # 12:46: 오후 KODEX 레버리지 신호 평가. 통과 시 인버스 청산 후 전환
     if hhmm == SHADOW_LEV_ENTRY_TIME:
         with LOCK:
             done = bool(S["shadow_fixed"].get("lev_evaluated", False))
+            stopped = bool(S["shadow_fixed"].get("stopped_today", False))
         if not done:
-            p0 = _shadow_get_checkpoint(LEV, SHADOW_LEV_BASE_TIME)
-            p1 = _shadow_get_checkpoint(LEV, SHADOW_LEV_SIGNAL_TIME)
+            p0 = _shadow_get_checkpoint(SHADOW_LEV_SYMBOL, SHADOW_LEV_BASE_TIME)
+            p1 = _shadow_get_checkpoint(SHADOW_LEV_SYMBOL, SHADOW_LEV_SIGNAL_TIME)
             move = pct(p1, p0) if p0 > 0 and p1 > 0 else 999.0
-            passed = p0 > 0 and p1 > 0 and SHADOW_LEV_MOVE_MIN_PCT <= move <= SHADOW_LEV_MOVE_MAX_PCT
-            reason = (f"11:45→12:45 레버리지 {move:+.2f}% / "
-                      f"허용 {SHADOW_LEV_MOVE_MIN_PCT:+.2f}~{SHADOW_LEV_MOVE_MAX_PCT:+.2f}%")
+            passed = (
+                not stopped
+                and p0 > 0 and p1 > 0
+                and SHADOW_LEV_MOVE_MIN_PCT <= move <= SHADOW_LEV_MOVE_MAX_PCT
+            )
+            reason = (
+                f"11:45→12:45 {name_of(SHADOW_LEV_SYMBOL)} {move:+.2f}% / "
+                f"허용 {SHADOW_LEV_MOVE_MIN_PCT:+.2f}~{SHADOW_LEV_MOVE_MAX_PCT:+.2f}%"
+            )
             with LOCK:
                 S["shadow_fixed"]["lev_evaluated"] = True
                 S["shadow_fixed"]["lev_signal"] = passed
                 pos = S["shadow_fixed"].get("position")
-            _shadow_write_signal("LEVERAGE_ENTRY", LEV, move, passed, reason)
+            _shadow_write_signal("LEVERAGE_ENTRY", SHADOW_LEV_SYMBOL, move, passed, reason)
             if passed:
-                if isinstance(pos, dict) and pos.get("symbol") == INV:
-                    shadow_fixed_sell("12:46 레버리지 신호 확정: 인버스→레버리지 전환")
+                if isinstance(pos, dict) and pos.get("symbol") == SHADOW_INV_SYMBOL:
+                    shadow_fixed_sell("12:46 KODEX 레버리지 신호 확정: 인버스→레버리지 전환")
                 with LOCK:
                     no_pos = not bool(S["shadow_fixed"].get("position"))
-                if no_pos:
-                    shadow_fixed_buy(LEV, reason)
+                    stopped = bool(S["shadow_fixed"].get("stopped_today", False))
+                if no_pos and not stopped:
+                    shadow_fixed_buy(SHADOW_LEV_SYMBOL, reason)
 
-    # 14:00: 레버리지 전환이 없었던 인버스만 종료
+    # 14:00: 오후 전환이 없었던 인버스만 종료
     if hhmm == SHADOW_INV_EXIT_TIME:
         with LOCK:
             pos = S["shadow_fixed"].get("position")
-        if isinstance(pos, dict) and pos.get("symbol") == INV:
-            shadow_fixed_sell("14:00 인버스 고정 종료")
+        if isinstance(pos, dict) and pos.get("symbol") == SHADOW_INV_SYMBOL:
+            shadow_fixed_sell("14:00 하이닉스 인버스 고정 종료")
 
-    # 15:00: 레버리지 종료. 안전상 남은 인버스도 종료
+    # 15:00: KODEX 레버리지 종료. 안전상 남은 포지션도 종료
     if hhmm == SHADOW_LEV_EXIT_TIME:
         with LOCK:
             pos = S["shadow_fixed"].get("position")
         if isinstance(pos, dict):
-            shadow_fixed_sell("15:00 고정전략 전량 종료")
+            shadow_fixed_sell("15:00 균형형 고정전략 전량 종료")
 
     _shadow_update_asset()
-    write_shadow_fixed_summary()
+
+    # 최종요약은 15:00 이후 포지션이 없을 때 하루 한 번만 저장
+    if hhmm >= SHADOW_LEV_EXIT_TIME:
+        with LOCK:
+            st = S["shadow_fixed"]
+            can_save = (not st.get("position")) and (not st.get("summary_saved", False))
+            if can_save:
+                st["summary_saved"] = True
+        if can_save:
+            write_shadow_fixed_summary()
+            save_state()
 
 
 def reset_base_and_paper():
@@ -3751,6 +3870,12 @@ class Handler(BaseHTTPRequestHandler):
                 "shadow_fixed_start_cash": SHADOW_FIXED_START_CASH,
                 "shadow_fixed_notify": SHADOW_FIXED_NOTIFY,
                 "shadow_fixed_strategy_id": SHADOW_FIXED_STRATEGY_ID,
+                "shadow_inv_symbol": SHADOW_INV_SYMBOL,
+                "shadow_lev_symbol": SHADOW_LEV_SYMBOL,
+                "shadow_inv_band": [SHADOW_INV_MOVE_MIN_PCT, SHADOW_INV_MOVE_MAX_PCT],
+                "shadow_lev_band": [SHADOW_LEV_MOVE_MIN_PCT, SHADOW_LEV_MOVE_MAX_PCT],
+                "shadow_stop_loss_pct": SHADOW_STOP_LOSS_PCT,
+                "shadow_fee_side_pct": SHADOW_FEE_SIDE_PCT,
                 "shadow_fixed_state": {
                     "date": S.get("shadow_fixed", {}).get("date", ""),
                     "cash": int(to_float(S.get("shadow_fixed", {}).get("cash", 0))),
