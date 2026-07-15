@@ -119,7 +119,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_19_SHADOW_BALANCED_STOP3_SUMMARYONCE"
+OPERATING_VERSION = "OPERATING_V4_22_SAMSUNG_LEV_PROFIT_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -189,6 +189,24 @@ TELEGRAM_NOTIFY_END = os.environ.get("TELEGRAM_NOTIFY_END", "15:30")
 FAST_SCALP_SCORE_MIN = int(os.environ.get("FAST_SCALP_SCORE_MIN", "85"))
 FAST_SCALP_LOG_COOLDOWN_SEC = int(os.environ.get("FAST_SCALP_LOG_COOLDOWN_SEC", "60"))
 WORK_SWING_MAX_REAL_ALERTS_PER_DAY = int(os.environ.get("WORK_SWING_MAX_REAL_ALERTS_PER_DAY", "4"))
+
+# ============================================================
+# V4.21 최종 최소 알림 정책
+# - 현재 목적: 7월 고정전략 가상검증에 필요한 체결/손절/요약/백업만 수신
+# - 예전 METHOD63/스윙 후보/보유 약화/뉴스·시장 후보 알림은 차단
+# - 실계좌는 사용자가 버튼을 눌러 실제 주문한 결과와 실제 자동매도 결과만 알림
+# ============================================================
+FINAL_MINIMAL_ALERT_MODE = os.environ.get("FINAL_MINIMAL_ALERT_MODE", "true").lower() == "true"
+ENABLE_METHOD63_CANDIDATE_ALERT = os.environ.get("ENABLE_METHOD63_CANDIDATE_ALERT", "false").lower() == "true"
+ENABLE_REAL_PATTERN_CANDIDATE_ALERT = os.environ.get("ENABLE_REAL_PATTERN_CANDIDATE_ALERT", "false").lower() == "true"
+ENABLE_HOLDING_WARNING_ALERT = os.environ.get("ENABLE_HOLDING_WARNING_ALERT", "false").lower() == "true"
+ENABLE_GENERAL_SIGNAL_ALERT = os.environ.get("ENABLE_GENERAL_SIGNAL_ALERT", "false").lower() == "true"
+ENABLE_SHADOW_TRADE_ALERT = os.environ.get("ENABLE_SHADOW_TRADE_ALERT", "true").lower() == "true"
+ENABLE_SHADOW_DAILY_SUMMARY_ALERT = os.environ.get("ENABLE_SHADOW_DAILY_SUMMARY_ALERT", "true").lower() == "true"
+ENABLE_REAL_ORDER_RESULT_ALERT = os.environ.get("ENABLE_REAL_ORDER_RESULT_ALERT", "true").lower() == "true"
+ENABLE_REAL_AUTOSELL_RESULT_ALERT = os.environ.get("ENABLE_REAL_AUTOSELL_RESULT_ALERT", "true").lower() == "true"
+ENABLE_DAILY_BACKUP_ALERT = os.environ.get("ENABLE_DAILY_BACKUP_ALERT", "true").lower() == "true"
+ENABLE_KAKAO_MIRROR = os.environ.get("ENABLE_KAKAO_MIRROR", "false").lower() == "true"
 
 # ============================================================
 # V4.12 최종 수정: 회복 반등 + 수익권 자동매도
@@ -284,6 +302,8 @@ SHADOW_LEV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MAX_PCT", "0.0")
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
 TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200", "494310", "488080", "469150", "005930", "000660"]
+# 실계좌 삼성전자 레버리지는 장기 복구 포지션: 손실권 자동매도/자동손절 절대 금지, 수익권에서만 매도 가능
+REAL_PROFIT_ONLY_SYMBOLS = {"0193W0"}
 # 신규 매수 버튼/매수 알림은 하이닉스 레버리지/인버스만 허용한다.
 # 기존 보유종목 자동매도는 TRADE_ALLOWED_SYMBOLS 기준으로 계속 보호한다.
 HYNIX_TRADE_SYMBOLS = {LEV, INV}
@@ -751,9 +771,13 @@ def send_telegram_test():
     )
 
 def send_kakao(msg, link_url=None, button_title="대시보드 열기"):
+    """최종 최소알림 모드에서는 카카오 중복 전송을 끄고 텔레그램만 사용."""
     add_alert(msg)
     url = link_url or APP_URL or "https://developers.tossinvest.com/docs"
-    ok, text = post_kakao_template(kakao_template_text(msg, url, button_title))
+    if ENABLE_KAKAO_MIRROR:
+        ok, text = post_kakao_template(kakao_template_text(msg, url, button_title))
+    else:
+        ok, text = False, "KAKAO_MIRROR_DISABLED"
     tg_ok, tg_text = send_telegram(msg, [[telegram_button(button_title, url)]])
     with LOCK:
         S["kakao_last"] = f"{now_text()} kakao={text} / telegram={tg_text}"
@@ -1237,6 +1261,10 @@ def auto_sell_reason(sym, qty, price, buy, high, profit, drop_from_high):
         return None
     if price <= 0 or buy <= 0 or high <= 0:
         return None
+    # 삼성전자 레버리지 장기 보유분은 손실권 자동매도 절대 금지.
+    # 환경변수가 잘못 바뀌어도 현재 수익률이 0% 이하이면 무조건 보유한다.
+    if sym in REAL_PROFIT_ONLY_SYMBOLS and profit <= 0:
+        return None
     # V4.13 본전방어:
     # 최고수익 +2% 이상 찍은 뒤 현재수익이 +0.3% 이하로 밀리면 방어매도
     max_profit = pct(high, buy)
@@ -1299,7 +1327,8 @@ def execute_real_auto_sell(sym, qty, reason):
         f"사유: {reason}\n"
         f"결과: {result.get('message', '')}"
     )
-    send_telegram(msg, [[telegram_button("📊 대시보드", APP_URL)]])
+    if ENABLE_REAL_AUTOSELL_RESULT_ALERT:
+        send_telegram(msg, [[telegram_button("📊 대시보드", APP_URL)]])
     write_alert_log("AUTOSELL", "real_auto_sell", sym, price, 0, "SELL" if ok else "FAILED", reason, ok, json.dumps(result, ensure_ascii=False)[:300])
     return ok
 
@@ -1336,6 +1365,10 @@ def check_real_holding_management():
         if reason_auto:
             if execute_real_auto_sell(sym, qty, reason_auto):
                 continue
+
+        # 자동매도 실행은 유지하되, 보유 약화/손실/교체 후보 같은 반복 경고는 끈다.
+        if FINAL_MINIMAL_ALERT_MODE or not ENABLE_HOLDING_WARNING_ALERT:
+            continue
 
         sig = signals.get(sym, {})
         score = to_float(sig.get("score", 50))
@@ -1891,6 +1924,8 @@ def maybe_alert():
     - 09:05 기존 오신호는 NO_BUY_BEFORE=09:15로 차단
     - 기존 보조 알림은 ALERT_ONLY_ACTIONABLE=true이면 계속 차단
     """
+    if FINAL_MINIMAL_ALERT_MODE or not ENABLE_GENERAL_SIGNAL_ALERT:
+        return
     if not is_market_watch_time():
         return
 
@@ -2160,10 +2195,9 @@ def mark_method63_alert_sent(side):
 
 
 def send_method63_alert():
-    """
-    METHOD63 전용 매수 후보 알림.
-    자동매수는 하지 않는다.
-    """
+    """METHOD63 전용 매수 후보 알림. 최종 최소알림 모드에서는 기본 차단."""
+    if FINAL_MINIMAL_ALERT_MODE or not ENABLE_METHOD63_CANDIDATE_ALERT:
+        return False
     cand = method63_candidate()
 
     if not cand:
@@ -2516,9 +2550,9 @@ def send_real_pattern_sell_alert(sym, qty, reason):
     return True
 
 def run_real_pattern_alert_engine():
-    """실계좌용 목표 패턴 알림 엔진.
-    자동주문은 하지 않고 텔레그램 매수/매도 확인 버튼만 보낸다.
-    """
+    """실계좌 후보 알림 엔진. 최종 최소알림 모드에서는 후보 알림을 보내지 않는다."""
+    if FINAL_MINIMAL_ALERT_MODE or not ENABLE_REAL_PATTERN_CANDIDATE_ALERT:
+        return
     if not TARGET_PATTERN_ENABLED or not ENABLE_WORK_SWING_ALERT or REAL_ALERT_MODE != "WORK_SWING_ONLY":
         return
     target_pattern_reset_if_new_day()
@@ -2874,7 +2908,8 @@ def place_order_manual(sym, side, qty):
                     item["qty"] = remain
                     S["real_watch"][sym] = item
         save_state()
-    send_kakao(("✅" if ok else "⚠️") + f" 실계좌 반자동 {side_kr}\n{name_of(sym)}\n수량: {qty}주\n결과: {row['status']}", APP_URL)
+    if ENABLE_REAL_ORDER_RESULT_ALERT:
+        send_kakao(("✅" if ok else "⚠️") + f" 실계좌 반자동 {side_kr}\n{name_of(sym)}\n수량: {qty}주\n결과: {row['status']}", APP_URL)
     refresh_account_all(force=True)
     return {"ok": ok, "data": data, "message": row["status"]}
 
@@ -3310,7 +3345,7 @@ def shadow_fixed_buy(sym, reason):
             "entry_total_cost": total_cost,
         }
     _shadow_record("가상매수", sym, price, qty, 0, reason, fee)
-    if SHADOW_FIXED_NOTIFY:
+    if SHADOW_FIXED_NOTIFY and ENABLE_SHADOW_TRADE_ALERT:
         send_telegram(
             f"🟢 균형형 가상매수\n종목: {name_of(sym)} ({sym})\n"
             f"체결가: {fmt_won(price)} / 수량: {qty}주 / 매수비용: {fmt_won(fee)}\n"
@@ -3344,7 +3379,7 @@ def shadow_fixed_sell(reason, mark_stop=False):
         if mark_stop:
             st["stopped_today"] = True
     _shadow_record("가상손절" if mark_stop else "가상매도", sym, price, qty, pl, reason, fee)
-    if SHADOW_FIXED_NOTIFY:
+    if SHADOW_FIXED_NOTIFY and ENABLE_SHADOW_TRADE_ALERT:
         rate = pct(price, entry) if entry else 0
         title = "⛔ 균형형 가상손절" if mark_stop else "🔴 균형형 가상매도"
         send_telegram(
@@ -3408,6 +3443,15 @@ def write_shadow_fixed_summary():
          "stopped_today", "last_action"],
         row,
     )
+    if ENABLE_SHADOW_DAILY_SUMMARY_ALERT:
+        send_telegram(
+            f"📊 균형형 가상매매 일일요약\n"
+            f"날짜: {today()}\n총자산: {fmt_won(row['asset'])}\n"
+            f"누적수익률: {row['profit_rate']:+.2f}%\n실현손익: {fmt_won(row['realized_pl'])}\n"
+            f"오늘 손절: {'예' if row['stopped_today'] else '아니오'}\n"
+            f"최종상태: {row['last_action']}\n실계좌 주문: 없음",
+            [[telegram_button("📊 대시보드", APP_URL)]],
+        )
 
 
 def run_shadow_fixed_strategy():
@@ -3699,6 +3743,8 @@ def create_backup_zip():
     return path
 
 def maybe_send_daily_backup():
+    if not ENABLE_DAILY_BACKUP_ALERT:
+        return
     n = now_kst()
     if is_weekend_kst() or not (n.hour == 15 and 35 <= n.minute <= 37):
         return
@@ -3839,6 +3885,9 @@ class Handler(BaseHTTPRequestHandler):
                 "real_auto_sell": ENABLE_REAL_AUTO_SELL,
                 "auto_sell_profit_only": AUTO_SELL_PROFIT_ONLY,
                 "auto_sell_loss_cut": AUTO_SELL_LOSS_CUT,
+                "samsung_leverage_profit_only": True,
+                "samsung_leverage_symbol": "0193W0",
+                "samsung_leverage_loss_auto_sell": False,
                 "real_order_enabled": ENABLE_REAL_ORDER,
                 "app_url": APP_URL,
                 "telegram_configured": telegram_enabled(),
@@ -3869,6 +3918,17 @@ class Handler(BaseHTTPRequestHandler):
                 "shadow_fixed_enabled": SHADOW_FIXED_ENABLED,
                 "shadow_fixed_start_cash": SHADOW_FIXED_START_CASH,
                 "shadow_fixed_notify": SHADOW_FIXED_NOTIFY,
+                "final_minimal_alert_mode": FINAL_MINIMAL_ALERT_MODE,
+                "method63_candidate_alert": ENABLE_METHOD63_CANDIDATE_ALERT,
+                "real_pattern_candidate_alert": ENABLE_REAL_PATTERN_CANDIDATE_ALERT,
+                "holding_warning_alert": ENABLE_HOLDING_WARNING_ALERT,
+                "general_signal_alert": ENABLE_GENERAL_SIGNAL_ALERT,
+                "shadow_trade_alert": ENABLE_SHADOW_TRADE_ALERT,
+                "shadow_daily_summary_alert": ENABLE_SHADOW_DAILY_SUMMARY_ALERT,
+                "real_order_result_alert": ENABLE_REAL_ORDER_RESULT_ALERT,
+                "real_autosell_result_alert": ENABLE_REAL_AUTOSELL_RESULT_ALERT,
+                "daily_backup_alert": ENABLE_DAILY_BACKUP_ALERT,
+                "kakao_mirror": ENABLE_KAKAO_MIRROR,
                 "shadow_fixed_strategy_id": SHADOW_FIXED_STRATEGY_ID,
                 "shadow_inv_symbol": SHADOW_INV_SYMBOL,
                 "shadow_lev_symbol": SHADOW_LEV_SYMBOL,
