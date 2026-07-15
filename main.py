@@ -42,6 +42,34 @@ NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "20000000")))
+
+# ============================================================
+# V4.23 토스 공식 시장데이터 수집
+# - 정식 1분봉 OHLCV
+# - 호가/잔량
+# - 최근 체결
+# - KOSPI/KOSDAQ 지수와 투자자별 매매대금
+# - 매매 판단에는 아직 강제 반영하지 않고 CSV 수집만 수행
+# ============================================================
+ENABLE_TOSS_MARKET_DATA_CAPTURE = os.environ.get("ENABLE_TOSS_MARKET_DATA_CAPTURE", "true").lower() == "true"
+MARKET_DATA_CANDLE_SEC = int(os.environ.get("MARKET_DATA_CANDLE_SEC", "60"))
+MARKET_DATA_ORDERFLOW_SEC = int(os.environ.get("MARKET_DATA_ORDERFLOW_SEC", "30"))
+MARKET_DATA_INVESTOR_SEC = int(os.environ.get("MARKET_DATA_INVESTOR_SEC", "300"))
+MARKET_DATA_CANDLE_COUNT = int(os.environ.get("MARKET_DATA_CANDLE_COUNT", "3"))
+MARKET_DATA_TRADE_COUNT = int(os.environ.get("MARKET_DATA_TRADE_COUNT", "20"))
+MARKET_DATA_CORE_SYMBOLS = [x.strip() for x in os.environ.get(
+    "MARKET_DATA_CORE_SYMBOLS",
+    "0197X0,122630,0193T0,252670,000660,005930,069500,229200"
+).split(",") if x.strip()]
+MARKET_DATA_ORDERFLOW_SYMBOLS = [x.strip() for x in os.environ.get(
+    "MARKET_DATA_ORDERFLOW_SYMBOLS",
+    "0197X0,122630,0193T0,252670"
+).split(",") if x.strip()]
+MARKET_DATA_FOCUS_WINDOWS = [
+    ("09:00", "10:05"),
+    ("11:35", "13:05"),
+    ("14:45", "15:05"),
+]
 # ============================================================
 # 구 구 단타 단타 엔진 제거
 # - 실계좌는 V4.10 목표 패턴 알림만 사용
@@ -119,7 +147,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_22_SAMSUNG_LEV_PROFIT_ONLY"
+OPERATING_VERSION = "OPERATING_V4_23_TOSS_MARKET_DATA_CAPTURE"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -405,6 +433,16 @@ S = {
         "last_choice": {},
         "last_action": "없음",
     },
+    "market_data_capture": {
+        "last_candle_ts": 0,
+        "last_orderflow_ts": 0,
+        "last_investor_ts": 0,
+        "last_candle_minute": {},
+        "last_trade_timestamp": {},
+        "last_orderbook_timestamp": {},
+        "status": "대기",
+        "errors": 0,
+    },
     "method63": {
         "date": "",
         "set_count": 0,
@@ -575,6 +613,26 @@ def backup_zip_path():
 def symbol_path(sym):
     # 실제 파일명은 한글 금지. HTTP 헤더 latin-1 오류와 502 방지.
     return os.path.join(day_dir(), "symbols", f"{sym}.csv")
+
+def market_data_dir():
+    path = os.path.join(day_dir(), "market_data")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def candle_1m_path(sym):
+    return os.path.join(market_data_dir(), f"candles_1m_{sym}_{today()}.csv")
+
+def orderbook_path(sym):
+    return os.path.join(market_data_dir(), f"orderbook_{sym}_{today()}.csv")
+
+def trades_path(sym):
+    return os.path.join(market_data_dir(), f"trades_{sym}_{today()}.csv")
+
+def market_indicator_path():
+    return os.path.join(market_data_dir(), f"market_indicators_{today()}.csv")
+
+def investor_trading_path():
+    return os.path.join(market_data_dir(), f"investor_trading_{today()}.csv")
 
 def write_row(path, headers, row):
     try:
@@ -3636,6 +3694,218 @@ def write_fast_scalp_log_only():
             "alert_sent": False,
         })
 
+
+# ============================================================
+# 토스 공식 시장데이터 수집
+# ============================================================
+
+def _hhmm_in_range(cur_hhmm, start_hhmm, end_hhmm):
+    return start_hhmm <= cur_hhmm <= end_hhmm
+
+def market_data_focus_time():
+    cur = now_kst().strftime("%H:%M")
+    return any(_hhmm_in_range(cur, start, end) for start, end in MARKET_DATA_FOCUS_WINDOWS)
+
+def _result_dict(data):
+    if not isinstance(data, dict):
+        return {}
+    result = data.get("result", data)
+    return result if isinstance(result, dict) else {}
+
+def capture_candles_1m():
+    if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
+        return
+    state = S.setdefault("market_data_capture", {})
+    headers = ["saved_at", "symbol", "timestamp", "open", "high", "low", "close", "volume", "currency"]
+    for sym in MARKET_DATA_CORE_SYMBOLS:
+        code, data = api_get("/api/v1/candles", params={
+            "symbol": sym,
+            "interval": "1m",
+            "count": max(1, min(10, MARKET_DATA_CANDLE_COUNT)),
+            "adjusted": "true",
+        }, timeout=10)
+        if code != 200:
+            continue
+        result = _result_dict(data)
+        candles = result.get("candles", []) if isinstance(result, dict) else []
+        if not isinstance(candles, list):
+            continue
+        # API는 최신순일 수 있으므로 오래된 봉부터 저장한다.
+        for c in reversed(candles):
+            if not isinstance(c, dict):
+                continue
+            ts = str(c.get("timestamp", ""))
+            if not ts:
+                continue
+            key = f"{sym}:{ts}"
+            if state.setdefault("last_candle_minute", {}).get(sym) == key:
+                continue
+            write_row(candle_1m_path(sym), headers, {
+                "saved_at": now_text(), "symbol": sym, "timestamp": ts,
+                "open": c.get("openPrice", 0), "high": c.get("highPrice", 0),
+                "low": c.get("lowPrice", 0), "close": c.get("closePrice", 0),
+                "volume": c.get("volume", 0), "currency": c.get("currency", "KRW"),
+            })
+            state["last_candle_minute"][sym] = key
+    # KOSPI/KOSDAQ 정식 1분봉도 함께 저장한다.
+    for sym in ["KOSPI", "KOSDAQ"]:
+        code, data = api_get(f"/api/v1/market-indicators/{sym}/candles", params={
+            "interval": "1m", "count": max(1, min(10, MARKET_DATA_CANDLE_COUNT))
+        }, timeout=10)
+        if code != 200:
+            continue
+        result = _result_dict(data)
+        candles = result.get("candles", []) if isinstance(result, dict) else []
+        for c in reversed(candles if isinstance(candles, list) else []):
+            if not isinstance(c, dict):
+                continue
+            ts = str(c.get("timestamp", ""))
+            if not ts:
+                continue
+            key = f"{sym}:{ts}"
+            if state.setdefault("last_candle_minute", {}).get(sym) == key:
+                continue
+            write_row(candle_1m_path(sym), headers, {
+                "saved_at": now_text(), "symbol": sym, "timestamp": ts,
+                "open": c.get("openPrice", 0), "high": c.get("highPrice", 0),
+                "low": c.get("lowPrice", 0), "close": c.get("closePrice", 0),
+                "volume": c.get("volume", 0), "currency": "INDEX",
+            })
+            state["last_candle_minute"][sym] = key
+
+def capture_orderbook_and_trades():
+    if not ENABLE_TOSS_MARKET_DATA_CAPTURE or not market_data_focus_time():
+        return
+    state = S.setdefault("market_data_capture", {})
+    ob_headers = [
+        "saved_at", "symbol", "api_timestamp", "best_ask", "best_bid", "spread",
+        "ask_total_volume", "bid_total_volume", "bid_ask_ratio", "asks_json", "bids_json"
+    ]
+    tr_headers = ["saved_at", "symbol", "timestamp", "price", "volume", "currency"]
+    for sym in MARKET_DATA_ORDERFLOW_SYMBOLS:
+        code, data = api_get("/api/v1/orderbook", params={"symbol": sym}, timeout=8)
+        if code == 200:
+            result = _result_dict(data)
+            asks = result.get("asks", []) if isinstance(result.get("asks", []), list) else []
+            bids = result.get("bids", []) if isinstance(result.get("bids", []), list) else []
+            api_ts = str(result.get("timestamp", ""))
+            if api_ts and state.setdefault("last_orderbook_timestamp", {}).get(sym) != api_ts:
+                ask_total = sum(to_float(x.get("volume", 0)) for x in asks if isinstance(x, dict))
+                bid_total = sum(to_float(x.get("volume", 0)) for x in bids if isinstance(x, dict))
+                best_ask = to_float(asks[0].get("price", 0)) if asks else 0
+                best_bid = to_float(bids[0].get("price", 0)) if bids else 0
+                write_row(orderbook_path(sym), ob_headers, {
+                    "saved_at": now_text(), "symbol": sym, "api_timestamp": api_ts,
+                    "best_ask": best_ask, "best_bid": best_bid,
+                    "spread": best_ask - best_bid if best_ask and best_bid else 0,
+                    "ask_total_volume": int(ask_total), "bid_total_volume": int(bid_total),
+                    "bid_ask_ratio": round(bid_total / ask_total, 4) if ask_total else 0,
+                    "asks_json": json.dumps(asks, ensure_ascii=False, separators=(",", ":")),
+                    "bids_json": json.dumps(bids, ensure_ascii=False, separators=(",", ":")),
+                })
+                state["last_orderbook_timestamp"][sym] = api_ts
+
+        code, data = api_get("/api/v1/trades", params={
+            "symbol": sym, "count": max(1, min(50, MARKET_DATA_TRADE_COUNT))
+        }, timeout=8)
+        if code != 200:
+            continue
+        result = data.get("result", []) if isinstance(data, dict) else []
+        if not isinstance(result, list):
+            continue
+        last_seen = state.setdefault("last_trade_timestamp", {}).get(sym, "")
+        new_rows = []
+        for t in reversed(result):
+            if not isinstance(t, dict):
+                continue
+            ts = str(t.get("timestamp", ""))
+            if not ts or (last_seen and ts <= last_seen):
+                continue
+            new_rows.append(t)
+        for t in new_rows:
+            write_row(trades_path(sym), tr_headers, {
+                "saved_at": now_text(), "symbol": sym, "timestamp": t.get("timestamp", ""),
+                "price": t.get("price", 0), "volume": t.get("volume", 0),
+                "currency": t.get("currency", "KRW"),
+            })
+        if new_rows:
+            state["last_trade_timestamp"][sym] = str(new_rows[-1].get("timestamp", ""))
+
+def capture_market_investor_data():
+    if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
+        return
+    price_headers = ["saved_at", "symbol", "timestamp", "last_price"]
+    code, data = api_get("/api/v1/market-indicators/prices", params={"symbols": "KOSPI,KOSDAQ"}, timeout=8)
+    if code == 200:
+        result = data.get("result", []) if isinstance(data, dict) else []
+        for item in result if isinstance(result, list) else []:
+            if not isinstance(item, dict):
+                continue
+            write_row(market_indicator_path(), price_headers, {
+                "saved_at": now_text(), "symbol": item.get("symbol", ""),
+                "timestamp": item.get("timestamp", ""), "last_price": item.get("lastPrice", 0),
+            })
+
+    headers = [
+        "saved_at", "market", "date", "updated_at",
+        "individual_buy", "individual_sell", "individual_net",
+        "foreigner_buy", "foreigner_sell", "foreigner_net",
+        "institution_buy", "institution_sell", "institution_net",
+        "other_corp_buy", "other_corp_sell", "other_corp_net",
+        "institution_breakdown_json"
+    ]
+    for market in ["KOSPI", "KOSDAQ"]:
+        code, data = api_get(f"/api/v1/market-indicators/{market}/investor-trading", params={
+            "interval": "1d", "count": 1
+        }, timeout=10)
+        if code != 200:
+            continue
+        result = _result_dict(data)
+        records = result.get("records", []) if isinstance(result, dict) else []
+        if not records or not isinstance(records[0], dict):
+            continue
+        r = records[0]
+        def amounts(key):
+            obj = r.get(key, {}) if isinstance(r.get(key, {}), dict) else {}
+            buy = to_int(obj.get("buyAmount", 0))
+            sell = to_int(obj.get("sellAmount", 0))
+            return buy, sell, buy - sell
+        ib, isell, inet = amounts("individual")
+        fb, fs, fnet = amounts("foreigner")
+        nb, ns, nnet = amounts("institution")
+        ob, osell, onet = amounts("otherCorporation")
+        inst = r.get("institution", {}) if isinstance(r.get("institution", {}), dict) else {}
+        write_row(investor_trading_path(), headers, {
+            "saved_at": now_text(), "market": market, "date": r.get("date", ""),
+            "updated_at": r.get("updatedAt", ""),
+            "individual_buy": ib, "individual_sell": isell, "individual_net": inet,
+            "foreigner_buy": fb, "foreigner_sell": fs, "foreigner_net": fnet,
+            "institution_buy": nb, "institution_sell": ns, "institution_net": nnet,
+            "other_corp_buy": ob, "other_corp_sell": osell, "other_corp_net": onet,
+            "institution_breakdown_json": json.dumps(inst.get("breakdown", {}), ensure_ascii=False, separators=(",", ":")),
+        })
+
+def maybe_capture_toss_market_data():
+    if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
+        return
+    state = S.setdefault("market_data_capture", {})
+    now_ts = time.time()
+    try:
+        if now_ts - to_float(state.get("last_candle_ts", 0)) >= MARKET_DATA_CANDLE_SEC:
+            capture_candles_1m()
+            state["last_candle_ts"] = now_ts
+        if now_ts - to_float(state.get("last_orderflow_ts", 0)) >= MARKET_DATA_ORDERFLOW_SEC:
+            capture_orderbook_and_trades()
+            state["last_orderflow_ts"] = now_ts
+        if now_ts - to_float(state.get("last_investor_ts", 0)) >= MARKET_DATA_INVESTOR_SEC:
+            capture_market_investor_data()
+            state["last_investor_ts"] = now_ts
+        state["status"] = "정상"
+    except Exception as e:
+        state["errors"] = to_int(state.get("errors", 0)) + 1
+        state["status"] = f"오류: {e}"
+        set_error(f"토스 시장데이터 수집 오류: {e}")
+
 # ============================================================
 # 저장 / 루프
 # ============================================================
@@ -3785,6 +4055,10 @@ def loop():
 
             # 1) 가격과 계좌를 같은 루프에서 30초마다 갱신
             load_prices()
+            try:
+                maybe_capture_toss_market_data()
+            except Exception as e:
+                set_error(f"시장데이터 수집 루프 오류: {e}")
             refresh_account_all()
             calc_wma_all()
 
@@ -3903,6 +4177,19 @@ class Handler(BaseHTTPRequestHandler):
                 "real_account_mode": "semi_auto_button_only",
                 "paper_account_mode": "auto_ai_when_ENABLE_PAPER_AUTO_true",
                 "refresh_sec": REFRESH_SEC,
+                "toss_market_data_capture": ENABLE_TOSS_MARKET_DATA_CAPTURE,
+                "market_data_candle_sec": MARKET_DATA_CANDLE_SEC,
+                "market_data_orderflow_sec": MARKET_DATA_ORDERFLOW_SEC,
+                "market_data_investor_sec": MARKET_DATA_INVESTOR_SEC,
+                "market_data_core_symbols": MARKET_DATA_CORE_SYMBOLS,
+                "market_data_orderflow_symbols": MARKET_DATA_ORDERFLOW_SYMBOLS,
+                "market_data_focus_windows": MARKET_DATA_FOCUS_WINDOWS,
+                "market_data_capture_state": S.get("market_data_capture", {}),
+                "market_data_files": {
+                    "directory": market_data_dir(),
+                    "investor": investor_trading_path(),
+                    "indicators": market_indicator_path(),
+                },
                 "alert_symbols": ALERT_SYMBOLS,
                 "backup_zip": backup_zip_path(),
                 "legacy_daytrade_removed": LEGACY_DAYTRADE_REMOVED,
