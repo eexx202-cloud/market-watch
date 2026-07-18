@@ -46,7 +46,7 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
 
-# A~F 독립 가상 AI: 각 계좌는 현금/보유/손익/거래내역을 완전히 분리한다.
+# A~F 세부전략 18개 + G1~G4 당일장 AI: 각 계좌는 현금/보유/손익/거래내역을 완전히 분리한다.
 ENABLE_MULTI_PAPER_AI = os.environ.get("ENABLE_MULTI_PAPER_AI", "true").lower() == "true"
 MULTI_AI_START_CASH = int(float(os.environ.get("MULTI_AI_START_CASH", "10000000")))
 MULTI_AI_FEE_SIDE_PCT = float(os.environ.get("MULTI_AI_FEE_SIDE_PCT", "0.10"))
@@ -59,6 +59,8 @@ MULTI_AI_IDS = [
     "D1", "D2", "D3",
     "E1", "E2", "E3",
     "F1", "F2", "F3",
+    # G1~G4는 A1~F3 고정 비교군과 별도로 그날 장세를 실시간 판단하는 당일장 AI
+    "G1", "G2", "G3", "G4",
 ]
 MULTI_AI_NAMES = {
     "A1": "적응형 50·30·20 기본",
@@ -79,6 +81,10 @@ MULTI_AI_NAMES = {
     "F1": "오버나이트 익일 09:05",
     "F2": "오버나이트 익일 09:20",
     "F3": "오버나이트 익일 10:30 추적",
+    "G1": "당일장 종합판단 AI",
+    "G2": "당일장 보수형 AI",
+    "G3": "당일장 공격형 AI",
+    "G4": "당일장 감시전체 발굴 AI",
 }
 MULTI_AI_PARENT = {ai_id: ai_id[0] for ai_id in MULTI_AI_IDS}
 
@@ -195,7 +201,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_26_MULTI_STRATEGY_18_ACCOUNTS"
+OPERATING_VERSION = "OPERATING_V4_27_18_STRATEGIES_PLUS_4_DAILY_AI"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -3696,12 +3702,22 @@ def _multi_ai_recent_metrics(sym):
 
 
 def _multi_ai_candidate(ai_id, mode):
-    """18개 계좌가 서로 다른 조건으로 후보를 고른다."""
+    """A1~F3 고정 비교전략과 G1~G4 당일장 AI가 서로 다른 조건으로 후보를 고른다."""
     with LOCK:
         prices = dict(S.get("prices", {}))
     long_syms = ["122630", "233740", "069500", "229200", "494310", "488080", "469150"]
     inv_syms = ["252670", "251340"]
-    universe = inv_syms if mode == "DOWN" else long_syms
+    if ai_id == "G4":
+        # 현재 서버가 실제로 수집 중인 감시종목 전체에서 탐색한다.
+        # 실계좌 보호종목과 단일종목 레버리지/인버스는 당일장 발굴 대상에서 제외한다.
+        blocked = set(PROTECTED_REAL_SYMBOLS) | {"0193T0", "0197X0", "0193L0"}
+        universe = [sym for sym in ALL if sym not in blocked and prices.get(sym, 0) > 0]
+        if mode == "DOWN":
+            universe = list(dict.fromkeys(inv_syms + [sym for sym in universe if is_inverse_symbol(sym)]))
+        else:
+            universe = [sym for sym in universe if not is_inverse_symbol(sym)]
+    else:
+        universe = inv_syms if mode == "DOWN" else long_syms
     market_ref = "252670" if mode == "DOWN" else "069500"
     _, market_r3, market_r10, _, _ = _multi_ai_recent_metrics(market_ref)
     scored = []
@@ -3725,6 +3741,17 @@ def _multi_ai_candidate(ai_id, mode):
         elif ai_id == "E1": metric = score * 0.70 + rel * 2 - abs(r3) * 2
         elif ai_id == "E2": metric = score * 0.60 + rel * 4 + r10 * 2
         elif ai_id == "E3": metric = score * 0.35 + r10 * 8 + from_low * 2
+        elif ai_id == "G1":
+            # 장세별로 추세·상대강도·눌림 회복 비중을 자동 조정한다.
+            if mode in ["UP", "SEMI_LEADER_UP"]:
+                metric = score * 0.35 + r3 * 10 + r10 * 7 + rel * 5
+            elif mode == "DOWN":
+                metric = score * 0.40 + r3 * 8 + r10 * 8 + rel * 4
+            else:
+                metric = score * 0.55 + rel * 3 - abs(r3) * 4
+        elif ai_id == "G2": metric = score * 0.65 + rel * 5 + r10 * 3 - abs(r3) * 3
+        elif ai_id == "G3": metric = score * 0.20 + r3 * 18 + r10 * 8 + from_low * 2
+        elif ai_id == "G4": metric = score * 0.25 + r3 * 10 + r10 * 7 + rel * 10
         else: metric = score * 0.45 + r10 * 7 + rel * 3
         scored.append((metric, sym, score, r3, r10, from_high, from_low, rel))
     return max(scored, default=(0,"",0,0,0,0,0,0), key=lambda x:x[0])
@@ -3735,6 +3762,7 @@ def _multi_ai_entry_window(ai_id, hhmm):
     if ai_id == "D2": return "10:00" <= hhmm <= "10:03"
     if ai_id == "D3": return "12:46" <= hhmm <= "12:49"
     if ai_id.startswith("F"): return "14:45" <= hhmm <= "15:05"
+    if ai_id.startswith("G"): return "09:10" <= hhmm < "14:40"
     return hhmm < "14:30"
 
 
@@ -3754,7 +3782,13 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
         if profit <= stop: return f"{ai_id} 손실제한 {profit:.2f}%"
         trail = -0.7 if ai_id in ["E1","E2","A2"] else -1.3
         if profit >= 0.8 and draw <= trail: return f"{ai_id} 수익보호 {draw:.2f}%"
-    if ai_id.startswith("F"):
+    if ai_id.startswith("G"):
+        g_stops = {"G1": -1.5, "G2": -0.8, "G3": -2.2, "G4": -1.6}
+        g_trails = {"G1": -0.9, "G2": -0.6, "G3": -1.4, "G4": -1.0}
+        if profit <= g_stops[ai_id]: return f"{ai_id} 당일 손실제한 {profit:.2f}%"
+        if profit >= 0.7 and draw <= g_trails[ai_id]: return f"{ai_id} 당일 수익보호 {draw:.2f}%"
+        if hhmm >= "15:10": return f"{ai_id} 당일 15:10 전량청산"
+    elif ai_id.startswith("F"):
         if pos.get("entry_date") != today():
             target = {"F1":"09:05", "F2":"09:20", "F3":"10:30"}[ai_id]
             if hhmm >= target:
@@ -3767,7 +3801,7 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
 
 
 def run_multi_paper_ais():
-    """18개 독립 가상계좌. 각 계좌 1천만원, 실제 주문은 절대 호출하지 않는다."""
+    """18개 고정 비교전략 + 4개 당일장 AI. 각 계좌 1천만원, 실제 주문은 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS: _multi_ai_update(ai_id)
     if not ENABLE_MULTI_PAPER_AI or not paper_auto_time_open(): return
@@ -3783,23 +3817,25 @@ def run_multi_paper_ais():
             continue
         if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC: continue
         if not _multi_ai_entry_window(ai_id, hhmm): continue
-        if ai_id == "E2" and mode in ["CHOPPY", "NO_TRADE", "RECOVERY"]:
+        if ai_id in ["E2", "G2"] and mode in ["CHOPPY", "NO_TRADE", "RECOVERY"]:
             with LOCK:
                 st["last_decision_ts"] = now_ts; st["last_action"] = f"{now_short()} 강화관망 {mode}"
             continue
-        if mode in ["CHOPPY", "NO_TRADE", "RECOVERY"] and ai_id not in ["A1","A2","E1","E3"]: continue
+        if mode in ["CHOPPY", "NO_TRADE", "RECOVERY"] and ai_id not in ["A1","A2","E1","E3","G1"]: continue
         metric, sym, score, r3, r10, from_high, from_low, rel = _multi_ai_candidate(ai_id, mode)
         thresholds = {
             "A1":38,"A2":48,"A3":42,"B1":32,"B2":40,"B3":35,
             "C1":38,"C2":40,"C3":35,"D1":45,"D2":45,"D3":45,
             "E1":55,"E2":60,"E3":35,"F1":45,"F2":45,"F3":45,
+            "G1":42,"G2":62,"G3":38,"G4":45,
         }
         if not sym or metric < thresholds[ai_id]:
             with LOCK:
                 st["last_decision_ts"] = now_ts
                 st["last_action"] = f"{now_short()} 관망 mode={mode} metric={metric:.1f}"
             continue
-        ratios = {"E1":0.35,"E2":0.45,"A2":0.55,"A1":0.70,"E3":0.70,"A3":0.90}
+        ratios = {"E1":0.35,"E2":0.45,"A2":0.55,"A1":0.70,"E3":0.70,"A3":0.90,
+                  "G1":0.70,"G2":0.40,"G3":0.90,"G4":0.65}
         ratio = ratios.get(ai_id, 0.90)
         reason = (f"{MULTI_AI_NAMES[ai_id]} mode={mode}, metric={metric:.1f}, score={score:.1f}, "
                   f"r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%")
@@ -4725,6 +4761,10 @@ class Handler(BaseHTTPRequestHandler):
                 "multi_paper_ai_ids": MULTI_AI_IDS,
                 "multi_paper_ai_start_cash_each": MULTI_AI_START_CASH,
                 "multi_paper_ai_total_virtual_cash": MULTI_AI_START_CASH * len(MULTI_AI_IDS),
+                "fixed_strategy_account_ids": [x for x in MULTI_AI_IDS if not x.startswith("G")],
+                "daily_market_ai_ids": [x for x in MULTI_AI_IDS if x.startswith("G")],
+                "fixed_strategy_account_count": len([x for x in MULTI_AI_IDS if not x.startswith("G")]),
+                "daily_market_ai_count": len([x for x in MULTI_AI_IDS if x.startswith("G")]),
                 "multi_paper_ai_states": {ai: {
                     "name": S.get("paper_ais", {}).get(ai, {}).get("name", MULTI_AI_NAMES.get(ai, ai)),
                     "cash": int(to_float(S.get("paper_ais", {}).get(ai, {}).get("cash", 0))),
