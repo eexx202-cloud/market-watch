@@ -52,15 +52,36 @@ MULTI_AI_START_CASH = int(float(os.environ.get("MULTI_AI_START_CASH", "10000000"
 MULTI_AI_FEE_SIDE_PCT = float(os.environ.get("MULTI_AI_FEE_SIDE_PCT", "0.10"))
 MULTI_AI_MAX_POSITION_RATIO = float(os.environ.get("MULTI_AI_MAX_POSITION_RATIO", "0.90"))
 MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get("MULTI_AI_DECISION_COOLDOWN_SEC", "180"))
-MULTI_AI_IDS = ["A", "B", "C", "D", "E", "F"]
+MULTI_AI_IDS = [
+    "A1", "A2", "A3",
+    "B1", "B2", "B3",
+    "C1", "C2", "C3",
+    "D1", "D2", "D3",
+    "E1", "E2", "E3",
+    "F1", "F2", "F3",
+]
 MULTI_AI_NAMES = {
-    "A": "적응형 50·30·20",
-    "B": "장중 패턴형",
-    "C": "최근 흐름형",
-    "D": "고정 기준형",
-    "E": "위험관리형",
-    "F": "오버나이트형",
+    "A1": "적응형 50·30·20 기본",
+    "A2": "적응형 보수형",
+    "A3": "적응형 공격형",
+    "B1": "장중 눌림목",
+    "B2": "장중 돌파",
+    "B3": "장중 재돌파",
+    "C1": "최근 3포인트 흐름",
+    "C2": "최근 10포인트 흐름",
+    "C3": "시장 대비 상대강도",
+    "D1": "고정시간 09:15",
+    "D2": "고정시간 10:00",
+    "D3": "고정시간 12:46",
+    "E1": "위험관리 저노출",
+    "E2": "관망필터 강화",
+    "E3": "고정손절 없음·추적청산",
+    "F1": "오버나이트 익일 09:05",
+    "F2": "오버나이트 익일 09:20",
+    "F3": "오버나이트 익일 10:30 추적",
 }
+MULTI_AI_PARENT = {ai_id: ai_id[0] for ai_id in MULTI_AI_IDS}
+
 
 # 공식 국내 장 캘린더 + 데이터 신선도 차단
 ENABLE_MARKET_SAFETY_GATE = os.environ.get("ENABLE_MARKET_SAFETY_GATE", "true").lower() == "true"
@@ -174,7 +195,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_25_MULTI_AI_A_TO_F"
+OPERATING_VERSION = "OPERATING_V4_26_MULTI_STRATEGY_18_ACCOUNTS"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -3654,83 +3675,137 @@ def _multi_ai_sell(ai_id, sym, reason):
     return True
 
 
-def _multi_ai_candidate(ai_id, mode):
-    """각 AI는 서로 다른 점수/시장 조건으로 독립 후보를 고른다."""
+def _multi_ai_recent_metrics(sym):
     with LOCK:
-        prices = dict(S.get("prices", {})); signals = dict(S.get("signals", {})); history = dict(S.get("history", {}))
+        hist = list(S.get("history", {}).get(sym, []) or [])
+        signals = dict(S.get("signals", {}))
+    sig = signals.get(sym, {}) if isinstance(signals.get(sym), dict) else {}
+    score = to_float(sig.get("score", 0))
+    def move(points):
+        if len(hist) >= points + 1 and to_float(hist[-points-1]) > 0:
+            return pct(to_float(hist[-1]), to_float(hist[-points-1]))
+        return 0.0
+    r3 = move(3)
+    r10 = move(10)
+    high = max([to_float(x) for x in hist[-30:] if to_float(x) > 0] or [0])
+    low = min([to_float(x) for x in hist[-30:] if to_float(x) > 0] or [0])
+    cur = to_float(hist[-1]) if hist else 0
+    from_high = pct(cur, high) if high else 0
+    from_low = pct(cur, low) if low else 0
+    return score, r3, r10, from_high, from_low
+
+
+def _multi_ai_candidate(ai_id, mode):
+    """18개 계좌가 서로 다른 조건으로 후보를 고른다."""
+    with LOCK:
+        prices = dict(S.get("prices", {}))
     long_syms = ["122630", "233740", "069500", "229200", "494310", "488080", "469150"]
     inv_syms = ["252670", "251340"]
     universe = inv_syms if mode == "DOWN" else long_syms
+    market_ref = "252670" if mode == "DOWN" else "069500"
+    _, market_r3, market_r10, _, _ = _multi_ai_recent_metrics(market_ref)
     scored = []
     for sym in universe:
-        if prices.get(sym, 0) <= 0: continue
-        sig = signals.get(sym, {}) if isinstance(signals.get(sym), dict) else {}
-        score = to_float(sig.get("score", 0))
-        hist = history.get(sym, []) if isinstance(history.get(sym), list) else []
-        recent = 0.0
-        if len(hist) >= 4 and to_float(hist[-4]) > 0:
-            recent = pct(to_float(hist[-1]), to_float(hist[-4]))
-        if ai_id == "A": metric = score * 0.5 + max(-20, min(20, recent * 5)) * 0.3 + (10 if mode in ["UP","DOWN","SEMI_LEADER_UP"] else -10) * 0.2
-        elif ai_id == "B": metric = recent * 12 + score * 0.35
-        elif ai_id == "C": metric = recent * 18 + score * 0.15
-        elif ai_id == "D": metric = score + (8 if sym in (["122630"] if mode != "DOWN" else ["252670"]) else 0)
-        elif ai_id == "E": metric = score * 0.55 + recent * 4
-        else: metric = score * 0.45 + recent * 7
-        scored.append((metric, sym, score, recent))
-    return max(scored, default=(0,"",0,0), key=lambda x:x[0])
+        if prices.get(sym, 0) <= 0:
+            continue
+        score, r3, r10, from_high, from_low = _multi_ai_recent_metrics(sym)
+        rel = r10 - market_r10
+        if ai_id == "A1": metric = score * 0.50 + r10 * 6 * 0.30 + (10 if mode in ["UP","DOWN","SEMI_LEADER_UP"] else -10) * 0.20
+        elif ai_id == "A2": metric = score * 0.65 + r10 * 3 + rel * 2
+        elif ai_id == "A3": metric = score * 0.30 + r3 * 12 + r10 * 6
+        elif ai_id == "B1": metric = score * 0.35 + from_low * 4 + (-from_high) * 3 if -3.5 <= from_high <= -0.3 else -999
+        elif ai_id == "B2": metric = score * 0.30 + r3 * 15 + r10 * 5 if from_high >= -0.25 else -999
+        elif ai_id == "B3": metric = score * 0.25 + r3 * 10 + from_low * 5 if r10 > 0 and -1.5 <= from_high <= 0.4 else -999
+        elif ai_id == "C1": metric = r3 * 20 + score * 0.15
+        elif ai_id == "C2": metric = r10 * 14 + score * 0.20
+        elif ai_id == "C3": metric = rel * 18 + score * 0.25
+        elif ai_id == "D1": metric = score + (10 if sym in (["122630"] if mode != "DOWN" else ["252670"]) else 0)
+        elif ai_id == "D2": metric = score + r10 * 4
+        elif ai_id == "D3": metric = score * 0.8 + rel * 6
+        elif ai_id == "E1": metric = score * 0.70 + rel * 2 - abs(r3) * 2
+        elif ai_id == "E2": metric = score * 0.60 + rel * 4 + r10 * 2
+        elif ai_id == "E3": metric = score * 0.35 + r10 * 8 + from_low * 2
+        else: metric = score * 0.45 + r10 * 7 + rel * 3
+        scored.append((metric, sym, score, r3, r10, from_high, from_low, rel))
+    return max(scored, default=(0,"",0,0,0,0,0,0), key=lambda x:x[0])
+
+
+def _multi_ai_entry_window(ai_id, hhmm):
+    if ai_id == "D1": return "09:15" <= hhmm <= "09:18"
+    if ai_id == "D2": return "10:00" <= hhmm <= "10:03"
+    if ai_id == "D3": return "12:46" <= hhmm <= "12:49"
+    if ai_id.startswith("F"): return "14:45" <= hhmm <= "15:05"
+    return hhmm < "14:30"
+
+
+def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
+    price = to_float(S.get("prices", {}).get(sym, 0)); avg = to_float(pos.get("avg", 0))
+    if price <= 0 or avg <= 0: return ""
+    high = max(to_float(pos.get("high_after_buy", avg)), price)
+    with LOCK:
+        if sym in S["paper_ais"][ai_id]["positions"]:
+            S["paper_ais"][ai_id]["positions"][sym]["high_after_buy"] = high
+    profit = pct(price, avg); draw = pct(price, high)
+    if ai_id == "E3":
+        if profit >= 0.8 and draw <= -1.2: return f"E3 무고정손절 추적청산 {draw:.2f}%"
+    else:
+        stops = {"E1":-0.8,"E2":-1.0,"A2":-1.2,"A1":-1.8,"A3":-2.5,"B1":-1.5,"B2":-2.0,"B3":-1.8,"C1":-2.2,"C2":-2.0,"C3":-1.8}
+        stop = stops.get(ai_id, -2.5)
+        if profit <= stop: return f"{ai_id} 손실제한 {profit:.2f}%"
+        trail = -0.7 if ai_id in ["E1","E2","A2"] else -1.3
+        if profit >= 0.8 and draw <= trail: return f"{ai_id} 수익보호 {draw:.2f}%"
+    if ai_id.startswith("F"):
+        if pos.get("entry_date") != today():
+            target = {"F1":"09:05", "F2":"09:20", "F3":"10:30"}[ai_id]
+            if hhmm >= target:
+                if ai_id != "F3" or profit > 0 or draw <= -0.8:
+                    return f"{ai_id} 익일 {target} 청산"
+    elif hhmm >= "15:00": return f"{ai_id} 당일청산"
+    if is_inverse_symbol(sym) and mode in ["UP","SEMI_LEADER_UP"]: return "시장 상승 전환"
+    if (not is_inverse_symbol(sym)) and mode == "DOWN": return "시장 하락 전환"
+    return ""
 
 
 def run_multi_paper_ais():
-    """A~F 각각 1천만원 독립 가상계좌. 실제 주문 함수는 호출하지 않는다."""
+    """18개 독립 가상계좌. 각 계좌 1천만원, 실제 주문은 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS: _multi_ai_update(ai_id)
     if not ENABLE_MULTI_PAPER_AI or not paper_auto_time_open(): return
-    mode = target_market_regime()
-    now_ts = time.time(); hhmm = now_kst().strftime("%H:%M")
+    mode = target_market_regime(); now_ts = time.time(); hhmm = now_kst().strftime("%H:%M")
     for ai_id in MULTI_AI_IDS:
         with LOCK:
             st = S["paper_ais"][ai_id]
             positions = dict(st.get("positions", {})); last_ts = to_float(st.get("last_decision_ts", 0))
-        # 보유 포지션 청산 규칙
         if positions:
             for sym, pos in list(positions.items()):
-                price = to_float(S.get("prices", {}).get(sym, 0)); avg = to_float(pos.get("avg", 0))
-                if price <= 0 or avg <= 0: continue
-                high = max(to_float(pos.get("high_after_buy", avg)), price)
-                with LOCK:
-                    if sym in S["paper_ais"][ai_id]["positions"]: S["paper_ais"][ai_id]["positions"][sym]["high_after_buy"] = high
-                profit = pct(price, avg); draw = pct(price, high)
-                reason = ""
-                stop = -1.2 if ai_id == "E" else (-2.0 if ai_id in ["A","B","C"] else -3.0)
-                trail = -0.8 if ai_id == "E" else -1.5
-                if profit <= stop: reason = f"{ai_id} 손실제한 {profit:.2f}%"
-                elif profit >= 0.8 and draw <= trail: reason = f"{ai_id} 수익보호 고점대비 {draw:.2f}%"
-                elif ai_id != "F" and hhmm >= "15:00": reason = f"{ai_id} 당일청산"
-                elif ai_id == "F" and pos.get("entry_date") != today() and hhmm >= "09:20": reason = "F 오버나이트 익일 09:20 이후 청산"
-                elif is_inverse_symbol(sym) and mode in ["UP","SEMI_LEADER_UP"]: reason = "시장 상승 전환"
-                elif (not is_inverse_symbol(sym)) and mode == "DOWN": reason = "시장 하락 전환"
+                reason = _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm)
                 if reason: _multi_ai_sell(ai_id, sym, reason)
             continue
         if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC: continue
-        # F는 종가 부근에만 신규 진입, 나머지는 장중 진입
-        if ai_id == "F":
-            if not ("14:45" <= hhmm <= "15:05"): continue
-        else:
-            if hhmm >= "14:30": continue
-        if mode in ["CHOPPY", "NO_TRADE", "RECOVERY"] and ai_id not in ["A","E"]: continue
-        metric, sym, score, recent = _multi_ai_candidate(ai_id, mode)
-        thresholds = {"A":42,"B":48,"C":45,"D":50,"E":58,"F":48}
+        if not _multi_ai_entry_window(ai_id, hhmm): continue
+        if ai_id == "E2" and mode in ["CHOPPY", "NO_TRADE", "RECOVERY"]:
+            with LOCK:
+                st["last_decision_ts"] = now_ts; st["last_action"] = f"{now_short()} 강화관망 {mode}"
+            continue
+        if mode in ["CHOPPY", "NO_TRADE", "RECOVERY"] and ai_id not in ["A1","A2","E1","E3"]: continue
+        metric, sym, score, r3, r10, from_high, from_low, rel = _multi_ai_candidate(ai_id, mode)
+        thresholds = {
+            "A1":38,"A2":48,"A3":42,"B1":32,"B2":40,"B3":35,
+            "C1":38,"C2":40,"C3":35,"D1":45,"D2":45,"D3":45,
+            "E1":55,"E2":60,"E3":35,"F1":45,"F2":45,"F3":45,
+        }
         if not sym or metric < thresholds[ai_id]:
             with LOCK:
-                S["paper_ais"][ai_id]["last_decision_ts"] = now_ts
-                S["paper_ais"][ai_id]["last_action"] = f"{now_short()} 관망 mode={mode} metric={metric:.1f}"
+                st["last_decision_ts"] = now_ts
+                st["last_action"] = f"{now_short()} 관망 mode={mode} metric={metric:.1f}"
             continue
-        ratio = 0.50 if ai_id == "E" else (0.70 if ai_id == "A" else 0.90)
-        reason = f"{MULTI_AI_NAMES[ai_id]} mode={mode}, metric={metric:.1f}, score={score:.1f}, recent={recent:.2f}%"
+        ratios = {"E1":0.35,"E2":0.45,"A2":0.55,"A1":0.70,"E3":0.70,"A3":0.90}
+        ratio = ratios.get(ai_id, 0.90)
+        reason = (f"{MULTI_AI_NAMES[ai_id]} mode={mode}, metric={metric:.1f}, score={score:.1f}, "
+                  f"r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%")
         if _multi_ai_buy(ai_id, sym, reason, ratio):
             with LOCK:
-                S["paper_ais"][ai_id]["last_decision_ts"] = now_ts
-                S["paper_ais"][ai_id]["last_decision_date"] = today()
+                st["last_decision_ts"] = now_ts; st["last_decision_date"] = today()
 
 def simulated_orderbook_fill(sym, side, max_cash=0, qty=0):
     """현재 호가 잔량을 위에서부터 소진해 가상 평균체결가/부분체결을 계산한다."""
