@@ -46,6 +46,22 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
 
+# A~F 독립 가상 AI: 각 계좌는 현금/보유/손익/거래내역을 완전히 분리한다.
+ENABLE_MULTI_PAPER_AI = os.environ.get("ENABLE_MULTI_PAPER_AI", "true").lower() == "true"
+MULTI_AI_START_CASH = int(float(os.environ.get("MULTI_AI_START_CASH", "10000000")))
+MULTI_AI_FEE_SIDE_PCT = float(os.environ.get("MULTI_AI_FEE_SIDE_PCT", "0.10"))
+MULTI_AI_MAX_POSITION_RATIO = float(os.environ.get("MULTI_AI_MAX_POSITION_RATIO", "0.90"))
+MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get("MULTI_AI_DECISION_COOLDOWN_SEC", "180"))
+MULTI_AI_IDS = ["A", "B", "C", "D", "E", "F"]
+MULTI_AI_NAMES = {
+    "A": "적응형 50·30·20",
+    "B": "장중 패턴형",
+    "C": "최근 흐름형",
+    "D": "고정 기준형",
+    "E": "위험관리형",
+    "F": "오버나이트형",
+}
+
 # 공식 국내 장 캘린더 + 데이터 신선도 차단
 ENABLE_MARKET_SAFETY_GATE = os.environ.get("ENABLE_MARKET_SAFETY_GATE", "true").lower() == "true"
 MARKET_CALENDAR_REFRESH_SEC = int(os.environ.get("MARKET_CALENDAR_REFRESH_SEC", "1800"))
@@ -158,7 +174,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_24_PAPER_LIVE_SAFE_ORDERBOOK"
+OPERATING_VERSION = "OPERATING_V4_25_MULTI_AI_A_TO_F"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -410,6 +426,7 @@ S = {
         "profit_rate": 0,
         "last_action": "없음",
     },
+    "paper_ais": {},
     "shadow_fixed": {
         "date": "",
         "strategy_id": SHADOW_FIXED_STRATEGY_ID,
@@ -777,6 +794,7 @@ def save_state():
             data = {
                 "real_base_cash": S["real_base_cash"],
                 "paper": S["paper"],
+                "paper_ais": S.get("paper_ais", {}),
                 "shadow_fixed": S.get("shadow_fixed", {}),
                 "real_watch": S.get("real_watch", {}),
             }
@@ -799,6 +817,9 @@ def load_state():
             paper = data.get("paper")
             if isinstance(paper, dict):
                 S["paper"].update(paper)
+            paper_ais = data.get("paper_ais")
+            if isinstance(paper_ais, dict):
+                S["paper_ais"] = paper_ais
             shadow = data.get("shadow_fixed")
             if isinstance(shadow, dict):
                 S["shadow_fixed"].update(shadow)
@@ -3493,6 +3514,224 @@ def _shadow_record(action, sym, price, qty, pl, reason, fee=0):
     save_state()
 
 
+
+def multi_ai_path(ai_id):
+    return os.path.join(day_dir(), f"paper_ai_{ai_id}_{today()}.csv")
+
+
+def _multi_ai_default(ai_id):
+    return {
+        "id": ai_id,
+        "name": MULTI_AI_NAMES.get(ai_id, ai_id),
+        "start_cash": MULTI_AI_START_CASH,
+        "cash": MULTI_AI_START_CASH,
+        "positions": {},
+        "realized_pl": 0,
+        "asset": MULTI_AI_START_CASH,
+        "profit_rate": 0.0,
+        "trades": [],
+        "last_action": "초기화",
+        "last_decision_ts": 0,
+        "last_decision_date": "",
+    }
+
+
+def ensure_multi_ai_states():
+    with LOCK:
+        states = S.setdefault("paper_ais", {})
+        for ai_id in MULTI_AI_IDS:
+            cur = states.get(ai_id)
+            if not isinstance(cur, dict):
+                states[ai_id] = _multi_ai_default(ai_id)
+                continue
+            default = _multi_ai_default(ai_id)
+            for k, v in default.items():
+                cur.setdefault(k, v)
+            cur["id"] = ai_id
+            cur["name"] = MULTI_AI_NAMES.get(ai_id, ai_id)
+            cur.setdefault("positions", {})
+            cur.setdefault("trades", [])
+
+
+def _multi_ai_asset(ai_id):
+    ensure_multi_ai_states()
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        total = to_float(st.get("cash", 0))
+        positions = dict(st.get("positions", {}))
+        prices = dict(S.get("prices", {}))
+    for sym, pos in positions.items():
+        total += to_float(pos.get("qty", 0)) * prices.get(sym, to_float(pos.get("avg", 0)))
+    return int(total)
+
+
+def _multi_ai_update(ai_id):
+    asset = _multi_ai_asset(ai_id)
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        st["asset"] = asset
+        st["profit_rate"] = pct(asset, st.get("start_cash", MULTI_AI_START_CASH))
+
+
+def _multi_ai_record(ai_id, action, sym, price, qty, fee, pl, reason, partial=False):
+    _multi_ai_update(ai_id)
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        row = {
+            "time": now_text(), "ai_id": ai_id, "ai_name": st.get("name", ai_id),
+            "action": action, "symbol": sym, "name": name_of(sym),
+            "price": round(to_float(price), 4), "qty": int(qty), "fee": int(fee),
+            "pl": int(pl), "cash": int(to_float(st.get("cash", 0))),
+            "asset": int(to_float(st.get("asset", 0))),
+            "profit_rate": round(to_float(st.get("profit_rate", 0)), 4),
+            "reason": reason, "partial": bool(partial), "real_order": False,
+        }
+        st.setdefault("trades", []).insert(0, row)
+        st["trades"] = st["trades"][:200]
+        st["last_action"] = f"{now_short()} {action} {name_of(sym)}"
+    write_row(multi_ai_path(ai_id), ["time","ai_id","ai_name","action","symbol","name","price","qty","fee","pl","cash","asset","profit_rate","reason","partial","real_order"], row)
+    save_state()
+
+
+def _multi_ai_buy(ai_id, sym, reason, ratio=None):
+    gate_ok, gate_reason = market_safety_gate(sym)
+    if not gate_ok:
+        return False
+    ensure_multi_ai_states()
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        if st.get("positions"):
+            return False
+        cash = int(to_float(st.get("cash", 0)))
+    use_ratio = MULTI_AI_MAX_POSITION_RATIO if ratio is None else min(MULTI_AI_MAX_POSITION_RATIO, max(0.05, ratio))
+    budget = int(cash * use_ratio)
+    fee_rate = MULTI_AI_FEE_SIDE_PCT / 100
+    fill = simulated_orderbook_fill(sym, "BUY", max_cash=budget / (1 + fee_rate))
+    if not fill.get("ok"):
+        return False
+    qty = int(fill.get("qty", 0)); price = to_float(fill.get("avg_price", 0)); gross = int(round(fill.get("gross", 0)))
+    fee = int(round(gross * fee_rate)); total = gross + fee
+    while qty > 0 and total > cash:
+        qty -= 1; gross = int(round(qty * price)); fee = int(round(gross * fee_rate)); total = gross + fee
+    if qty <= 0:
+        return False
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        st["cash"] = cash - total
+        st["positions"][sym] = {
+            "qty": qty, "avg": price, "entry_time": now_text(), "entry_date": today(),
+            "entry_total_cost": total, "entry_fee": fee, "high_after_buy": price,
+        }
+    _multi_ai_record(ai_id, "가상매수", sym, price, qty, fee, 0, reason, bool(fill.get("partial")))
+    return True
+
+
+def _multi_ai_sell(ai_id, sym, reason):
+    ensure_multi_ai_states()
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        pos = st.get("positions", {}).get(sym)
+        if not isinstance(pos, dict): return False
+        qty = int(to_float(pos.get("qty", 0))); avg = to_float(pos.get("avg", 0)); total_cost = int(to_float(pos.get("entry_total_cost", qty * avg)))
+    gate_ok, _ = market_safety_gate(sym)
+    if not gate_ok: return False
+    fill = simulated_orderbook_fill(sym, "SELL", qty=qty)
+    if not fill.get("ok"): return False
+    sold = int(fill.get("qty", 0)); price = to_float(fill.get("avg_price", 0)); gross = int(round(fill.get("gross", 0)))
+    fee = int(round(gross * MULTI_AI_FEE_SIDE_PCT / 100)); net = gross - fee
+    cost_part = int(round(total_cost * sold / max(1, qty))); pl = net - cost_part; remain = qty - sold
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        st["cash"] = int(to_float(st.get("cash", 0))) + net
+        st["realized_pl"] = int(to_float(st.get("realized_pl", 0))) + pl
+        if remain <= 0:
+            st["positions"].pop(sym, None)
+        else:
+            pos["qty"] = remain
+            pos["entry_total_cost"] = max(0, total_cost - cost_part)
+            st["positions"][sym] = pos
+    _multi_ai_record(ai_id, "가상매도", sym, price, sold, fee, pl, reason, remain > 0)
+    return True
+
+
+def _multi_ai_candidate(ai_id, mode):
+    """각 AI는 서로 다른 점수/시장 조건으로 독립 후보를 고른다."""
+    with LOCK:
+        prices = dict(S.get("prices", {})); signals = dict(S.get("signals", {})); history = dict(S.get("history", {}))
+    long_syms = ["122630", "233740", "069500", "229200", "494310", "488080", "469150"]
+    inv_syms = ["252670", "251340"]
+    universe = inv_syms if mode == "DOWN" else long_syms
+    scored = []
+    for sym in universe:
+        if prices.get(sym, 0) <= 0: continue
+        sig = signals.get(sym, {}) if isinstance(signals.get(sym), dict) else {}
+        score = to_float(sig.get("score", 0))
+        hist = history.get(sym, []) if isinstance(history.get(sym), list) else []
+        recent = 0.0
+        if len(hist) >= 4 and to_float(hist[-4]) > 0:
+            recent = pct(to_float(hist[-1]), to_float(hist[-4]))
+        if ai_id == "A": metric = score * 0.5 + max(-20, min(20, recent * 5)) * 0.3 + (10 if mode in ["UP","DOWN","SEMI_LEADER_UP"] else -10) * 0.2
+        elif ai_id == "B": metric = recent * 12 + score * 0.35
+        elif ai_id == "C": metric = recent * 18 + score * 0.15
+        elif ai_id == "D": metric = score + (8 if sym in (["122630"] if mode != "DOWN" else ["252670"]) else 0)
+        elif ai_id == "E": metric = score * 0.55 + recent * 4
+        else: metric = score * 0.45 + recent * 7
+        scored.append((metric, sym, score, recent))
+    return max(scored, default=(0,"",0,0), key=lambda x:x[0])
+
+
+def run_multi_paper_ais():
+    """A~F 각각 1천만원 독립 가상계좌. 실제 주문 함수는 호출하지 않는다."""
+    ensure_multi_ai_states()
+    for ai_id in MULTI_AI_IDS: _multi_ai_update(ai_id)
+    if not ENABLE_MULTI_PAPER_AI or not paper_auto_time_open(): return
+    mode = target_market_regime()
+    now_ts = time.time(); hhmm = now_kst().strftime("%H:%M")
+    for ai_id in MULTI_AI_IDS:
+        with LOCK:
+            st = S["paper_ais"][ai_id]
+            positions = dict(st.get("positions", {})); last_ts = to_float(st.get("last_decision_ts", 0))
+        # 보유 포지션 청산 규칙
+        if positions:
+            for sym, pos in list(positions.items()):
+                price = to_float(S.get("prices", {}).get(sym, 0)); avg = to_float(pos.get("avg", 0))
+                if price <= 0 or avg <= 0: continue
+                high = max(to_float(pos.get("high_after_buy", avg)), price)
+                with LOCK:
+                    if sym in S["paper_ais"][ai_id]["positions"]: S["paper_ais"][ai_id]["positions"][sym]["high_after_buy"] = high
+                profit = pct(price, avg); draw = pct(price, high)
+                reason = ""
+                stop = -1.2 if ai_id == "E" else (-2.0 if ai_id in ["A","B","C"] else -3.0)
+                trail = -0.8 if ai_id == "E" else -1.5
+                if profit <= stop: reason = f"{ai_id} 손실제한 {profit:.2f}%"
+                elif profit >= 0.8 and draw <= trail: reason = f"{ai_id} 수익보호 고점대비 {draw:.2f}%"
+                elif ai_id != "F" and hhmm >= "15:00": reason = f"{ai_id} 당일청산"
+                elif ai_id == "F" and pos.get("entry_date") != today() and hhmm >= "09:20": reason = "F 오버나이트 익일 09:20 이후 청산"
+                elif is_inverse_symbol(sym) and mode in ["UP","SEMI_LEADER_UP"]: reason = "시장 상승 전환"
+                elif (not is_inverse_symbol(sym)) and mode == "DOWN": reason = "시장 하락 전환"
+                if reason: _multi_ai_sell(ai_id, sym, reason)
+            continue
+        if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC: continue
+        # F는 종가 부근에만 신규 진입, 나머지는 장중 진입
+        if ai_id == "F":
+            if not ("14:45" <= hhmm <= "15:05"): continue
+        else:
+            if hhmm >= "14:30": continue
+        if mode in ["CHOPPY", "NO_TRADE", "RECOVERY"] and ai_id not in ["A","E"]: continue
+        metric, sym, score, recent = _multi_ai_candidate(ai_id, mode)
+        thresholds = {"A":42,"B":48,"C":45,"D":50,"E":58,"F":48}
+        if not sym or metric < thresholds[ai_id]:
+            with LOCK:
+                S["paper_ais"][ai_id]["last_decision_ts"] = now_ts
+                S["paper_ais"][ai_id]["last_action"] = f"{now_short()} 관망 mode={mode} metric={metric:.1f}"
+            continue
+        ratio = 0.50 if ai_id == "E" else (0.70 if ai_id == "A" else 0.90)
+        reason = f"{MULTI_AI_NAMES[ai_id]} mode={mode}, metric={metric:.1f}, score={score:.1f}, recent={recent:.2f}%"
+        if _multi_ai_buy(ai_id, sym, reason, ratio):
+            with LOCK:
+                S["paper_ais"][ai_id]["last_decision_ts"] = now_ts
+                S["paper_ais"][ai_id]["last_decision_date"] = today()
+
 def simulated_orderbook_fill(sym, side, max_cash=0, qty=0):
     """현재 호가 잔량을 위에서부터 소진해 가상 평균체결가/부분체결을 계산한다."""
     ob = S.setdefault("market_data_capture", {}).get("latest_orderbook", {}).get(sym, {})
@@ -4240,6 +4479,8 @@ def maybe_send_daily_backup():
 
 def loop():
     load_state()
+    ensure_multi_ai_states()
+    save_state()
     counter = 0
     last_news = 0
     initialized = False
@@ -4324,6 +4565,15 @@ def loop():
             try:
                 gate_ok, gate_reason = market_safety_gate()
                 if gate_ok:
+                    run_multi_paper_ais()
+                else:
+                    set_status_once(f"MULTI_AI_GATE_{gate_reason}", f"A~F 가상AI 차단: {gate_reason}", 300)
+            except Exception as e:
+                set_error(f"A~F 가상AI 오류: {e}")
+
+            try:
+                gate_ok, gate_reason = market_safety_gate()
+                if gate_ok:
                     run_shadow_fixed_strategy()
                 else:
                     set_status_once(f"SHADOW_GATE_{gate_reason}", f"고정전략 차단: {gate_reason}", 300)
@@ -4396,6 +4646,18 @@ class Handler(BaseHTTPRequestHandler):
                 "sellable_endpoint": "/api/v1/sellable-quantity",
                 "real_holding_management": True,
                 "paper_auto_ai_2000": ENABLE_PAPER_AUTO,
+                "multi_paper_ai_enabled": ENABLE_MULTI_PAPER_AI,
+                "multi_paper_ai_ids": MULTI_AI_IDS,
+                "multi_paper_ai_start_cash_each": MULTI_AI_START_CASH,
+                "multi_paper_ai_total_virtual_cash": MULTI_AI_START_CASH * len(MULTI_AI_IDS),
+                "multi_paper_ai_states": {ai: {
+                    "name": S.get("paper_ais", {}).get(ai, {}).get("name", MULTI_AI_NAMES.get(ai, ai)),
+                    "cash": int(to_float(S.get("paper_ais", {}).get(ai, {}).get("cash", 0))),
+                    "asset": int(to_float(S.get("paper_ais", {}).get(ai, {}).get("asset", 0))),
+                    "profit_rate": round(to_float(S.get("paper_ais", {}).get(ai, {}).get("profit_rate", 0)), 4),
+                    "positions": S.get("paper_ais", {}).get(ai, {}).get("positions", {}),
+                    "last_action": S.get("paper_ais", {}).get(ai, {}).get("last_action", ""),
+                } for ai in MULTI_AI_IDS},
                 "paper_auto_hours": f"{PAPER_AUTO_START}~{PAPER_AUTO_END}",
                 "paper_auto_time_open": paper_auto_time_open(),
                 "account_refresh_hours": f"{ACCOUNT_REFRESH_START}~{ACCOUNT_REFRESH_END}",
