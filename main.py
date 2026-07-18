@@ -33,15 +33,26 @@ KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-ENABLE_REAL_ORDER = os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true"
+# V4.24 기본 운용은 완전 가상실전이다. PAPER_ONLY_MODE=true이면
+# Render 환경변수가 실수로 켜져 있어도 실제 주문 API를 호출하지 않는다.
+PAPER_ONLY_MODE = os.environ.get("PAPER_ONLY_MODE", "true").lower() == "true"
+ENABLE_REAL_ORDER = (os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true") and (not PAPER_ONLY_MODE)
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
-ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "false").lower() == "true"
+ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "true").lower() == "true"
 NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
 REFRESH_SEC = int(os.environ.get("REFRESH_SEC", "30"))
 NEWS_SCORE_WEIGHT = int(os.environ.get("NEWS_SCORE_WEIGHT", "6"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
-VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "20000000")))
+VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
+
+# 공식 국내 장 캘린더 + 데이터 신선도 차단
+ENABLE_MARKET_SAFETY_GATE = os.environ.get("ENABLE_MARKET_SAFETY_GATE", "true").lower() == "true"
+MARKET_CALENDAR_REFRESH_SEC = int(os.environ.get("MARKET_CALENDAR_REFRESH_SEC", "1800"))
+MAX_PRICE_AGE_SEC = int(os.environ.get("MAX_PRICE_AGE_SEC", "90"))
+MAX_ORDERBOOK_AGE_SEC = int(os.environ.get("MAX_ORDERBOOK_AGE_SEC", "90"))
+REQUIRE_FRESH_ORDERBOOK_FOR_SHADOW = os.environ.get("REQUIRE_FRESH_ORDERBOOK_FOR_SHADOW", "true").lower() == "true"
+PROTECTED_REAL_SYMBOLS = {x.strip() for x in os.environ.get("PROTECTED_REAL_SYMBOLS", "0193W0").split(",") if x.strip()}
 
 # ============================================================
 # V4.23 토스 공식 시장데이터 수집
@@ -147,7 +158,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_23_TOSS_MARKET_DATA_CAPTURE"
+OPERATING_VERSION = "OPERATING_V4_24_PAPER_LIVE_SAFE_ORDERBOOK"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -329,9 +340,11 @@ SHADOW_LEV_MOVE_MAX_PCT = float(os.environ.get("SHADOW_LEV_MOVE_MAX_PCT", "0.0")
 
 
 # 실제 매수/매도 실행 후보. 나머지 종목은 판단/기록 참고용.
-TRADE_ALLOWED_SYMBOLS = ["0193W0", "0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200", "494310", "488080", "469150", "005930", "000660"]
+TRADE_ALLOWED_SYMBOLS = ["0193L0", "0193T0", "0197X0", "122630", "252670", "233740", "251340", "069500", "229200", "494310", "488080", "469150", "005930", "000660"]
 # 실계좌 삼성전자 레버리지는 장기 복구 포지션: 손실권 자동매도/자동손절 절대 금지, 수익권에서만 매도 가능
-REAL_PROFIT_ONLY_SYMBOLS = {"0193W0"}
+REAL_PROFIT_ONLY_SYMBOLS = set()
+# 완전 보호: 자동/수동 주문 모두 차단. 복구 관찰만 한다.
+REAL_ORDER_BLOCKED_SYMBOLS = set(PROTECTED_REAL_SYMBOLS)
 # 신규 매수 버튼/매수 알림은 하이닉스 레버리지/인버스만 허용한다.
 # 기존 보유종목 자동매도는 TRADE_ALLOWED_SYMBOLS 기준으로 계속 보호한다.
 HYNIX_TRADE_SYMBOLS = {LEV, INV}
@@ -440,6 +453,13 @@ S = {
         "last_candle_minute": {},
         "last_trade_timestamp": {},
         "last_orderbook_timestamp": {},
+        "latest_orderbook": {},
+        "latest_trade": {},
+        "price_timestamp": {},
+        "calendar": {},
+        "calendar_checked_at": 0,
+        "gate_ok": False,
+        "gate_reason": "NOT_CHECKED",
         "status": "대기",
         "errors": 0,
     },
@@ -472,6 +492,25 @@ def now_text():
 
 def now_short():
     return now_kst().strftime("%H:%M:%S")
+
+def parse_api_datetime(value):
+    """토스 ISO 8601 시각을 KST aware datetime으로 변환한다."""
+    if not value:
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = KST.localize(dt)
+        return dt.astimezone(KST)
+    except Exception:
+        return None
+
+def data_age_seconds(value):
+    dt = parse_api_datetime(value)
+    if dt is None:
+        return 10**9
+    return max(0.0, (now_kst() - dt).total_seconds())
 
 def safe(v):
     return html.escape(str(v))
@@ -542,9 +581,80 @@ def set_status(msg):
         S["status"] = msg
         S["updated"] = now_short()
 
-def is_market_watch_time():
+def refresh_kr_market_calendar(force=False):
+    """공식 /api/v1/market-calendar/KR로 오늘 영업일과 정규장 시간을 캐시한다."""
+    state = S.setdefault("market_data_capture", {})
+    if (not force) and time.time() - to_float(state.get("calendar_checked_at", 0)) < MARKET_CALENDAR_REFRESH_SEC:
+        return bool(state.get("calendar"))
+    code, data = api_get("/api/v1/market-calendar/KR", params={"date": today()}, timeout=8)
+    state["calendar_checked_at"] = time.time()
+    if code != 200:
+        state["calendar"] = {}
+        state["gate_ok"] = False
+        state["gate_reason"] = f"CALENDAR_HTTP_{code}"
+        return False
+    result = _result_dict(data)
+    today_info = result.get("today", {}) if isinstance(result, dict) else {}
+    integrated = today_info.get("integrated") if isinstance(today_info, dict) else None
+    regular = integrated.get("regularMarket") if isinstance(integrated, dict) else None
+    state["calendar"] = {
+        "date": str(today_info.get("date", "")) if isinstance(today_info, dict) else "",
+        "is_business_day": bool(regular),
+        "regular_start": str(regular.get("startTime", "")) if isinstance(regular, dict) else "",
+        "regular_end": str(regular.get("endTime", "")) if isinstance(regular, dict) else "",
+        "auction_start": str(regular.get("singlePriceAuctionStartTime", "")) if isinstance(regular, dict) else "",
+    }
+    return True
+
+def regular_market_open_now():
+    state = S.setdefault("market_data_capture", {})
+    refresh_kr_market_calendar(False)
+    cal = state.get("calendar", {})
+    if not cal or cal.get("date") != today():
+        return False, "CALENDAR_NOT_TODAY"
+    if not cal.get("is_business_day"):
+        return False, "MARKET_CLOSED"
+    start = parse_api_datetime(cal.get("regular_start"))
+    end = parse_api_datetime(cal.get("regular_end"))
+    if not start or not end:
+        return False, "REGULAR_SESSION_MISSING"
     n = now_kst()
-    return 8 <= n.hour < 16
+    if not (start <= n <= end):
+        return False, "OUTSIDE_REGULAR_SESSION"
+    return True, "OK"
+
+def market_safety_gate(require_orderbook_symbol=None):
+    """가상/실거래 공통 차단. 휴장, 장외, 과거 가격, 오래된 호가를 거부한다."""
+    if not ENABLE_MARKET_SAFETY_GATE:
+        return True, "GATE_DISABLED"
+    state = S.setdefault("market_data_capture", {})
+    ok, reason = regular_market_open_now()
+    if not ok:
+        state["gate_ok"], state["gate_reason"] = False, reason
+        return False, reason
+    price_ts = state.get("price_timestamp", {})
+    check_symbols = [require_orderbook_symbol] if require_orderbook_symbol else MARKET_DATA_CORE_SYMBOLS[:2]
+    ages = [data_age_seconds(price_ts.get(sym)) for sym in check_symbols if sym]
+    if not ages or min(ages) > MAX_PRICE_AGE_SEC:
+        reason = "STALE_PRICE"
+        state["gate_ok"], state["gate_reason"] = False, reason
+        return False, reason
+    if require_orderbook_symbol and REQUIRE_FRESH_ORDERBOOK_FOR_SHADOW:
+        ob = state.get("latest_orderbook", {}).get(require_orderbook_symbol, {})
+        if data_age_seconds(ob.get("timestamp")) > MAX_ORDERBOOK_AGE_SEC:
+            reason = "STALE_ORDERBOOK"
+            state["gate_ok"], state["gate_reason"] = False, reason
+            return False, reason
+        if to_float(ob.get("best_ask", 0)) <= 0 or to_float(ob.get("best_bid", 0)) <= 0:
+            reason = "INVALID_ORDERBOOK"
+            state["gate_ok"], state["gate_reason"] = False, reason
+            return False, reason
+    state["gate_ok"], state["gate_reason"] = True, "OK"
+    return True, "OK"
+
+def is_market_watch_time():
+    ok, _ = regular_market_open_now() if ENABLE_MARKET_SAFETY_GATE else (True, "")
+    return ok
 
 def account_api_time_open():
     # 장 마감 후에는 buying-power/holdings/sellable 반복조회 금지.
@@ -1305,6 +1415,8 @@ def real_watch_detail(sym, item, stage):
 
 
 def auto_sell_allowed_symbol(sym):
+    if PAPER_ONLY_MODE or sym in REAL_ORDER_BLOCKED_SYMBOLS:
+        return False
     if sym not in TRADE_ALLOWED_SYMBOLS:
         return False
     # 해외/이벤트/장기투자/관찰용은 제외. 이 리스트에 없는 종목은 자동매도하지 않는다.
@@ -1573,6 +1685,12 @@ def load_prices():
                     break
             if sym not in ALL or price <= 0:
                 continue
+            api_ts = str(item.get("timestamp", ""))
+            api_dt = parse_api_datetime(api_ts)
+            # 장중에는 오늘 날짜가 아닌 시세를 절대 현재가로 채택하지 않는다.
+            if ENABLE_MARKET_SAFETY_GATE and api_dt and api_dt.strftime("%Y-%m-%d") != today():
+                continue
+            S.setdefault("market_data_capture", {}).setdefault("price_timestamp", {})[sym] = api_ts
             old = S["prices"].get(sym, price)
             S["prev_prices"][sym] = old
             S["prices"][sym] = price
@@ -2917,6 +3035,13 @@ def record_order(row):
     write_row(orders_path(), ["time", "symbol", "name", "side", "qty", "status", "response"], row)
 
 def place_order_manual(sym, side, qty):
+    if PAPER_ONLY_MODE:
+        return {"ok": False, "message": "PAPER_ONLY_MODE=true: 실제 주문 완전 차단"}
+    if sym in REAL_ORDER_BLOCKED_SYMBOLS:
+        return {"ok": False, "message": f"보호종목 {sym}: 실제 매수·매도 모두 차단"}
+    gate_ok, gate_reason = market_safety_gate(sym)
+    if not gate_ok:
+        return {"ok": False, "message": f"시장 안전게이트 차단: {gate_reason}"}
     if sym not in ALL:
         return {"ok": False, "message": "허용되지 않은 종목"}
     if side not in ["BUY", "SELL"]:
@@ -3368,10 +3493,49 @@ def _shadow_record(action, sym, price, qty, pl, reason, fee=0):
     save_state()
 
 
+def simulated_orderbook_fill(sym, side, max_cash=0, qty=0):
+    """현재 호가 잔량을 위에서부터 소진해 가상 평균체결가/부분체결을 계산한다."""
+    ob = S.setdefault("market_data_capture", {}).get("latest_orderbook", {}).get(sym, {})
+    levels = ob.get("asks" if side == "BUY" else "bids", []) if isinstance(ob, dict) else []
+    if not isinstance(levels, list) or not levels:
+        return {"ok": False, "reason": "ORDERBOOK_EMPTY", "qty": 0, "avg_price": 0, "gross": 0}
+    remain_cash = float(max_cash)
+    remain_qty = int(qty)
+    filled = 0
+    gross = 0.0
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        px = to_float(level.get("price", 0))
+        avail = int(to_float(level.get("volume", 0)))
+        if px <= 0 or avail <= 0:
+            continue
+        if side == "BUY":
+            can = min(avail, int(remain_cash // px))
+        else:
+            can = min(avail, remain_qty)
+        if can <= 0:
+            continue
+        filled += can
+        gross += can * px
+        if side == "BUY":
+            remain_cash -= can * px
+        else:
+            remain_qty -= can
+        if (side == "BUY" and remain_cash < px) or (side == "SELL" and remain_qty <= 0):
+            break
+    return {
+        "ok": filled > 0, "reason": "OK" if filled > 0 else "NO_LIQUIDITY",
+        "qty": filled, "avg_price": gross / filled if filled else 0, "gross": gross,
+        "partial": (side == "SELL" and filled < qty),
+        "orderbook_timestamp": ob.get("timestamp", "") if isinstance(ob, dict) else "",
+    }
+
 def shadow_fixed_buy(sym, reason):
-    """가상 전액매수. 실제 주문 함수는 절대 호출하지 않는다."""
-    price = to_float(S.get("prices", {}).get(sym, 0))
-    if price <= 0:
+    """호가잔량 기반 가상매수. 실제 주문 함수는 절대 호출하지 않는다."""
+    gate_ok, gate_reason = market_safety_gate(sym)
+    if not gate_ok:
+        _shadow_write_signal("BLOCK", sym, 0, False, gate_reason)
         return False
     with LOCK:
         st = S["shadow_fixed"]
@@ -3379,19 +3543,24 @@ def shadow_fixed_buy(sym, reason):
             return False
         cash = int(to_float(st.get("cash", 0)))
         fee_rate = SHADOW_FEE_SIDE_PCT / 100
-        qty = int(cash // (price * (1 + fee_rate)))
-        if qty <= 0:
-            return False
-        gross = int(qty * price)
+    fill = simulated_orderbook_fill(sym, "BUY", max_cash=cash / (1 + fee_rate))
+    if not fill.get("ok"):
+        _shadow_write_signal("BLOCK", sym, 0, False, fill.get("reason", "NO_FILL"))
+        return False
+    qty = int(fill["qty"])
+    price = to_float(fill["avg_price"])
+    gross = int(round(fill["gross"]))
+    fee = int(round(gross * fee_rate))
+    total_cost = gross + fee
+    while qty > 0 and total_cost > cash:
+        qty -= 1
+        gross = int(round(qty * price))
         fee = int(round(gross * fee_rate))
         total_cost = gross + fee
-        if total_cost > cash:
-            qty -= 1
-            if qty <= 0:
-                return False
-            gross = int(qty * price)
-            fee = int(round(gross * fee_rate))
-            total_cost = gross + fee
+    if qty <= 0:
+        return False
+    with LOCK:
+        st = S["shadow_fixed"]
         st["cash"] = cash - total_cost
         st["position"] = {
             "symbol": sym,
@@ -3424,16 +3593,43 @@ def shadow_fixed_sell(reason, mark_stop=False):
         qty = int(to_float(pos.get("qty", 0)))
         entry = to_float(pos.get("entry_price", 0))
         entry_total_cost = int(to_float(pos.get("entry_total_cost", qty * entry)))
-        price = to_float(S.get("prices", {}).get(sym, 0))
-        if qty <= 0 or price <= 0:
+        if qty <= 0:
             return False
-        gross = int(qty * price)
+    gate_ok, gate_reason = market_safety_gate(sym)
+    if not gate_ok:
+        _shadow_write_signal("BLOCK", sym, 0, False, gate_reason)
+        return False
+    fill = simulated_orderbook_fill(sym, "SELL", qty=qty)
+    if not fill.get("ok"):
+        _shadow_write_signal("BLOCK", sym, 0, False, fill.get("reason", "NO_FILL"))
+        return False
+    sold_qty = int(fill.get("qty", 0))
+    price = to_float(fill.get("avg_price", 0))
+    if sold_qty <= 0 or price <= 0:
+        return False
+    qty = sold_qty
+    with LOCK:
+        st = S["shadow_fixed"]
+        pos = st.get("position")
+        entry_total_cost = int(round(to_float(pos.get("entry_total_cost", 0)) * qty / max(1, int(to_float(pos.get("qty", qty))))))
+        gross = int(round(qty * price))
         fee = int(round(gross * SHADOW_FEE_SIDE_PCT / 100))
         net_proceeds = gross - fee
         pl = int(net_proceeds - entry_total_cost)
         st["cash"] = int(to_float(st.get("cash", 0))) + net_proceeds
         st["realized_pl"] = int(to_float(st.get("realized_pl", 0))) + pl
-        st["position"] = None
+        original_qty = int(to_float(pos.get("qty", 0)))
+        remain_qty = max(0, original_qty - qty)
+        if remain_qty > 0:
+            remain_ratio = remain_qty / max(1, original_qty)
+            pos["qty"] = remain_qty
+            pos["entry_gross"] = int(round(to_float(pos.get("entry_gross", 0)) * remain_ratio))
+            pos["entry_fee"] = int(round(to_float(pos.get("entry_fee", 0)) * remain_ratio))
+            pos["entry_total_cost"] = int(round(to_float(pos.get("entry_total_cost", 0)) * remain_ratio))
+            st["position"] = pos
+            reason = reason + f" / 부분체결 {qty}주, 잔여 {remain_qty}주"
+        else:
+            st["position"] = None
         if mark_stop:
             st["stopped_today"] = True
     _shadow_record("가상손절" if mark_stop else "가상매도", sym, price, qty, pl, reason, fee)
@@ -3703,8 +3899,10 @@ def _hhmm_in_range(cur_hhmm, start_hhmm, end_hhmm):
     return start_hhmm <= cur_hhmm <= end_hhmm
 
 def market_data_focus_time():
-    cur = now_kst().strftime("%H:%M")
-    return any(_hhmm_in_range(cur, start, end) for start, end in MARKET_DATA_FOCUS_WINDOWS)
+    # 호가 기반 가상체결은 장중 언제든 청산될 수 있으므로 정규장 전체에서 수집한다.
+    # 4개 핵심 종목을 30초 간격으로 조회해 호출량을 제한한다.
+    ok, _ = regular_market_open_now()
+    return ok
 
 def _result_dict(data):
     if not isinstance(data, dict):
@@ -3794,6 +3992,10 @@ def capture_orderbook_and_trades():
                 bid_total = sum(to_float(x.get("volume", 0)) for x in bids if isinstance(x, dict))
                 best_ask = to_float(asks[0].get("price", 0)) if asks else 0
                 best_bid = to_float(bids[0].get("price", 0)) if bids else 0
+                state.setdefault("latest_orderbook", {})[sym] = {
+                    "timestamp": api_ts, "best_ask": best_ask, "best_bid": best_bid,
+                    "asks": asks, "bids": bids,
+                }
                 write_row(orderbook_path(sym), ob_headers, {
                     "saved_at": now_text(), "symbol": sym, "api_timestamp": api_ts,
                     "best_ask": best_ask, "best_bid": best_bid,
@@ -3829,7 +4031,13 @@ def capture_orderbook_and_trades():
                 "currency": t.get("currency", "KRW"),
             })
         if new_rows:
-            state["last_trade_timestamp"][sym] = str(new_rows[-1].get("timestamp", ""))
+            last_trade = new_rows[-1]
+            state["last_trade_timestamp"][sym] = str(last_trade.get("timestamp", ""))
+            state.setdefault("latest_trade", {})[sym] = {
+                "timestamp": str(last_trade.get("timestamp", "")),
+                "price": to_float(last_trade.get("price", 0)),
+                "volume": to_float(last_trade.get("volume", 0)),
+            }
 
 def capture_market_investor_data():
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
@@ -4046,6 +4254,7 @@ def loop():
 
             if not initialized:
                 get_token()
+                refresh_kr_market_calendar(force=True)
                 refresh_account_all()
                 load_prices()
                 calc_wma_all()
@@ -4054,6 +4263,7 @@ def loop():
                 initialized = True
 
             # 1) 가격과 계좌를 같은 루프에서 30초마다 갱신
+            refresh_kr_market_calendar(force=False)
             load_prices()
             try:
                 maybe_capture_toss_market_data()
@@ -4103,12 +4313,20 @@ def loop():
                 set_error(f"실계좌 보유관리 오류: {e}")
 
             try:
-                run_paper_ai_if_enabled()
+                gate_ok, gate_reason = market_safety_gate()
+                if gate_ok:
+                    run_paper_ai_if_enabled()
+                else:
+                    set_status_once(f"PAPER_GATE_{gate_reason}", f"가상매매 차단: {gate_reason}", 300)
             except Exception as e:
                 set_error(f"가상매매 오류: {e}")
 
             try:
-                run_shadow_fixed_strategy()
+                gate_ok, gate_reason = market_safety_gate()
+                if gate_ok:
+                    run_shadow_fixed_strategy()
+                else:
+                    set_status_once(f"SHADOW_GATE_{gate_reason}", f"고정전략 차단: {gate_reason}", 300)
             except Exception as e:
                 set_error(f"고정전략 가상체결 오류: {e}")
 
@@ -4154,6 +4372,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.json_response({
                 "ok": True,
                 "version": OPERATING_VERSION,
+                "paper_only_mode": PAPER_ONLY_MODE,
+                "market_safety_gate_enabled": ENABLE_MARKET_SAFETY_GATE,
+                "market_gate_ok": S.get("market_data_capture", {}).get("gate_ok", False),
+                "market_gate_reason": S.get("market_data_capture", {}).get("gate_reason", ""),
+                "kr_market_calendar": S.get("market_data_capture", {}).get("calendar", {}),
+                "max_price_age_sec": MAX_PRICE_AGE_SEC,
+                "max_orderbook_age_sec": MAX_ORDERBOOK_AGE_SEC,
+                "protected_real_symbols": sorted(REAL_ORDER_BLOCKED_SYMBOLS),
+                "orderbook_fill_simulation": True,
                 "symbols": len(ALL),
                 "real_auto_buy": ENABLE_REAL_AUTO_BUY,
                 "real_auto_sell": ENABLE_REAL_AUTO_SELL,
@@ -4570,6 +4797,7 @@ def print_operating_config():
     print("=" * 60, flush=True)
     print("[운영 설정 확인]", flush=True)
     print(f"version={OPERATING_VERSION}", flush=True)
+    print(f"paper_only_mode={PAPER_ONLY_MODE}", flush=True)
     print(f"real_order={ENABLE_REAL_ORDER}", flush=True)
     print(f"real_auto_buy={ENABLE_REAL_AUTO_BUY}", flush=True)
     print(f"real_auto_sell={ENABLE_REAL_AUTO_SELL}", flush=True)
