@@ -97,6 +97,13 @@ FULL_MARKET_SYMBOLS_ENV = os.environ.get("FULL_MARKET_SYMBOLS", "")
 FULL_MARKET_BATCH_SIZE = int(os.environ.get("FULL_MARKET_BATCH_SIZE", "80"))
 FULL_MARKET_SCAN_INTERVAL_SEC = int(os.environ.get("FULL_MARKET_SCAN_INTERVAL_SEC", "60"))
 FULL_MARKET_TOP_N = int(os.environ.get("FULL_MARKET_TOP_N", "80"))
+FULL_MARKET_RANKING_COUNT = int(os.environ.get("FULL_MARKET_RANKING_COUNT", "100"))
+FULL_MARKET_RANKING_TYPES = [
+    "MARKET_TRADING_AMOUNT",
+    "MARKET_TRADING_VOLUME",
+    "TOP_GAINERS",
+    "TOP_LOSERS",
+]
 FULL_MARKET_MIN_PRICE = int(os.environ.get("FULL_MARKET_MIN_PRICE", "1000"))
 FULL_MARKET_MIN_TURNOVER = float(os.environ.get("FULL_MARKET_MIN_TURNOVER", "1000000000"))
 FULL_MARKET_BLOCKED_SYMBOLS_BASE = {
@@ -218,7 +225,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_29_TOSS_STOCK_MASTER_AUTOLOAD"
+OPERATING_VERSION = "OPERATING_V4_30_TOSS_RANKING_FULL_MARKET"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -3576,166 +3583,170 @@ def _shadow_record(action, sym, price, qty, pl, reason, fee=0):
 
 
 
-def _normalize_stock_master_items(data):
-    if isinstance(data, list):
-        return data
+
+def _ranking_result(data):
     if not isinstance(data, dict):
-        return []
-    for key in ["result", "data", "items", "stocks"]:
-        value = data.get(key)
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            for key2 in ["items", "stocks", "list", "results"]:
-                value2 = value.get(key2)
-                if isinstance(value2, list):
-                    return value2
-    return []
+        return {}, []
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return {}, []
+    rankings = result.get("rankings")
+    if not isinstance(rankings, list):
+        rankings = []
+    return result, rankings
 
 
-def _stock_master_row(item):
-    if not isinstance(item, dict):
-        return None
-    sym = str(item.get("symbol") or item.get("code") or item.get("stockCode") or item.get("ticker") or "").strip()
-    if not sym:
-        return None
-    name = str(item.get("name") or item.get("stockName") or item.get("displayName") or item.get("koreanName") or sym).strip()
-    market = str(item.get("market") or item.get("exchange") or item.get("marketType") or item.get("exchangeCode") or "").strip()
-    security_type = str(item.get("securityType") or item.get("type") or item.get("productType") or "").strip()
-    currency = str(item.get("currency") or item.get("currencyCode") or "").strip()
-    listing_status = str(item.get("listingStatus") or item.get("status") or item.get("listedStatus") or "").strip()
-
-    upper_market = market.upper()
-    upper_currency = currency.upper()
-    if upper_currency and upper_currency not in {"KRW", "WON"}:
-        return None
-    if upper_market and not any(x in upper_market for x in ["KR", "KOSPI", "KOSDAQ", "KONEX", "KRX", "NXT"]):
-        return None
-
-    upper_status = listing_status.upper()
-    if upper_status and any(x in upper_status for x in ["DELIST", "INACTIVE", "SUSPENDED_PERMANENT"]):
-        return None
-
-    return {
-        "symbol": sym,
-        "name": name,
-        "market": market,
-        "security_type": security_type,
-        "currency": currency,
-        "listing_status": listing_status,
-    }
+def _ranking_change_pct(item):
+    price = item.get("price") if isinstance(item, dict) else {}
+    if not isinstance(price, dict):
+        return 0.0
+    # 토스 API changeRate는 0.0125 = 1.25% 형식이다.
+    return to_float(price.get("changeRate"), 0.0) * 100.0
 
 
-def _load_stock_master_cache():
-    path = FULL_MARKET_STOCK_MASTER_CACHE_PATH
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, dict):
-            return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
-    except Exception:
-        pass
-    return {}
+def _ranking_last_price(item):
+    price = item.get("price") if isinstance(item, dict) else {}
+    if not isinstance(price, dict):
+        return 0.0
+    return to_float(price.get("lastPrice"), 0.0)
 
 
-def _save_stock_master_cache(universe):
-    path = FULL_MARKET_STOCK_MASTER_CACHE_PATH
-    if not path:
-        return
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(universe, f, ensure_ascii=False)
-    except Exception as e:
-        set_error(f"전체시장 종목마스터 캐시 저장 실패: {e}")
+def _stock_info_map(symbols):
+    """랭킹 후보의 종목명·시장·상장상태를 최대 200개 단위로 보강한다."""
+    result = {}
+    clean = [str(x).strip() for x in symbols if str(x).strip()]
+    for i in range(0, len(clean), 200):
+        batch = clean[i:i+200]
+        code, data = api_get("/api/v1/stocks", params={"symbols": ",".join(batch)}, timeout=15)
+        if code != 200:
+            continue
+        for item in first_list(data):
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "").strip()
+            if not sym:
+                continue
+            result[sym] = {
+                "symbol": sym,
+                "name": str(item.get("name") or sym).strip(),
+                "market": str(item.get("market") or "").strip(),
+                "security_type": str(item.get("securityType") or "").strip(),
+                "currency": str(item.get("currency") or "").strip(),
+                "listing_status": str(item.get("status") or "").strip(),
+                "trading_suspended": bool(
+                    (item.get("koreanMarketDetail") or {}).get("krxTradingSuspended")
+                    if isinstance(item.get("koreanMarketDetail"), dict)
+                    else False
+                ),
+            }
+    return result
 
 
 def load_full_market_universe(force=False):
-    """토스 공식 종목 마스터를 우선 사용하고, 실패 시 캐시/CSV/환경변수로 대체."""
+    """토스 랭킹 API로 현재 시장 후보군을 자동 구성한다.
+
+    전체 상장종목 마스터를 빈 symbols로 요청하지 않는다.
+    시장 거래대금·거래량·상승·하락 랭킹을 합쳐 G01~G05 후보군으로 사용한다.
+    """
     state = S.setdefault("full_market", {})
     now_ts = time.time()
 
     if (
         state.get("universe")
         and not force
-        and now_ts - to_float(state.get("stock_master_checked_at", 0)) < FULL_MARKET_STOCK_MASTER_REFRESH_SEC
+        and now_ts - to_float(state.get("stock_master_checked_at", 0)) < FULL_MARKET_SCAN_INTERVAL_SEC
     ):
         return state["universe"]
 
+    merged = {}
+    errors = []
+    ranked_at_values = []
+
+    for ranking_type in FULL_MARKET_RANKING_TYPES:
+        duration = "1d" if ranking_type in {"TOP_GAINERS", "TOP_LOSERS"} else "realtime"
+        params = {
+            "type": ranking_type,
+            "marketCountry": "KR",
+            "duration": duration,
+            "excludeInvestmentCaution": True,
+            "count": max(1, min(100, FULL_MARKET_RANKING_COUNT)),
+        }
+        code, data = api_get("/api/v1/rankings", params=params, timeout=15)
+        if code != 200:
+            errors.append(f"{ranking_type}:HTTP_{code}")
+            continue
+
+        result, rankings = _ranking_result(data)
+        ranked_at = str(result.get("rankedAt") or "")
+        if ranked_at:
+            ranked_at_values.append(ranked_at)
+
+        for item in rankings:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "").strip()
+            if not sym or sym in FULL_MARKET_BLOCKED_SYMBOLS:
+                continue
+            currency = str(item.get("currency") or "").upper()
+            if currency and currency != "KRW":
+                continue
+
+            row = merged.setdefault(sym, {
+                "symbol": sym,
+                "name": sym,
+                "market": "",
+                "security_type": "",
+                "currency": currency or "KRW",
+                "listing_status": "",
+                "ranking_types": [],
+                "ranking_best": {},
+                "price": 0.0,
+                "change_pct": 0.0,
+                "volume": 0.0,
+                "turnover": 0.0,
+                "timestamp": ranked_at,
+            })
+            row["ranking_types"].append(ranking_type)
+            row["ranking_best"][ranking_type] = int(to_float(item.get("rank"), 9999))
+            row["price"] = max(to_float(row.get("price"), 0), _ranking_last_price(item))
+            row["change_pct"] = _ranking_change_pct(item)
+            row["volume"] = max(to_float(row.get("volume"), 0), to_float(item.get("tradingVolume"), 0))
+            row["turnover"] = max(to_float(row.get("turnover"), 0), to_float(item.get("tradingAmount"), 0))
+            if ranked_at:
+                row["timestamp"] = ranked_at
+
+    symbols = list(merged)
+    info_map = _stock_info_map(symbols)
     universe = {}
-    source = "없음"
-    api_error = ""
 
-    if FULL_MARKET_STOCK_MASTER_AUTOLOAD:
-        code, data = api_get("/api/v1/stocks", params={}, timeout=20)
-        if code == 200:
-            for item in _normalize_stock_master_items(data):
-                row = _stock_master_row(item)
-                if row:
-                    universe[row["symbol"]] = row
-            if universe:
-                source = "TOSS_/api/v1/stocks"
-                _save_stock_master_cache(universe)
-            else:
-                api_error = "STOCK_MASTER_EMPTY_RESPONSE"
-        else:
-            api_error = f"STOCK_MASTER_HTTP_{code}"
-
-    if not universe:
-        cached = _load_stock_master_cache()
-        if cached:
-            universe.update(cached)
-            source = "CACHE"
-
-    path = FULL_MARKET_UNIVERSE_PATH
-    if not universe and path and os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                for row in csv.DictReader(f):
-                    sym = str(row.get("symbol") or row.get("code") or row.get("단축코드") or "").strip()
-                    if not sym:
-                        continue
-                    universe[sym] = {
-                        "symbol": sym,
-                        "name": str(row.get("name") or row.get("종목명") or sym).strip(),
-                        "market": str(row.get("market") or row.get("시장구분") or "").strip(),
-                        "security_type": str(row.get("security_type") or row.get("종목구분") or "").strip(),
-                    }
-            if universe:
-                source = "CSV"
-        except Exception as e:
-            state["errors"] = int(state.get("errors", 0)) + 1
-            api_error = f"CSV_ERROR:{e}"
-
-    if not universe:
-        env_text = FULL_MARKET_SYMBOLS_ENV.strip()
-        if env_text:
-            for token in env_text.split(","):
-                token = token.strip()
-                if not token:
-                    continue
-                parts = token.split(":", 1)
-                sym = parts[0].strip()
-                nm = parts[1].strip() if len(parts) > 1 else sym
-                if sym:
-                    universe[sym] = {"symbol": sym, "name": nm, "market": "", "security_type": ""}
-            if universe:
-                source = "ENV"
-
-    for sym in list(universe):
-        if sym in FULL_MARKET_BLOCKED_SYMBOLS:
-            universe.pop(sym, None)
+    for sym, row in merged.items():
+        info = info_map.get(sym, {})
+        if info:
+            if str(info.get("currency") or "KRW").upper() != "KRW":
+                continue
+            if str(info.get("listing_status") or "ACTIVE").upper() not in {"ACTIVE", ""}:
+                continue
+            if info.get("trading_suspended"):
+                continue
+            row.update(info)
+        if to_float(row.get("price"), 0) < FULL_MARKET_MIN_PRICE:
+            continue
+        if to_float(row.get("turnover"), 0) and to_float(row.get("turnover"), 0) < FULL_MARKET_MIN_TURNOVER:
+            continue
+        universe[sym] = row
 
     state["universe"] = universe
     state["stock_master_checked_at"] = now_ts
-    state["stock_master_source"] = source
+    state["stock_master_source"] = "TOSS_/api/v1/rankings"
+    state["ranking_last_at"] = max(ranked_at_values) if ranked_at_values else ""
+    state["ranking_errors"] = errors
     state["status"] = (
-        f"전체시장 종목 {len(universe):,}개 로드 ({source})"
+        f"토스 전체시장 랭킹 후보 {len(universe):,}개 로드"
         if universe
-        else f"FULL_MARKET_UNIVERSE_EMPTY / {api_error or 'NO_SOURCE'}"
+        else "FULL_MARKET_UNIVERSE_EMPTY / " + (", ".join(errors) if errors else "RANKINGS_EMPTY")
     )
     return universe
+
 
 def _quote_field(item, keys, default=0.0):
     for k in keys:
@@ -3745,88 +3756,109 @@ def _quote_field(item, keys, default=0.0):
 
 
 def scan_full_market_universe(force=False):
-    """전체 종목을 순환 배치 조회해 3그룹 후보를 만든다.
-    API 호출 한도를 피하기 위해 매 회 FULL_MARKET_BATCH_SIZE개만 갱신한다.
-    종목 선택에는 해당 시점까지 수신된 값만 사용한다.
-    """
+    """토스 전체시장 랭킹 후보를 실시간 가격으로 보강해 3그룹 순위를 만든다."""
     state = S.setdefault("full_market", {})
     if not ENABLE_FULL_MARKET_SCANNER:
         state["status"] = "전체시장 스캐너 OFF"
         return False
-    if not force and time.time() - to_float(state.get("last_scan_ts",0)) < FULL_MARKET_SCAN_INTERVAL_SEC:
+    if not force and time.time() - to_float(state.get("last_scan_ts", 0)) < FULL_MARKET_SCAN_INTERVAL_SEC:
         return bool(state.get("ranked"))
-    universe = load_full_market_universe(False)
+
+    universe = load_full_market_universe(force)
     symbols = list(universe)
-    if not symbols:
-        state["status"] = "FULL_MARKET_UNIVERSE_EMPTY"
-        state["last_scan_ts"] = time.time()
-        return False
-    cursor = int(state.get("cursor",0)) % len(symbols)
-    batch = symbols[cursor:cursor+FULL_MARKET_BATCH_SIZE]
-    if len(batch) < FULL_MARKET_BATCH_SIZE:
-        batch += symbols[:FULL_MARKET_BATCH_SIZE-len(batch)]
-    state["cursor"] = (cursor + len(batch)) % len(symbols)
-    code, data = api_get("/api/v1/prices", params={"symbols": ",".join(batch)}, timeout=15)
     state["last_scan_ts"] = time.time()
     state["last_scan_text"] = now_text()
-    if code != 200:
-        state["errors"] = int(state.get("errors",0)) + 1
-        state["status"] = f"전체시장 조회 실패 HTTP {code}"
+
+    if not symbols:
+        state["status"] = "FULL_MARKET_UNIVERSE_EMPTY"
         return False
-    items = first_list(data)
-    for item in items:
-        if not isinstance(item, dict):
+
+    # 랭킹 후보만 현재가 다건조회한다. 공식 최대 200개 제한을 지킨다.
+    quote_map = {}
+    for i in range(0, len(symbols), 200):
+        batch = symbols[i:i+200]
+        code, data = api_get("/api/v1/prices", params={"symbols": ",".join(batch)}, timeout=15)
+        if code != 200:
+            state["errors"] = int(state.get("errors", 0)) + 1
             continue
-        sym = str(item.get("symbol") or item.get("code") or "").strip()
-        if sym not in universe:
-            continue
-        price = _quote_field(item, ["lastPrice","price","currentPrice","closePrice","tradePrice"])
+        for item in first_list(data):
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "").strip()
+            if sym:
+                quote_map[sym] = item
+
+    for sym, base in universe.items():
+        item = quote_map.get(sym, {})
+        price = _quote_field(item, ["lastPrice", "price", "currentPrice", "closePrice", "tradePrice"], to_float(base.get("price"), 0))
         if price < FULL_MARKET_MIN_PRICE:
             continue
-        change_pct = _quote_field(item, ["changeRate","changePercent","fluctuationRate","rate"])
-        volume = _quote_field(item, ["accTradeVolume","volume","cumulativeVolume"])
-        turnover = _quote_field(item, ["accTradeAmount","tradeAmount","cumulativeTradingValue","turnover"])
-        ts = str(item.get("timestamp",""))
+
+        ts = str(item.get("timestamp") or base.get("timestamp") or "")
         api_dt = parse_api_datetime(ts)
         if ENABLE_MARKET_SAFETY_GATE and api_dt and api_dt.strftime("%Y-%m-%d") != today():
             continue
-        prev = state.setdefault("quotes",{}).get(sym,{})
-        prev_price = to_float(prev.get("price",price))
+
+        prev = state.setdefault("quotes", {}).get(sym, {})
+        prev_price = to_float(prev.get("price"), price)
         short_mom = pct(price, prev_price) if prev_price else 0.0
+
         q = {
-            **universe[sym], "price":price, "change_pct":change_pct,
-            "volume":volume, "turnover":turnover, "short_mom":short_mom,
-            "timestamp":ts, "saved_at":now_text(),
+            **base,
+            "price": price,
+            "short_mom": short_mom,
+            "timestamp": ts,
+            "saved_at": now_text(),
         }
         state["quotes"][sym] = q
-        # 선택 후보의 가격은 가상체결/평가에도 사용한다.
-        S.setdefault("prices",{})[sym] = price
-        S.setdefault("market_data_capture",{}).setdefault("price_timestamp",{})[sym] = ts
-        hist = S.setdefault("history",{}).setdefault(sym,[])
+        S.setdefault("prices", {})[sym] = price
+        S.setdefault("market_data_capture", {}).setdefault("price_timestamp", {})[sym] = ts
+
+        hist = S.setdefault("history", {}).setdefault(sym, [])
         hist.append(price)
         if len(hist) > TARGET_PATTERN_LOOKBACK_POINTS:
             del hist[:-TARGET_PATTERN_LOOKBACK_POINTS]
-        S.setdefault("high",{})[sym] = max(to_float(S.get("high",{}).get(sym,price)),price)
-        old_low = to_float(S.get("low",{}).get(sym,price)) or price
-        S.setdefault("low",{})[sym] = min(old_low,price)
+        S.setdefault("high", {})[sym] = max(to_float(S.get("high", {}).get(sym, price)), price)
+        old_low = to_float(S.get("low", {}).get(sym, price)) or price
+        S.setdefault("low", {})[sym] = min(old_low, price)
+
     ranked = []
-    for sym,q in state.get("quotes",{}).items():
-        if sym in FULL_MARKET_BLOCKED_SYMBOLS:
+    for sym, q in state.get("quotes", {}).items():
+        if sym not in universe or sym in FULL_MARKET_BLOCKED_SYMBOLS:
             continue
-        if data_age_seconds(q.get("timestamp")) > max(MAX_PRICE_AGE_SEC, FULL_MARKET_SCAN_INTERVAL_SEC*3):
+        if data_age_seconds(q.get("timestamp")) > max(MAX_PRICE_AGE_SEC, FULL_MARKET_SCAN_INTERVAL_SEC * 3):
             continue
-        turnover = to_float(q.get("turnover",0))
-        if turnover and turnover < FULL_MARKET_MIN_TURNOVER:
-            continue
+
+        turnover = to_float(q.get("turnover"), 0)
+        volume = to_float(q.get("volume"), 0)
+        change_pct = to_float(q.get("change_pct"), 0)
+        short_mom = to_float(q.get("short_mom"), 0)
+        ranks = q.get("ranking_best") if isinstance(q.get("ranking_best"), dict) else {}
+
+        amount_rank = int(ranks.get("MARKET_TRADING_AMOUNT", 9999))
+        volume_rank = int(ranks.get("MARKET_TRADING_VOLUME", 9999))
+        gainer_rank = int(ranks.get("TOP_GAINERS", 9999))
+        loser_rank = int(ranks.get("TOP_LOSERS", 9999))
+
+        rank_bonus = 0.0
+        for r, weight in [(amount_rank, 28.0), (volume_rank, 18.0), (gainer_rank, 16.0), (loser_rank, 8.0)]:
+            if r <= 100:
+                rank_bonus += weight * (101 - r) / 100.0
+
         score = (
-            min(40.0, max(-40.0, to_float(q.get("change_pct",0))*4.0)) +
-            min(25.0, max(-25.0, to_float(q.get("short_mom",0))*20.0)) +
-            min(35.0, (max(0.0, turnover) ** 0.5) / 20000.0)
+            rank_bonus
+            + min(28.0, max(-28.0, change_pct * 2.2))
+            + min(20.0, max(-20.0, short_mom * 16.0))
+            + min(18.0, (max(0.0, turnover) ** 0.5) / 24000.0)
+            + min(6.0, (max(0.0, volume) ** 0.5) / 2500.0)
         )
-        ranked.append((score,sym,q))
-    ranked.sort(key=lambda x:x[0], reverse=True)
+        ranked.append((score, sym, q))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
     state["ranked"] = ranked[:FULL_MARKET_TOP_N]
-    state["status"] = f"전체시장 순환검색 {len(state.get('quotes',{})):,}/{len(universe):,}, 후보 {len(state['ranked'])}개"
+    state["status"] = (
+        f"토스 랭킹시장 후보 {len(universe):,}개, 실시간가격 {len(quote_map):,}개, 최종 {len(state['ranked'])}개"
+    )
     return bool(state["ranked"])
 
 
@@ -5112,6 +5144,9 @@ class Handler(BaseHTTPRequestHandler):
             "full_market_scanner_ready": bool(S.get("full_market", {}).get("universe")) and ENABLE_FULL_MARKET_SCANNER,
             "full_market_status": S.get("full_market", {}).get("status", "대기"),
             "full_market_stock_master_source": S.get("full_market", {}).get("stock_master_source", "없음"),
+            "full_market_ranking_last_at": S.get("full_market", {}).get("ranking_last_at", ""),
+            "full_market_ranking_errors": S.get("full_market", {}).get("ranking_errors", []),
+            "full_market_candidate_count": len(S.get("full_market", {}).get("ranked", [])),
                 "fixed_strategy_account_ids": [x for x in MULTI_AI_IDS if not x.startswith("G")],
                 "daily_market_ai_ids": [x for x in MULTI_AI_IDS if x.startswith("G")],
                 "fixed_strategy_account_count": len([x for x in MULTI_AI_IDS if not x.startswith("G")]),
@@ -5562,7 +5597,7 @@ def print_v428_selfcheck():
     if len(MULTI_AI_IDS) != 35:
         raise RuntimeError("V4.28 계좌 수 오류: 35개가 아님")
     if not universe:
-        print(" WARNING: 토스 /api/v1/stocks, 캐시, CSV, 환경변수에서 종목목록을 받지 못해 G01~G05는 대기합니다.", flush=True)
+        print(" WARNING: 토스 /api/v1/rankings에서 전체시장 후보를 받지 못해 G01~G05는 대기합니다.", flush=True)
 
 if __name__ == "__main__":
     print_v428_selfcheck()
