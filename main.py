@@ -90,6 +90,9 @@ MULTI_AI_PARENT = dict(MULTI_AI_GROUP)
 # 3그룹 전체시장 스캐너
 ENABLE_FULL_MARKET_SCANNER = os.environ.get("ENABLE_FULL_MARKET_SCANNER", "true").lower() == "true"
 FULL_MARKET_UNIVERSE_PATH = os.environ.get("FULL_MARKET_UNIVERSE_PATH", "kr_market_universe.csv")
+FULL_MARKET_STOCK_MASTER_AUTOLOAD = os.environ.get("FULL_MARKET_STOCK_MASTER_AUTOLOAD", "true").lower() == "true"
+FULL_MARKET_STOCK_MASTER_REFRESH_SEC = int(os.environ.get("FULL_MARKET_STOCK_MASTER_REFRESH_SEC", "21600"))
+FULL_MARKET_STOCK_MASTER_CACHE_PATH = os.environ.get("FULL_MARKET_STOCK_MASTER_CACHE_PATH", "kr_market_universe_cache.json")
 FULL_MARKET_SYMBOLS_ENV = os.environ.get("FULL_MARKET_SYMBOLS", "")
 FULL_MARKET_BATCH_SIZE = int(os.environ.get("FULL_MARKET_BATCH_SIZE", "80"))
 FULL_MARKET_SCAN_INTERVAL_SEC = int(os.environ.get("FULL_MARKET_SCAN_INTERVAL_SEC", "60"))
@@ -215,7 +218,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_28_35_PAPER_ACCOUNTS_FULL_MARKET_LIVE"
+OPERATING_VERSION = "OPERATING_V4_29_TOSS_STOCK_MASTER_AUTOLOAD"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -475,6 +478,8 @@ S = {
         "cursor": 0,
         "last_scan_ts": 0,
         "last_scan_text": "없음",
+        "stock_master_checked_at": 0,
+        "stock_master_source": "없음",
         "status": "대기",
         "errors": 0,
     },
@@ -3570,29 +3575,121 @@ def _shadow_record(action, sym, price, qty, pl, reason, fee=0):
 
 
 
+
+def _normalize_stock_master_items(data):
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ["result", "data", "items", "stocks"]:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for key2 in ["items", "stocks", "list", "results"]:
+                value2 = value.get(key2)
+                if isinstance(value2, list):
+                    return value2
+    return []
+
+
+def _stock_master_row(item):
+    if not isinstance(item, dict):
+        return None
+    sym = str(item.get("symbol") or item.get("code") or item.get("stockCode") or item.get("ticker") or "").strip()
+    if not sym:
+        return None
+    name = str(item.get("name") or item.get("stockName") or item.get("displayName") or item.get("koreanName") or sym).strip()
+    market = str(item.get("market") or item.get("exchange") or item.get("marketType") or item.get("exchangeCode") or "").strip()
+    security_type = str(item.get("securityType") or item.get("type") or item.get("productType") or "").strip()
+    currency = str(item.get("currency") or item.get("currencyCode") or "").strip()
+    listing_status = str(item.get("listingStatus") or item.get("status") or item.get("listedStatus") or "").strip()
+
+    upper_market = market.upper()
+    upper_currency = currency.upper()
+    if upper_currency and upper_currency not in {"KRW", "WON"}:
+        return None
+    if upper_market and not any(x in upper_market for x in ["KR", "KOSPI", "KOSDAQ", "KONEX", "KRX", "NXT"]):
+        return None
+
+    upper_status = listing_status.upper()
+    if upper_status and any(x in upper_status for x in ["DELIST", "INACTIVE", "SUSPENDED_PERMANENT"]):
+        return None
+
+    return {
+        "symbol": sym,
+        "name": name,
+        "market": market,
+        "security_type": security_type,
+        "currency": currency,
+        "listing_status": listing_status,
+    }
+
+
+def _load_stock_master_cache():
+    path = FULL_MARKET_STOCK_MASTER_CACHE_PATH
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_stock_master_cache(universe):
+    path = FULL_MARKET_STOCK_MASTER_CACHE_PATH
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(universe, f, ensure_ascii=False)
+    except Exception as e:
+        set_error(f"전체시장 종목마스터 캐시 저장 실패: {e}")
+
+
 def load_full_market_universe(force=False):
-    """3그룹용 한국시장 전체 종목 목록을 로드한다.
-    CSV 권장 열: symbol,name,market,security_type.
-    환경변수 FULL_MARKET_SYMBOLS에는 '005930:삼성전자,000660:SK하이닉스' 형식도 허용한다.
-    목록이 없으면 3그룹은 거래하지 않고 FULL_MARKET_UNIVERSE_EMPTY로 대기한다.
-    """
+    """토스 공식 종목 마스터를 우선 사용하고, 실패 시 캐시/CSV/환경변수로 대체."""
     state = S.setdefault("full_market", {})
-    if state.get("universe") and not force:
+    now_ts = time.time()
+
+    if (
+        state.get("universe")
+        and not force
+        and now_ts - to_float(state.get("stock_master_checked_at", 0)) < FULL_MARKET_STOCK_MASTER_REFRESH_SEC
+    ):
         return state["universe"]
+
     universe = {}
-    env_text = FULL_MARKET_SYMBOLS_ENV.strip()
-    if env_text:
-        for token in env_text.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            parts = token.split(":", 1)
-            sym = parts[0].strip()
-            nm = parts[1].strip() if len(parts) > 1 else sym
-            if sym:
-                universe[sym] = {"symbol":sym, "name":nm, "market":"", "security_type":""}
+    source = "없음"
+    api_error = ""
+
+    if FULL_MARKET_STOCK_MASTER_AUTOLOAD:
+        code, data = api_get("/api/v1/stocks", params={}, timeout=20)
+        if code == 200:
+            for item in _normalize_stock_master_items(data):
+                row = _stock_master_row(item)
+                if row:
+                    universe[row["symbol"]] = row
+            if universe:
+                source = "TOSS_/api/v1/stocks"
+                _save_stock_master_cache(universe)
+            else:
+                api_error = "STOCK_MASTER_EMPTY_RESPONSE"
+        else:
+            api_error = f"STOCK_MASTER_HTTP_{code}"
+
+    if not universe:
+        cached = _load_stock_master_cache()
+        if cached:
+            universe.update(cached)
+            source = "CACHE"
+
     path = FULL_MARKET_UNIVERSE_PATH
-    if path and os.path.exists(path):
+    if not universe and path and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
                 for row in csv.DictReader(f):
@@ -3605,16 +3702,40 @@ def load_full_market_universe(force=False):
                         "market": str(row.get("market") or row.get("시장구분") or "").strip(),
                         "security_type": str(row.get("security_type") or row.get("종목구분") or "").strip(),
                     }
+            if universe:
+                source = "CSV"
         except Exception as e:
-            state["errors"] = int(state.get("errors",0)) + 1
-            state["status"] = f"종목목록 오류: {e}"
+            state["errors"] = int(state.get("errors", 0)) + 1
+            api_error = f"CSV_ERROR:{e}"
+
+    if not universe:
+        env_text = FULL_MARKET_SYMBOLS_ENV.strip()
+        if env_text:
+            for token in env_text.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                parts = token.split(":", 1)
+                sym = parts[0].strip()
+                nm = parts[1].strip() if len(parts) > 1 else sym
+                if sym:
+                    universe[sym] = {"symbol": sym, "name": nm, "market": "", "security_type": ""}
+            if universe:
+                source = "ENV"
+
     for sym in list(universe):
         if sym in FULL_MARKET_BLOCKED_SYMBOLS:
             universe.pop(sym, None)
-    state["universe"] = universe
-    state["status"] = f"전체시장 종목 {len(universe):,}개 로드" if universe else "FULL_MARKET_UNIVERSE_EMPTY"
-    return universe
 
+    state["universe"] = universe
+    state["stock_master_checked_at"] = now_ts
+    state["stock_master_source"] = source
+    state["status"] = (
+        f"전체시장 종목 {len(universe):,}개 로드 ({source})"
+        if universe
+        else f"FULL_MARKET_UNIVERSE_EMPTY / {api_error or 'NO_SOURCE'}"
+    )
+    return universe
 
 def _quote_field(item, keys, default=0.0):
     for k in keys:
@@ -4987,6 +5108,10 @@ class Handler(BaseHTTPRequestHandler):
                 "multi_paper_ai_ids": MULTI_AI_IDS,
                 "multi_paper_ai_start_cash_each": MULTI_AI_START_CASH,
                 "multi_paper_ai_total_virtual_cash": MULTI_AI_START_CASH * len(MULTI_AI_IDS),
+            "full_market_universe_count": len(S.get("full_market", {}).get("universe", {})),
+            "full_market_scanner_ready": bool(S.get("full_market", {}).get("universe")) and ENABLE_FULL_MARKET_SCANNER,
+            "full_market_status": S.get("full_market", {}).get("status", "대기"),
+            "full_market_stock_master_source": S.get("full_market", {}).get("stock_master_source", "없음"),
                 "fixed_strategy_account_ids": [x for x in MULTI_AI_IDS if not x.startswith("G")],
                 "daily_market_ai_ids": [x for x in MULTI_AI_IDS if x.startswith("G")],
                 "fixed_strategy_account_count": len([x for x in MULTI_AI_IDS if not x.startswith("G")]),
@@ -5437,7 +5562,7 @@ def print_v428_selfcheck():
     if len(MULTI_AI_IDS) != 35:
         raise RuntimeError("V4.28 계좌 수 오류: 35개가 아님")
     if not universe:
-        print(" WARNING: kr_market_universe.csv 또는 FULL_MARKET_SYMBOLS가 없어 G01~G05는 거래하지 않고 대기합니다.", flush=True)
+        print(" WARNING: 토스 /api/v1/stocks, 캐시, CSV, 환경변수에서 종목목록을 받지 못해 G01~G05는 대기합니다.", flush=True)
 
 if __name__ == "__main__":
     print_v428_selfcheck()
