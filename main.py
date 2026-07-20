@@ -46,46 +46,69 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
 
-# 35개 독립 가상계좌
-# R01~R15: 과거 전체 연구 후 규칙 고정형
-# W01~W15: 미래정보 차단 순방향 학습형
-# G01~G05: 한국시장 전체 실시간 자유선택형
+# 65개 독립 가상계좌
+# 1그룹 고정전략: RI01~RI15(삼성·하이닉스 포함), RE01~RE15(제외)
+# 2그룹 순방향: WI01~WI15(삼성·하이닉스 포함), WE01~WE15(제외)
+# 3그룹 전체시장: G01~G05 기존 방식 유지
 ENABLE_MULTI_PAPER_AI = os.environ.get("ENABLE_MULTI_PAPER_AI", "true").lower() == "true"
 MULTI_AI_START_CASH = int(float(os.environ.get("MULTI_AI_START_CASH", "10000000")))
 MULTI_AI_FEE_SIDE_PCT = float(os.environ.get("MULTI_AI_FEE_SIDE_PCT", "0.10"))
 MULTI_AI_MAX_POSITION_RATIO = float(os.environ.get("MULTI_AI_MAX_POSITION_RATIO", "0.90"))
 MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get("MULTI_AI_DECISION_COOLDOWN_SEC", "180"))
 
+RESEARCH_BASE_NAMES = {
+    1:"연구고정 오전추세",2:"연구고정 오전역추세",3:"연구고정 오전돌파",
+    4:"연구고정 오전눌림",5:"연구고정 09:15",6:"연구고정 10:00",
+    7:"연구고정 11:00",8:"연구고정 오후추세",9:"연구고정 오후역추세",
+    10:"연구고정 오후돌파",11:"연구고정 2구간",12:"연구고정 저노출",
+    13:"연구고정 관망강화",14:"연구고정 추적청산",15:"연구고정 오버나이트",
+}
+WALK_BASE_NAMES = {
+    1:"순방향 누적수익 1위",2:"순방향 누적 상위3 분산",3:"순방향 최근3일 1위",
+    4:"순방향 최근5일 1위",5:"순방향 최근7일 1위",6:"순방향 최근10일 1위",
+    7:"순방향 최근5일 위험조정",8:"순방향 최근10일 위험조정",9:"순방향 최소MDD",
+    10:"순방향 승률우선",11:"순방향 수익MDD 혼합",12:"순방향 50·30·20",
+    13:"순방향 단기역추세",14:"순방향 지연추세",15:"순방향 현금관망",
+}
+
 MULTI_AI_IDS = (
-    [f"R{i:02d}" for i in range(1, 16)] +
-    [f"W{i:02d}" for i in range(1, 16)] +
+    [f"RI{i:02d}" for i in range(1, 16)] +
+    [f"RE{i:02d}" for i in range(1, 16)] +
+    [f"WI{i:02d}" for i in range(1, 16)] +
+    [f"WE{i:02d}" for i in range(1, 16)] +
     [f"G{i:02d}" for i in range(1, 6)]
 )
 
 MULTI_AI_NAMES = {
-    # 1그룹: 백테스트 연구 후 고정형
-    "R01":"연구고정 오전추세","R02":"연구고정 오전역추세","R03":"연구고정 오전돌파",
-    "R04":"연구고정 오전눌림","R05":"연구고정 09:15","R06":"연구고정 10:00",
-    "R07":"연구고정 11:00","R08":"연구고정 오후추세","R09":"연구고정 오후역추세",
-    "R10":"연구고정 오후돌파","R11":"연구고정 2구간","R12":"연구고정 저노출",
-    "R13":"연구고정 관망강화","R14":"연구고정 추적청산","R15":"연구고정 오버나이트",
-    # 2그룹: 당일 미래를 모르는 순방향 학습형
-    "W01":"순방향 누적수익 1위","W02":"순방향 누적 상위3 분산","W03":"순방향 최근3일 1위",
-    "W04":"순방향 최근5일 1위","W05":"순방향 최근7일 1위","W06":"순방향 최근10일 1위",
-    "W07":"순방향 최근5일 위험조정","W08":"순방향 최근10일 위험조정","W09":"순방향 최소MDD",
-    "W10":"순방향 승률우선","W11":"순방향 수익MDD 혼합","W12":"순방향 50·30·20",
-    "W13":"순방향 단기역추세","W14":"순방향 지연추세","W15":"순방향 현금관망",
-    # 3그룹: 전체시장 실시간 자유선택
+    **{f"RI{i:02d}":f"1그룹 포함형 {RESEARCH_BASE_NAMES[i]}" for i in range(1,16)},
+    **{f"RE{i:02d}":f"1그룹 제외형 {RESEARCH_BASE_NAMES[i]}" for i in range(1,16)},
+    **{f"WI{i:02d}":f"2그룹 포함형 {WALK_BASE_NAMES[i]}" for i in range(1,16)},
+    **{f"WE{i:02d}":f"2그룹 제외형 {WALK_BASE_NAMES[i]}" for i in range(1,16)},
     "G01":"전체시장 거래대금·돈몰림","G02":"전체시장 추세·돌파",
     "G03":"전체시장 눌림목·재상승","G04":"전체시장 급락·반전",
     "G05":"전체시장 종합자율",
 }
 MULTI_AI_GROUP = {
-    **{f"R{i:02d}":"RESEARCH_FIXED" for i in range(1,16)},
-    **{f"W{i:02d}":"WALK_FORWARD" for i in range(1,16)},
+    **{f"RI{i:02d}":"RESEARCH_FIXED" for i in range(1,16)},
+    **{f"RE{i:02d}":"RESEARCH_FIXED" for i in range(1,16)},
+    **{f"WI{i:02d}":"WALK_FORWARD" for i in range(1,16)},
+    **{f"WE{i:02d}":"WALK_FORWARD" for i in range(1,16)},
     **{f"G{i:02d}":"FULL_MARKET_LIVE" for i in range(1,6)},
 }
-MULTI_AI_PARENT = dict(MULTI_AI_GROUP)
+MULTI_AI_UNIVERSE = {
+    **{f"RI{i:02d}":"INCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
+    **{f"RE{i:02d}":"EXCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
+    **{f"WI{i:02d}":"INCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
+    **{f"WE{i:02d}":"EXCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
+    **{f"G{i:02d}":"FULL_MARKET" for i in range(1,6)},
+}
+MULTI_AI_PARENT = {
+    **{f"RI{i:02d}":f"R{i:02d}" for i in range(1,16)},
+    **{f"RE{i:02d}":f"R{i:02d}" for i in range(1,16)},
+    **{f"WI{i:02d}":f"W{i:02d}" for i in range(1,16)},
+    **{f"WE{i:02d}":f"W{i:02d}" for i in range(1,16)},
+    **{f"G{i:02d}":f"G{i:02d}" for i in range(1,6)},
+}
 
 # 3그룹 전체시장 스캐너
 ENABLE_FULL_MARKET_SCANNER = os.environ.get("ENABLE_FULL_MARKET_SCANNER", "true").lower() == "true"
@@ -225,7 +248,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_30_TOSS_RANKING_FULL_MARKET"
+OPERATING_VERSION = "OPERATING_V4_31_GROUP_SPLIT_INCLUDE_EXCLUDE"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -3935,6 +3958,8 @@ def _multi_ai_default(ai_id):
         "last_decision_ts": 0,
          "last_decision_date": "",
         "group": MULTI_AI_GROUP.get(ai_id, ""),
+        "universe_type": MULTI_AI_UNIVERSE.get(ai_id, ""),
+        "parent_strategy": MULTI_AI_PARENT.get(ai_id, ai_id),
         "mdd_pct": 0.0,
         "peak_asset": MULTI_AI_START_CASH,
         "loss_streak": 0,
@@ -4085,6 +4110,35 @@ def _multi_ai_recent_metrics(sym):
     return score, r3, r10, from_high, from_low
 
 
+
+
+def _multi_ai_parent_id(ai_id):
+    return MULTI_AI_PARENT.get(ai_id, ai_id)
+
+
+def _multi_ai_index(ai_id):
+    parent = _multi_ai_parent_id(ai_id)
+    digits = ''.join(ch for ch in parent if ch.isdigit())
+    return int(digits) if digits else 1
+
+
+def _multi_ai_family(ai_id):
+    parent = _multi_ai_parent_id(ai_id)
+    return parent[:1] if parent else ''
+
+
+def _multi_ai_universe_lists(ai_id, mode):
+    # 포함형은 삼성전자·SK하이닉스 본주/레버리지/인버스를 후보에 추가한다.
+    # 제외형은 동일 전략을 시장·섹터 ETF에만 적용한다.
+    etf_long = ["122630","233740","069500","229200","494310","488080","469150"]
+    etf_inv = ["252670","251340"]
+    samsung_hynix_long = ["0193T0","000660","0193W0","005930"]
+    samsung_hynix_inv = ["0197X0","0193L0"]
+    include_family = MULTI_AI_UNIVERSE.get(ai_id) == "INCLUDE_SAMSUNG_HYNIX"
+    if mode == "DOWN":
+        return etf_inv + (samsung_hynix_inv if include_family else [])
+    return etf_long + (samsung_hynix_long if include_family else [])
+
 def _multi_ai_candidate(ai_id, mode):
     """그룹별 후보 선택. G그룹은 전체시장 실시간 스캐너만 사용한다."""
     if ai_id.startswith("G"):
@@ -4092,19 +4146,19 @@ def _multi_ai_candidate(ai_id, mode):
 
     with LOCK:
         prices = dict(S.get("prices", {}))
-    long_syms = ["122630","233740","069500","229200","494310","488080","469150"]
-    inv_syms = ["252670","251340"]
-    universe = inv_syms if mode=="DOWN" else long_syms
+    universe = _multi_ai_universe_lists(ai_id, mode)
     market_ref = "252670" if mode=="DOWN" else "069500"
     _,_,market_r10,_,_ = _multi_ai_recent_metrics(market_ref)
     scored=[]
-    idx = int(ai_id[1:]) if len(ai_id)>1 and ai_id[1:].isdigit() else 1
+    idx = _multi_ai_index(ai_id)
+    family = _multi_ai_family(ai_id)
+    parent = _multi_ai_parent_id(ai_id)
     for sym in universe:
         if prices.get(sym,0)<=0:
             continue
         score,r3,r10,from_high,from_low = _multi_ai_recent_metrics(sym)
         rel = r10-market_r10
-        if ai_id.startswith("R"):
+        if family=="R":
             # 연구 후 고정형: 15개의 서로 다른 고정 규칙
             methods = idx % 5
             if methods==1: metric=score*0.4+r10*8+rel*4
@@ -4118,17 +4172,18 @@ def _multi_ai_candidate(ai_id, mode):
             own_penalty=max(0.0,-to_float(st.get("profit_rate",0)))*0.25
             look = [3,5,7,10][(idx-1)%4]
             momentum = r3 if look<=3 else r10
-            if ai_id=="W13": momentum=-r3
-            if ai_id=="W15" and mode in ["CHOPPY","NO_TRADE","RECOVERY"]: metric=-999
+            if parent=="W13": momentum=-r3
+            if parent=="W15" and mode in ["CHOPPY","NO_TRADE","RECOVERY"]: metric=-999
             else: metric=score*0.35+momentum*10+rel*5+from_low*2-own_penalty
         scored.append((metric,sym,score,r3,r10,from_high,from_low,rel))
     return max(scored,default=(0,"",0,0,0,0,0,0),key=lambda x:x[0])
 
 def _multi_ai_entry_window(ai_id, hhmm):
-    if ai_id.startswith("G"):
+    family = _multi_ai_family(ai_id)
+    idx = _multi_ai_index(ai_id)
+    if family == "G":
         return "09:10" <= hhmm < "14:40"
-    if ai_id.startswith("R"):
-        idx=int(ai_id[1:])
+    if family == "R":
         fixed={5:"09:15",6:"10:00",7:"11:00",8:"12:30",9:"13:00",10:"13:30"}
         if idx in fixed:
             t=fixed[idx]
@@ -4147,18 +4202,20 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
         if sym in S["paper_ais"][ai_id]["positions"]:
             S["paper_ais"][ai_id]["positions"][sym]["high_after_buy"]=high
     profit=pct(price,avg); draw=pct(price,high)
-    if ai_id.startswith("G"):
+    parent = _multi_ai_parent_id(ai_id)
+    family = _multi_ai_family(ai_id)
+    if family == "G":
         stops={"G01":-1.4,"G02":-1.8,"G03":-1.3,"G04":-1.6,"G05":-1.2}
         trails={"G01":-0.9,"G02":-1.1,"G03":-0.7,"G04":-0.9,"G05":-0.8}
-        if profit<=stops[ai_id]: return f"{ai_id} 실시간 손실제한 {profit:.2f}%"
-        if profit>=0.7 and draw<=trails[ai_id]: return f"{ai_id} 실시간 수익보호 {draw:.2f}%"
+        if profit<=stops[parent]: return f"{ai_id} 실시간 손실제한 {profit:.2f}%"
+        if profit>=0.7 and draw<=trails[parent]: return f"{ai_id} 실시간 수익보호 {draw:.2f}%"
         if hhmm>="15:10": return f"{ai_id} 당일 15:10 청산"
-    elif ai_id=="R14":
-        if profit>=0.8 and draw<=-1.0: return f"R14 추적청산 {draw:.2f}%"
+    elif parent=="R14":
+        if profit>=0.8 and draw<=-1.0: return f"{ai_id} 추적청산 {draw:.2f}%"
     else:
         if profit<=-2.0: return f"{ai_id} 손실제한 {profit:.2f}%"
         if profit>=0.8 and draw<=-1.0: return f"{ai_id} 수익보호 {draw:.2f}%"
-        if not ai_id=="R15" and hhmm>="15:10": return f"{ai_id} 당일청산"
+        if parent!="R15" and hhmm>="15:10": return f"{ai_id} 당일청산"
     return ""
 
 def run_multi_paper_ais():
@@ -4191,28 +4248,31 @@ def run_multi_paper_ais():
             continue
         if not _multi_ai_entry_window(ai_id,hhmm):
             continue
-        if ai_id=="W15" and mode in ["CHOPPY","NO_TRADE","RECOVERY"]:
+        parent = _multi_ai_parent_id(ai_id)
+        family = _multi_ai_family(ai_id)
+        if parent=="W15" and mode in ["CHOPPY","NO_TRADE","RECOVERY"]:
             with LOCK:
                 st["last_decision_ts"]=now_ts
                 st["last_action"]=f"{now_short()} 현금관망 {mode}"
             continue
         metric,sym,score,r3,r10,from_high,from_low,rel=_multi_ai_candidate(ai_id,mode)
-        threshold = 48 if ai_id.startswith("G") else (42 if ai_id.startswith("W") else 40)
+        threshold = 48 if family=="G" else (42 if family=="W" else 40)
         if not sym or metric<threshold:
             with LOCK:
                 st["last_decision_ts"]=now_ts
                 st["decision_data_end"]=now_text()
                 st["last_action"]=f"{now_short()} 관망 mode={mode} metric={metric:.1f}"
             continue
-        if ai_id.startswith("G") and not ensure_live_orderbook(sym):
+        if family=="G" and not ensure_live_orderbook(sym):
             with LOCK:
                 st["last_decision_ts"]=now_ts
                 st["last_action"]=f"{now_short()} 호가미수신 관망 {sym}"
             continue
         ratios = {"G01":0.60,"G02":0.70,"G03":0.55,"G04":0.50,"G05":0.65,
                   "W15":0.30,"R12":0.35,"R13":0.40}
-        ratio=ratios.get(ai_id,0.70)
-        reason=(f"{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, mode={mode}, "
+        ratio=ratios.get(parent,0.70)
+        reason=(f"{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, "
+                f"universe={MULTI_AI_UNIVERSE[ai_id]}, parent={parent}, mode={mode}, "
                 f"metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, "
                 f"high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%, "
                 f"decision_data_end={now_text()}")
@@ -5151,8 +5211,17 @@ class Handler(BaseHTTPRequestHandler):
                 "daily_market_ai_ids": [x for x in MULTI_AI_IDS if x.startswith("G")],
                 "fixed_strategy_account_count": len([x for x in MULTI_AI_IDS if not x.startswith("G")]),
                 "daily_market_ai_count": len([x for x in MULTI_AI_IDS if x.startswith("G")]),
+                "research_include_ids": [x for x in MULTI_AI_IDS if x.startswith("RI")],
+                "research_exclude_ids": [x for x in MULTI_AI_IDS if x.startswith("RE")],
+                "walk_include_ids": [x for x in MULTI_AI_IDS if x.startswith("WI")],
+                "walk_exclude_ids": [x for x in MULTI_AI_IDS if x.startswith("WE")],
+                "multi_ai_universe_types": MULTI_AI_UNIVERSE,
+                "multi_ai_parent_strategies": MULTI_AI_PARENT,
                 "multi_paper_ai_states": {ai: {
                     "name": S.get("paper_ais", {}).get(ai, {}).get("name", MULTI_AI_NAMES.get(ai, ai)),
+                    "group": MULTI_AI_GROUP.get(ai, ""),
+                    "universe_type": MULTI_AI_UNIVERSE.get(ai, ""),
+                    "parent_strategy": MULTI_AI_PARENT.get(ai, ai),
                     "cash": int(to_float(S.get("paper_ais", {}).get(ai, {}).get("cash", 0))),
                     "asset": int(to_float(S.get("paper_ais", {}).get(ai, {}).get("asset", 0))),
                     "profit_rate": round(to_float(S.get("paper_ais", {}).get(ai, {}).get("profit_rate", 0)), 4),
@@ -5581,26 +5650,27 @@ def print_operating_config():
     print("=" * 60, flush=True)
 
 
-def print_v428_selfcheck():
+def print_v431_selfcheck():
     universe = load_full_market_universe(True)
-    print("[V4.28 SELFHECK]", flush=True)
+    print("[V4.31 SELFCHECK]", flush=True)
     print(" version=", OPERATING_VERSION, flush=True)
     print(" paper_only_mode=", PAPER_ONLY_MODE, flush=True)
     print(" real_order_enabled=", ENABLE_REAL_ORDER, flush=True)
     print(" paper_accounts=", len(MULTI_AI_IDS), flush=True)
     print(" groups=", {g:sum(1 for x in MULTI_AI_IDS if MULTI_AI_GROUP[x]==g) for g in set(MULTI_AI_GROUP.values())}, flush=True)
+    print(" universes=", {u:sum(1 for x in MULTI_AI_IDS if MULTI_AI_UNIVERSE[x]==u) for u in set(MULTI_AI_UNIVERSE.values())}, flush=True)
     print(" full_market_universe_count=", len(universe), flush=True)
     print(" full_market_scanner_ready=", bool(universe) and ENABLE_FULL_MARKET_SCANNER, flush=True)
     print(" protected_real_symbols=", sorted(PROTECTED_REAL_SYMBOLS), flush=True)
     if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER:
-        raise RuntimeError("V4.28 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
-    if len(MULTI_AI_IDS) != 35:
-        raise RuntimeError("V4.28 계좌 수 오류: 35개가 아님")
+        raise RuntimeError("V4.31 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
+    if len(MULTI_AI_IDS) != 65:
+        raise RuntimeError("V4.31 계좌 수 오류: 65개가 아님")
     if not universe:
         print(" WARNING: 토스 /api/v1/rankings에서 전체시장 후보를 받지 못해 G01~G05는 대기합니다.", flush=True)
 
 if __name__ == "__main__":
-    print_v428_selfcheck()
+    print_v431_selfcheck()
     print_operating_config()
     print("80억 프로젝트 실전 반자동 관제센터 시작:", PORT, flush=True)
     threading.Thread(target=loop, daemon=True).start()
