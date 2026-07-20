@@ -46,10 +46,11 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
 
-# 65개 독립 가상계좌
+# 70개 독립 가상계좌
 # 1그룹 고정전략: RI01~RI15(삼성·하이닉스 포함), RE01~RE15(제외)
 # 2그룹 순방향: WI01~WI15(삼성·하이닉스 포함), WE01~WE15(제외)
 # 3그룹 전체시장: G01~G05 기존 방식 유지
+# 추가 실험군: C01~C05 오전·오후 조합 전략
 ENABLE_MULTI_PAPER_AI = os.environ.get("ENABLE_MULTI_PAPER_AI", "true").lower() == "true"
 MULTI_AI_START_CASH = int(float(os.environ.get("MULTI_AI_START_CASH", "10000000")))
 MULTI_AI_FEE_SIDE_PCT = float(os.environ.get("MULTI_AI_FEE_SIDE_PCT", "0.10"))
@@ -76,7 +77,8 @@ MULTI_AI_IDS = (
     [f"RE{i:02d}" for i in range(1, 16)] +
     [f"WI{i:02d}" for i in range(1, 16)] +
     [f"WE{i:02d}" for i in range(1, 16)] +
-    [f"G{i:02d}" for i in range(1, 6)]
+    [f"G{i:02d}" for i in range(1, 6)] +
+    [f"C{i:02d}" for i in range(1, 6)]
 )
 
 MULTI_AI_NAMES = {
@@ -87,6 +89,11 @@ MULTI_AI_NAMES = {
     "G01":"전체시장 거래대금·돈몰림","G02":"전체시장 추세·돌파",
     "G03":"전체시장 눌림목·재상승","G04":"전체시장 급락·반전",
     "G05":"전체시장 종합자율",
+    "C01":"조합 오전인버스→오후레버리지",
+    "C02":"조합 오전인버스→오후인버스",
+    "C03":"조합 11:30 방향전환",
+    "C04":"조합 삼성·하이닉스 포함 자율",
+    "C05":"조합 삼성·하이닉스 제외 자율",
 }
 MULTI_AI_GROUP = {
     **{f"RI{i:02d}":"RESEARCH_FIXED" for i in range(1,16)},
@@ -94,6 +101,7 @@ MULTI_AI_GROUP = {
     **{f"WI{i:02d}":"WALK_FORWARD" for i in range(1,16)},
     **{f"WE{i:02d}":"WALK_FORWARD" for i in range(1,16)},
     **{f"G{i:02d}":"FULL_MARKET_LIVE" for i in range(1,6)},
+    **{f"C{i:02d}":"INTRADAY_COMBO" for i in range(1,6)},
 }
 MULTI_AI_UNIVERSE = {
     **{f"RI{i:02d}":"INCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
@@ -101,6 +109,11 @@ MULTI_AI_UNIVERSE = {
     **{f"WI{i:02d}":"INCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
     **{f"WE{i:02d}":"EXCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
     **{f"G{i:02d}":"FULL_MARKET" for i in range(1,6)},
+    "C01":"INCLUDE_SAMSUNG_HYNIX",
+    "C02":"INCLUDE_SAMSUNG_HYNIX",
+    "C03":"INCLUDE_SAMSUNG_HYNIX",
+    "C04":"INCLUDE_SAMSUNG_HYNIX",
+    "C05":"EXCLUDE_SAMSUNG_HYNIX",
 }
 MULTI_AI_PARENT = {
     **{f"RI{i:02d}":f"R{i:02d}" for i in range(1,16)},
@@ -108,6 +121,7 @@ MULTI_AI_PARENT = {
     **{f"WI{i:02d}":f"W{i:02d}" for i in range(1,16)},
     **{f"WE{i:02d}":f"W{i:02d}" for i in range(1,16)},
     **{f"G{i:02d}":f"G{i:02d}" for i in range(1,6)},
+    **{f"C{i:02d}":f"C{i:02d}" for i in range(1,6)},
 }
 
 # 3그룹 전체시장 스캐너
@@ -248,7 +262,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_31_GROUP_SPLIT_INCLUDE_EXCLUDE"
+OPERATING_VERSION = "OPERATING_V4_32_GROUP_SPLIT_PLUS_INTRADAY_COMBOS"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -3964,6 +3978,9 @@ def _multi_ai_default(ai_id):
         "peak_asset": MULTI_AI_START_CASH,
         "loss_streak": 0,
         "decision_data_end": "",
+        "combo_date": "",
+        "combo_phase": 0,
+        "combo_last_symbol": "",
     }
 
 
@@ -4218,8 +4235,123 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
         if parent!="R15" and hhmm>="15:10": return f"{ai_id} 당일청산"
     return ""
 
+
+def _combo_reset_daily(ai_id):
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        if st.get("combo_date") != today():
+            st["combo_date"] = today()
+            st["combo_phase"] = 0
+            st["combo_last_symbol"] = ""
+            st["last_decision_ts"] = 0
+
+
+def _combo_mode_for_phase(ai_id, phase, market_mode):
+    if ai_id == "C01":
+        return "DOWN" if phase == 0 else "UP"
+    if ai_id == "C02":
+        return "DOWN"
+    if ai_id == "C03":
+        return "DOWN" if phase == 0 else "UP"
+    # C04/C05는 그 시점까지 확인된 시장 상태만 이용한다.
+    return "DOWN" if market_mode == "DOWN" else "UP"
+
+
+def _combo_times(ai_id):
+    # (1차 진입, 1차 청산, 2차 진입, 최종 청산)
+    if ai_id == "C03":
+        return "09:15", "11:30", "11:31", "14:00"
+    return "09:15", "12:00", "12:01", "15:00"
+
+
+def _combo_pick_candidate(ai_id, direction):
+    # 선택 시점까지 저장된 가격·점수만 사용한다. 이후 가격은 절대 사용하지 않는다.
+    metric, sym, score, r3, r10, from_high, from_low, rel = _multi_ai_candidate(ai_id, direction)
+    return metric, sym, score, r3, r10, from_high, from_low, rel
+
+
+def _run_combo_account(ai_id, market_mode, hhmm, now_ts):
+    _combo_reset_daily(ai_id)
+    entry1, exit1, entry2, exit2 = _combo_times(ai_id)
+    with LOCK:
+        st = S["paper_ais"][ai_id]
+        phase = int(to_float(st.get("combo_phase", 0)))
+        positions = dict(st.get("positions", {}))
+        last_ts = to_float(st.get("last_decision_ts", 0))
+
+    # 1차 포지션 청산
+    if phase == 1 and positions and hhmm >= exit1:
+        for sym in list(positions):
+            ensure_live_orderbook(sym)
+            if _multi_ai_sell(ai_id, sym, f"{ai_id} 1차 구간 {exit1} 청산"):
+                with LOCK:
+                    st = S["paper_ais"][ai_id]
+                    st["combo_phase"] = 2
+                    st["last_decision_ts"] = now_ts
+        return True
+
+    # 2차 포지션 최종 청산
+    if phase == 3 and positions and hhmm >= exit2:
+        for sym in list(positions):
+            ensure_live_orderbook(sym)
+            if _multi_ai_sell(ai_id, sym, f"{ai_id} 2차 구간 {exit2} 청산"):
+                with LOCK:
+                    st = S["paper_ais"][ai_id]
+                    st["combo_phase"] = 4
+                    st["last_decision_ts"] = now_ts
+        return True
+
+    if positions:
+        return True
+    if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC:
+        return True
+
+    # 1차 진입
+    if phase == 0 and entry1 <= hhmm < exit1:
+        direction = _combo_mode_for_phase(ai_id, 0, market_mode)
+        metric, sym, score, r3, r10, from_high, from_low, rel = _combo_pick_candidate(ai_id, direction)
+        if sym and metric >= 35:
+            reason = (f"{MULTI_AI_NAMES[ai_id]} 1차 direction={direction}, metric={metric:.1f}, "
+                      f"score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, rel={rel:.2f}%, "
+                      f"decision_data_end={now_text()}")
+            if _multi_ai_buy(ai_id, sym, reason, 0.70):
+                with LOCK:
+                    st = S["paper_ais"][ai_id]
+                    st["combo_phase"] = 1
+                    st["combo_last_symbol"] = sym
+                    st["last_decision_ts"] = now_ts
+                return True
+        with LOCK:
+            st = S["paper_ais"][ai_id]
+            st["last_decision_ts"] = now_ts
+            st["last_action"] = f"{now_short()} 1차 관망 metric={metric:.1f}"
+        return True
+
+    # 2차 진입
+    if phase == 2 and entry2 <= hhmm < exit2:
+        direction = _combo_mode_for_phase(ai_id, 1, market_mode)
+        metric, sym, score, r3, r10, from_high, from_low, rel = _combo_pick_candidate(ai_id, direction)
+        if sym and metric >= 35:
+            reason = (f"{MULTI_AI_NAMES[ai_id]} 2차 direction={direction}, metric={metric:.1f}, "
+                      f"score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, rel={rel:.2f}%, "
+                      f"decision_data_end={now_text()}")
+            if _multi_ai_buy(ai_id, sym, reason, 0.70):
+                with LOCK:
+                    st = S["paper_ais"][ai_id]
+                    st["combo_phase"] = 3
+                    st["combo_last_symbol"] = sym
+                    st["last_decision_ts"] = now_ts
+                return True
+        with LOCK:
+            st = S["paper_ais"][ai_id]
+            st["last_decision_ts"] = now_ts
+            st["last_action"] = f"{now_short()} 2차 관망 metric={metric:.1f}"
+        return True
+    return True
+
+
 def run_multi_paper_ais():
-    """35개 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
+    """70개 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS:
         _multi_ai_update(ai_id)
@@ -4233,6 +4365,9 @@ def run_multi_paper_ais():
         scan_full_market_universe(False)
 
     for ai_id in MULTI_AI_IDS:
+        if ai_id.startswith("C"):
+            _run_combo_account(ai_id, mode, hhmm, now_ts)
+            continue
         with LOCK:
             st=S["paper_ais"][ai_id]
             positions=dict(st.get("positions",{}))
@@ -5652,7 +5787,7 @@ def print_operating_config():
 
 def print_v431_selfcheck():
     universe = load_full_market_universe(True)
-    print("[V4.31 SELFCHECK]", flush=True)
+    print("[V4.32 SELFCHECK]", flush=True)
     print(" version=", OPERATING_VERSION, flush=True)
     print(" paper_only_mode=", PAPER_ONLY_MODE, flush=True)
     print(" real_order_enabled=", ENABLE_REAL_ORDER, flush=True)
@@ -5663,9 +5798,9 @@ def print_v431_selfcheck():
     print(" full_market_scanner_ready=", bool(universe) and ENABLE_FULL_MARKET_SCANNER, flush=True)
     print(" protected_real_symbols=", sorted(PROTECTED_REAL_SYMBOLS), flush=True)
     if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER:
-        raise RuntimeError("V4.31 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
-    if len(MULTI_AI_IDS) != 65:
-        raise RuntimeError("V4.31 계좌 수 오류: 65개가 아님")
+        raise RuntimeError("V4.32 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
+    if len(MULTI_AI_IDS) != 70:
+        raise RuntimeError("V4.32 계좌 수 오류: 70개가 아님")
     if not universe:
         print(" WARNING: 토스 /api/v1/rankings에서 전체시장 후보를 받지 못해 G01~G05는 대기합니다.", flush=True)
 
