@@ -46,7 +46,7 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
 
-# 70개 독립 가상계좌
+# 75개 독립 가상계좌
 # 1그룹 고정전략: RI01~RI15(삼성·하이닉스 포함), RE01~RE15(제외)
 # 2그룹 순방향: WI01~WI15(삼성·하이닉스 포함), WE01~WE15(제외)
 # 3그룹 전체시장: G01~G05 기존 방식 유지
@@ -78,7 +78,8 @@ MULTI_AI_IDS = (
     [f"WI{i:02d}" for i in range(1, 16)] +
     [f"WE{i:02d}" for i in range(1, 16)] +
     [f"G{i:02d}" for i in range(1, 6)] +
-    [f"C{i:02d}" for i in range(1, 6)]
+    [f"C{i:02d}" for i in range(1, 6)] +
+    [f"L{i:02d}" for i in range(1, 6)]
 )
 
 MULTI_AI_NAMES = {
@@ -94,6 +95,11 @@ MULTI_AI_NAMES = {
     "C03":"조합 11:30 방향전환",
     "C04":"조합 삼성·하이닉스 포함 자율",
     "C05":"조합 삼성·하이닉스 제외 자율",
+    "L01":"학습 직전5일 최근가중 1위",
+    "L02":"학습 직전5일 최근가중 상위3",
+    "L03":"학습 직전7일 수익 1위",
+    "L04":"학습 직전5일 수익·MDD 균형",
+    "L05":"학습 비용·낙폭 방어형",
 }
 MULTI_AI_GROUP = {
     **{f"RI{i:02d}":"RESEARCH_FIXED" for i in range(1,16)},
@@ -102,6 +108,7 @@ MULTI_AI_GROUP = {
     **{f"WE{i:02d}":"WALK_FORWARD" for i in range(1,16)},
     **{f"G{i:02d}":"FULL_MARKET_LIVE" for i in range(1,6)},
     **{f"C{i:02d}":"INTRADAY_COMBO" for i in range(1,6)},
+    **{f"L{i:02d}":"DAILY_LEARNING" for i in range(1,6)},
 }
 MULTI_AI_UNIVERSE = {
     **{f"RI{i:02d}":"INCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
@@ -114,6 +121,7 @@ MULTI_AI_UNIVERSE = {
     "C03":"INCLUDE_SAMSUNG_HYNIX",
     "C04":"INCLUDE_SAMSUNG_HYNIX",
     "C05":"EXCLUDE_SAMSUNG_HYNIX",
+    **{f"L{i:02d}":"FULL_MARKET" for i in range(1,6)},
 }
 MULTI_AI_PARENT = {
     **{f"RI{i:02d}":f"R{i:02d}" for i in range(1,16)},
@@ -122,6 +130,7 @@ MULTI_AI_PARENT = {
     **{f"WE{i:02d}":f"W{i:02d}" for i in range(1,16)},
     **{f"G{i:02d}":f"G{i:02d}" for i in range(1,6)},
     **{f"C{i:02d}":f"C{i:02d}" for i in range(1,6)},
+    **{f"L{i:02d}":f"L{i:02d}" for i in range(1,6)},
 }
 
 # 3그룹 전체시장 스캐너
@@ -262,7 +271,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_32_GROUP_SPLIT_PLUS_INTRADAY_COMBOS"
+OPERATING_VERSION = "OPERATING_V4_35_FINAL_DASHBOARD_IPSAFE_LEARNING"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -472,6 +481,10 @@ LOCK = threading.RLock()
 S = {
     "token": "",
     "token_exp": 0,
+    "token_last_error": "",
+    "outbound_ip": "확인 전",
+    "outbound_ip_checked_at": 0,
+    "outbound_ip_error": "",
     "account_seq": "",
     "account_raw": {},
     "status": "시작 중",
@@ -700,6 +713,31 @@ def set_status(msg):
     with LOCK:
         S["status"] = msg
         S["updated"] = now_short()
+
+def refresh_outbound_ip(force=False):
+    """현재 Render 외부 송신 IP를 10분 캐시한다."""
+    with LOCK:
+        checked = float(S.get("outbound_ip_checked_at", 0) or 0)
+    if (not force) and time.time() - checked < 600:
+        return str(S.get("outbound_ip", "확인 전"))
+    try:
+        r = requests.get("https://api.ipify.org", timeout=5)
+        ip = r.text.strip() if r.status_code == 200 else ""
+        if not ip:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        with LOCK:
+            old = str(S.get("outbound_ip", "") or "")
+            S["outbound_ip"] = ip
+            S["outbound_ip_checked_at"] = time.time()
+            S["outbound_ip_error"] = ""
+            if old and old not in {"확인 전", ip}:
+                S["last_error"] = f"{now_text()} 외부 IP 변경 {old} → {ip}"
+        return ip
+    except Exception as e:
+        with LOCK:
+            S["outbound_ip_checked_at"] = time.time()
+            S["outbound_ip_error"] = str(e)[:200]
+        return str(S.get("outbound_ip", "확인 실패"))
 
 def refresh_kr_market_calendar(force=False):
     """공식 /api/v1/market-calendar/KR로 오늘 영업일과 정규장 시간을 캐시한다."""
@@ -1257,14 +1295,23 @@ def get_token():
         r = requests.post(BASE + "/oauth2/token", data={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}, timeout=10)
         data = r.json() if r.text else {}
         if r.status_code != 200:
-            set_status(f"토큰 오류 {r.status_code}")
-            set_error(f"토큰 오류: {data}")
+            raw = str(data).replace("\n", " ")[:800]
+            with LOCK:
+                S["token_last_error"] = raw
+            if "IP address not allowed" in raw or "access_denied" in raw:
+                ip = refresh_outbound_ip(True)
+                set_status(f"IP 차단: {ip}")
+                set_error(f"토스 허용 IP 아님: {ip} / {raw}")
+            else:
+                set_status(f"토큰 오류 {r.status_code}")
+                set_error(f"토큰 오류: {raw}")
             return ""
         token = data.get("access_token", "")
         exp = int(data.get("expires_in", 3600))
         with LOCK:
             S["token"] = token
             S["token_exp"] = time.time() + max(60, exp - 300)
+            S["token_last_error"] = ""
         set_status("토큰 정상")
         return token
     except Exception as e:
@@ -3981,6 +4028,11 @@ def _multi_ai_default(ai_id):
         "combo_date": "",
         "combo_phase": 0,
         "combo_last_symbol": "",
+        "daily_assets": {},
+        "selected_source": "",
+        "selected_sources": [],
+        "selection_date": "",
+        "selection_reason": "",
     }
 
 
@@ -4129,7 +4181,85 @@ def _multi_ai_recent_metrics(sym):
 
 
 
+
+
+def _learning_base_ids():
+    """학습 계좌가 비교할 실시간 가상계좌. 조합·학습계좌 자신은 제외한다."""
+    return [x for x in MULTI_AI_IDS if x.startswith(("RI","RE","WI","WE","G"))]
+
+def _record_multi_ai_daily_assets():
+    """매 루프 현재 자산을 오늘 날짜 스냅숏으로 저장한다. 다음날 선택에는 전일까지 값만 쓴다."""
+    d=today()
+    with LOCK:
+        for ai_id in MULTI_AI_IDS:
+            st=S.get("paper_ais",{}).get(ai_id,{})
+            st.setdefault("daily_assets",{})[d]=int(to_float(st.get("asset",st.get("cash",0))))
+            # 상태파일 비대화 방지: 최근 40일만 유지
+            keys=sorted(st.get("daily_assets",{}))
+            for old in keys[:-40]:
+                st["daily_assets"].pop(old,None)
+
+def _source_daily_returns(source_id, window=5, extra_cost_pct=0.0):
+    st=S.get("paper_ais",{}).get(source_id,{})
+    assets=st.get("daily_assets",{}) if isinstance(st.get("daily_assets"),dict) else {}
+    ds=sorted([d for d in assets if d < today()])
+    vals=[]
+    for d0,d1 in zip(ds[:-1],ds[1:]):
+        a0=to_float(assets.get(d0,0)); a1=to_float(assets.get(d1,0))
+        if a0>0 and a1>0:
+            vals.append((d1,(a1/a0-1.0)-extra_cost_pct/100.0))
+    return vals[-window:]
+
+def _learning_score(source_id, ai_id):
+    window=7 if ai_id=="L03" else 5
+    extra_cost=0.10 if ai_id=="L05" else 0.0
+    vals=_source_daily_returns(source_id,window,extra_cost)
+    if len(vals)<2:
+        return -9999.0
+    rs=[r for _,r in vals]
+    equity=1.0; peak=1.0; mdd=0.0
+    for r in rs:
+        equity*=1+r; peak=max(peak,equity); mdd=min(mdd,equity/peak-1)
+    total=equity-1
+    if ai_id in ["L01","L02"]:
+        w=[0.5+i*(1.0/max(1,len(rs)-1)) for i in range(len(rs))]
+        return sum(r*x for r,x in zip(rs,w))/sum(w) + 0.5*mdd
+    if ai_id=="L03":
+        return total
+    if ai_id=="L04":
+        return total + 2.5*mdd
+    return total + 4.0*mdd - max(0,-min(rs))*1.5
+
+def _select_learning_sources(ai_id, force=False):
+    with LOCK:
+        st=S["paper_ais"][ai_id]
+        if (not force) and st.get("selection_date")==today():
+            return list(st.get("selected_sources",[]) or [])
+    scored=[]
+    for src in _learning_base_ids():
+        sc=_learning_score(src,ai_id)
+        if sc>-9990:
+            scored.append((sc,src))
+    scored.sort(reverse=True)
+    topn=3 if ai_id=="L02" else 1
+    chosen=[src for _,src in scored[:topn]]
+    with LOCK:
+        st=S["paper_ais"][ai_id]
+        st["selection_date"]=today()
+        st["selected_sources"]=chosen
+        st["selected_source"]=chosen[0] if chosen else ""
+        st["selection_reason"]=(f"전일까지 최근성과 선택: " + ", ".join(f"{src}={sc:.4f}" for sc,src in scored[:topn])) if chosen else "학습자료 부족"
+        st["last_action"]=f"{now_short()} 학습선택 " + (",".join(chosen) if chosen else "자료부족 관망")
+    return chosen
+
+def _learning_effective_source(ai_id):
+    chosen=_select_learning_sources(ai_id,False)
+    return chosen[0] if chosen else ""
+
 def _multi_ai_parent_id(ai_id):
+    if str(ai_id).startswith("L"):
+        src=_learning_effective_source(ai_id)
+        return MULTI_AI_PARENT.get(src,src) if src else ai_id
     return MULTI_AI_PARENT.get(ai_id, ai_id)
 
 
@@ -4145,6 +4275,10 @@ def _multi_ai_family(ai_id):
 
 
 def _multi_ai_universe_lists(ai_id, mode):
+    if str(ai_id).startswith("L"):
+        src=_learning_effective_source(ai_id)
+        if src:
+            ai_id=src
     # 포함형은 삼성전자·SK하이닉스 본주/레버리지/인버스를 후보에 추가한다.
     # 제외형은 동일 전략을 시장·섹터 ETF에만 적용한다.
     etf_long = ["122630","233740","069500","229200","494310","488080","469150"]
@@ -4157,7 +4291,13 @@ def _multi_ai_universe_lists(ai_id, mode):
     return etf_long + (samsung_hynix_long if include_family else [])
 
 def _multi_ai_candidate(ai_id, mode):
-    """그룹별 후보 선택. G그룹은 전체시장 실시간 스캐너만 사용한다."""
+    """그룹별 후보 선택. 학습형은 전일까지 선택한 원본 전략 규칙을 당일 고정 적용한다."""
+    if ai_id.startswith("L"):
+        chosen=_select_learning_sources(ai_id,False)
+        if not chosen:
+            return (0,"",0,0,0,0,0,0)
+        results=[_multi_ai_candidate(src,mode) for src in chosen]
+        return max(results,default=(0,"",0,0,0,0,0,0),key=lambda x:x[0])
     if ai_id.startswith("G"):
         return full_market_candidate(ai_id)
 
@@ -4196,6 +4336,9 @@ def _multi_ai_candidate(ai_id, mode):
     return max(scored,default=(0,"",0,0,0,0,0,0),key=lambda x:x[0])
 
 def _multi_ai_entry_window(ai_id, hhmm):
+    if str(ai_id).startswith("L"):
+        src=_learning_effective_source(ai_id)
+        return _multi_ai_entry_window(src,hhmm) if src else False
     family = _multi_ai_family(ai_id)
     idx = _multi_ai_index(ai_id)
     if family == "G":
@@ -4211,6 +4354,7 @@ def _multi_ai_entry_window(ai_id, hhmm):
 
 
 def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
+    logic_id=_learning_effective_source(ai_id) if str(ai_id).startswith("L") else ai_id
     price=to_float(S.get("prices",{}).get(sym,0)); avg=to_float(pos.get("avg",0))
     if price<=0 or avg<=0:
         return ""
@@ -4219,8 +4363,8 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
         if sym in S["paper_ais"][ai_id]["positions"]:
             S["paper_ais"][ai_id]["positions"][sym]["high_after_buy"]=high
     profit=pct(price,avg); draw=pct(price,high)
-    parent = _multi_ai_parent_id(ai_id)
-    family = _multi_ai_family(ai_id)
+    parent = _multi_ai_parent_id(logic_id)
+    family = _multi_ai_family(logic_id)
     if family == "G":
         stops={"G01":-1.4,"G02":-1.8,"G03":-1.3,"G04":-1.6,"G05":-1.2}
         trails={"G01":-0.9,"G02":-1.1,"G03":-0.7,"G04":-0.9,"G05":-0.8}
@@ -4287,7 +4431,7 @@ def _run_combo_account(ai_id, market_mode, hhmm, now_ts):
                 with LOCK:
                     st = S["paper_ais"][ai_id]
                     st["combo_phase"] = 2
-                    st["last_decision_ts"] = now_ts
+                    st["last_decision_ts"] = 0
         return True
 
     # 2차 포지션 최종 청산
@@ -4323,8 +4467,9 @@ def _run_combo_account(ai_id, market_mode, hhmm, now_ts):
                 return True
         with LOCK:
             st = S["paper_ais"][ai_id]
-            st["last_decision_ts"] = now_ts
-            st["last_action"] = f"{now_short()} 1차 관망 metric={metric:.1f}"
+            st["combo_phase"] = 2
+            st["last_decision_ts"] = 0
+            st["last_action"] = f"{now_short()} 1차 1회평가 관망 metric={metric:.1f}"
         return True
 
     # 2차 진입
@@ -4344,17 +4489,21 @@ def _run_combo_account(ai_id, market_mode, hhmm, now_ts):
                 return True
         with LOCK:
             st = S["paper_ais"][ai_id]
+            st["combo_phase"] = 4
             st["last_decision_ts"] = now_ts
-            st["last_action"] = f"{now_short()} 2차 관망 metric={metric:.1f}"
+            st["last_action"] = f"{now_short()} 2차 1회평가 관망 metric={metric:.1f}"
         return True
     return True
 
 
 def run_multi_paper_ais():
-    """70개 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
+    """75개 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS:
         _multi_ai_update(ai_id)
+    _record_multi_ai_daily_assets()
+    for ai_id in [x for x in MULTI_AI_IDS if x.startswith("L")]:
+        _select_learning_sources(ai_id,False)
     if not ENABLE_MULTI_PAPER_AI or not paper_auto_time_open():
         return
     mode=target_market_regime()
@@ -4391,7 +4540,7 @@ def run_multi_paper_ais():
                 st["last_action"]=f"{now_short()} 현금관망 {mode}"
             continue
         metric,sym,score,r3,r10,from_high,from_low,rel=_multi_ai_candidate(ai_id,mode)
-        threshold = 48 if family=="G" else (42 if family=="W" else 40)
+        threshold = 46 if ai_id.startswith("L") else (48 if family=="G" else (42 if family=="W" else 40))
         if not sym or metric<threshold:
             with LOCK:
                 st["last_decision_ts"]=now_ts
@@ -4404,7 +4553,8 @@ def run_multi_paper_ais():
                 st["last_action"]=f"{now_short()} 호가미수신 관망 {sym}"
             continue
         ratios = {"G01":0.60,"G02":0.70,"G03":0.55,"G04":0.50,"G05":0.65,
-                  "W15":0.30,"R12":0.35,"R13":0.40}
+                  "W15":0.30,"R12":0.35,"R13":0.40,
+                  "L01":0.70,"L02":0.55,"L03":0.65,"L04":0.50,"L05":0.35}
         ratio=ratios.get(parent,0.70)
         reason=(f"{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, "
                 f"universe={MULTI_AI_UNIVERSE[ai_id]}, parent={parent}, mode={mode}, "
@@ -5282,7 +5432,7 @@ def loop():
 
 CSS = """
 <style>
-*{box-sizing:border-box}body{margin:0;padding:10px;background:#05060a;color:#f3f4f8;font-family:Arial,sans-serif;font-size:13px}h1{margin:6px 0 2px;text-align:center;color:#fff;font-size:22px}.sub{text-align:center;color:#777;font-size:11px;margin-bottom:10px}.grid{display:grid;grid-template-columns:1.05fr 1.5fr 1.1fr;gap:10px}.card{background:#11131c;border:1px solid #222635;border-radius:12px;padding:12px;margin-bottom:10px}.card h2{margin:0 0 8px;font-size:15px;color:#aaa}.big{font-size:25px;font-weight:bold}.mid{font-size:18px;font-weight:bold}.small{font-size:11px;color:#888}.red{color:#ff4d4d}.blue{color:#4d8cff}.green{color:#4dff88}.yellow{color:#ffd84d}.gray{color:#888}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:#888;background:#161927;padding:6px;border-bottom:1px solid #252a3a}td{padding:6px;border-bottom:1px solid #1d2030}button{border:none;border-radius:7px;padding:8px 12px;margin:3px;font-weight:bold;cursor:pointer}.buy{background:#d71920;color:white}.sell{background:#1f64ff;color:white}.graybtn{background:#333;color:white}.gold{background:#ffd84d;color:black}.paperbtn{background:#7b3ff2;color:white}input{background:#05060a;color:white;border:1px solid #333;border-radius:6px;padding:7px;width:80px}.progress{width:100%;height:8px;background:#222;border-radius:10px;overflow:hidden;margin:6px 0}.bar{height:100%;background:#ffd84d}@media(max-width:900px){.grid{grid-template-columns:1fr}}
+*{box-sizing:border-box}body{margin:0;padding:12px;background:#07090f;color:#eef1f7;font-family:Arial,sans-serif;font-size:13px}h1{margin:4px 0;text-align:center;font-size:22px}.sub{text-align:center;color:#8d95a7;font-size:11px;margin-bottom:12px}.grid{display:grid;grid-template-columns:minmax(260px,.9fr) minmax(440px,1.55fr) minmax(300px,1fr);gap:12px;align-items:start}.card{background:#111522;border:1px solid #242a3a;border-radius:12px;padding:12px;margin-bottom:12px;box-shadow:0 4px 18px rgba(0,0,0,.18)}.card h2{margin:0 0 9px;font-size:15px;color:#c2c8d5}.big{font-size:24px;font-weight:700}.mid{font-size:18px;font-weight:700}.small{font-size:11px;color:#929bad}.red{color:#ff6262}.blue{color:#63a0ff}.green{color:#55df91}.yellow{color:#ffd75a}.gray{color:#8b93a5}table{width:100%;border-collapse:collapse;font-size:11px}th{text-align:left;color:#9aa3b6;background:#171c2a;padding:7px;position:sticky;top:0}td{padding:7px;border-bottom:1px solid #202637;vertical-align:top}button{border:0;border-radius:7px;padding:8px 11px;margin:3px;font-weight:700;cursor:pointer}.buy{background:#db3038;color:#fff}.sell{background:#2b6cff;color:#fff}.graybtn{background:#343b4d;color:#fff}.gold{background:#ffd75a;color:#111}.paperbtn{background:#7c51e8;color:#fff}input{background:#090c14;color:#fff;border:1px solid #394156;border-radius:6px;padding:7px;width:72px}.progress{width:100%;height:8px;background:#222a3a;border-radius:10px;overflow:hidden;margin:6px 0}.bar{height:100%;background:#ffd75a}.scroll{max-height:680px;overflow:auto}.summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}.metric{background:#171c2a;border-radius:8px;padding:9px}.metric b{display:block;font-size:16px;margin-top:3px}.tabs{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}.tabbtn{background:#2a3040;color:#dce1eb;padding:6px 9px}.tabbtn.active{background:#ffd75a;color:#111}.hide{display:none}.badge{display:inline-block;padding:2px 6px;border-radius:10px;background:#252c3d;font-size:10px}.pos{background:#173c2a;color:#65e59a}.neg{background:#4a2025;color:#ff8087}.warn{background:#463b18;color:#ffdd6c}details summary{cursor:pointer;color:#cbd2df;font-weight:700;margin:4px 0}@media(max-width:1150px){.grid{grid-template-columns:1fr 1.5fr}.grid>div:last-child{grid-column:1/-1}}@media(max-width:760px){body{padding:7px}.grid{grid-template-columns:1fr}.summary-grid{grid-template-columns:repeat(2,1fr)}.card{padding:9px}.scroll{max-height:520px}}
 </style>
 """
 
@@ -5342,10 +5492,12 @@ class Handler(BaseHTTPRequestHandler):
             "full_market_ranking_last_at": S.get("full_market", {}).get("ranking_last_at", ""),
             "full_market_ranking_errors": S.get("full_market", {}).get("ranking_errors", []),
             "full_market_candidate_count": len(S.get("full_market", {}).get("ranked", [])),
-                "fixed_strategy_account_ids": [x for x in MULTI_AI_IDS if not x.startswith("G")],
+                "fixed_strategy_account_ids": [x for x in MULTI_AI_IDS if x.startswith(("RI","RE"))],
                 "daily_market_ai_ids": [x for x in MULTI_AI_IDS if x.startswith("G")],
-                "fixed_strategy_account_count": len([x for x in MULTI_AI_IDS if not x.startswith("G")]),
+                "learning_ai_ids": [x for x in MULTI_AI_IDS if x.startswith("L")],
+                "fixed_strategy_account_count": len([x for x in MULTI_AI_IDS if x.startswith(("RI","RE"))]),
                 "daily_market_ai_count": len([x for x in MULTI_AI_IDS if x.startswith("G")]),
+                "learning_ai_count": len([x for x in MULTI_AI_IDS if x.startswith("L")]),
                 "research_include_ids": [x for x in MULTI_AI_IDS if x.startswith("RI")],
                 "research_exclude_ids": [x for x in MULTI_AI_IDS if x.startswith("RE")],
                 "walk_include_ids": [x for x in MULTI_AI_IDS if x.startswith("WI")],
@@ -5538,7 +5690,7 @@ class Handler(BaseHTTPRequestHandler):
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>80억 프로젝트 실전 반자동 관제센터</title><meta http-equiv="refresh" content="60">{CSS}</head><body>
 <h1>80억 프로젝트 실전 반자동 관제센터</h1>
 <div class="sub">버전 {safe(OPERATING_VERSION)} | 전략 {safe(SHADOW_FIXED_STRATEGY_ID)} | 업데이트 {safe(S['updated'])} | 상태 {safe(S['status'])} | 계좌 {safe(S['account_seq'])}</div>
-<div class="grid"><div>{self.account_card()}{self.shadow_fixed_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.signal_card(SHADOW_LEV_SYMBOL,'red')}{self.signal_card(SHADOW_INV_SYMBOL,'blue')}{self.basic_card(HYNIX)}{self.stock_table()}</div><div>{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}{self.shadow_trade_card()}</div></div>
+<div class="grid"><div>{self.account_card()}{self.multi_ai_summary_card()}{self.holdings_card()}</div><div>{self.market_card()}{self.multi_ai_accounts_card()}{self.stock_table()}</div><div>{self.system_health_card()}{self.test_card()}{self.news_card()}{self.alert_card()}{self.order_card()}</div></div>
 <script>
 async function postJson(path, body){{const res=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body||{{}})}});return await res.json();}}
 async function order(symbol,side,qtyId){{const qty=document.getElementById(qtyId).value;const sideText=side==='BUY'?'매수':'매도';if(!qty||Number(qty)<=0){{alert('수량이 0입니다.');return;}}if(!confirm(symbol+' '+qty+'주 실계좌 '+sideText+' 주문 전송?'))return;const data=await postJson('/order',{{symbol:symbol,side:side,qty:qty}});alert(JSON.stringify(data));location.reload();}}
@@ -5546,6 +5698,7 @@ async function paperBuy(symbol){{const data=await postJson('/paper_buy',{{symbol
 async function paperSell(symbol){{const data=await postJson('/paper_sell',{{symbol:symbol}});alert(data.ok?'가상매도 완료':'가상매도 실패');location.reload();}}
 async function resetBase(){{if(!confirm('현재 토스 총자산으로 실계좌 기준금과 구 AI 가상계좌를 리셋할까요? 고정전략 1천만원 계좌는 유지됩니다.'))return;const data=await postJson('/reset_base',{{}});alert(JSON.stringify(data));location.reload();}}
 function setQty(id,qty){{document.getElementById(id).value=qty;}}
+function showAiGroup(g,btn){{document.querySelectorAll('.ai-group').forEach(x=>x.classList.add('hide'));const el=document.getElementById('grp_'+g);if(el)el.classList.remove('hide');document.querySelectorAll('.tabbtn').forEach(x=>x.classList.remove('active'));if(btn)btn.classList.add('active');}}
 </script></body></html>"""
         self.html_response(html_doc)
 
@@ -5553,6 +5706,60 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         real_rate = pct(S["total_value"], S["real_base_cash"]) if S["real_base_cash"] else 0
         return f"""<div class="card"><h2>실계좌</h2><div class="small">실제 기준금</div><div class="mid yellow">{fmt_won(S['real_base_cash'])}</div><br><div class="small">총자산</div><div class="big yellow">{fmt_won(S['total_value'])}</div><div class="small">기준금 대비 {real_rate:.2f}%</div><br><div class="small">매수가능금액</div><div class="mid">{fmt_won(S['cash'])}</div><br><div class="small">평가손익</div><div class="mid {color_class(S['profit_loss'])}">{fmt_won(S['profit_loss'])}</div><div class="{color_class(S['profit_rate'])}">{S['profit_rate']}%</div><br><div class="small">실주문 상태</div><div class="{'green' if ENABLE_REAL_ORDER else 'red'}">{'활성화' if ENABLE_REAL_ORDER else '비활성화'}</div><button class="gold" onclick="resetBase()">실계좌 기준금 리셋</button></div>"""
 
+
+    def multi_ai_summary_card(self):
+        ensure_multi_ai_states()
+        states=[S.get("paper_ais",{}).get(x,{}) for x in MULTI_AI_IDS]
+        total_start=sum(to_float(x.get("start_cash",0)) for x in states)
+        total_asset=sum(to_float(x.get("asset",0)) for x in states)
+        active=sum(1 for x in states if x.get("positions"))
+        profitable=sum(1 for x in states if to_float(x.get("profit_rate",0))>0)
+        best=max(((to_float(st.get("profit_rate",0)),aid) for aid,st in zip(MULTI_AI_IDS,states)),default=(0,""))
+        worst=min(((to_float(st.get("profit_rate",0)),aid) for aid,st in zip(MULTI_AI_IDS,states)),default=(0,""))
+        return f"""<div class='card'><h2>75개 가상전략 요약</h2><div class='summary-grid'>
+        <div class='metric small'>총 가상자산<b>{fmt_won(total_asset)}</b></div><div class='metric small'>통합수익률<b class='{color_class(total_asset-total_start)}'>{pct(total_asset,total_start):+.2f}%</b></div>
+        <div class='metric small'>보유 계좌<b>{active}개</b></div><div class='metric small'>수익 계좌<b>{profitable}개</b></div></div>
+        <div class='small'>최고 <span class='green'>{best[1]} {best[0]:+.2f}%</span> / 최저 <span class='red'>{worst[1]} {worst[0]:+.2f}%</span></div>
+        <div class='small'>실주문 없음 · 각 계좌 독립 · L01~L05는 전일까지 학습 후 당일 고정</div></div>"""
+
+    def multi_ai_accounts_card(self):
+        ensure_multi_ai_states()
+        group_defs=[("ALL","전체"),("RI","고정 포함"),("RE","고정 제외"),("WI","순방향 포함"),("WE","순방향 제외"),("G","전체시장"),("C","조합"),("L","학습형")]
+        tabs=''.join(f"<button class='tabbtn {'active' if k=='ALL' else ''}' onclick=\"showAiGroup('{k}',this)\">{n}</button>" for k,n in group_defs)
+        blocks=[]
+        for key,label in group_defs:
+            ids=MULTI_AI_IDS if key=="ALL" else [x for x in MULTI_AI_IDS if x.startswith(key)]
+            ids=sorted(ids,key=lambda x:to_float(S.get("paper_ais",{}).get(x,{}).get("profit_rate",0)),reverse=True)
+            rows=[]
+            for rank,aid in enumerate(ids,1):
+                st=S.get("paper_ais",{}).get(aid,{})
+                pr=to_float(st.get("profit_rate",0)); mdd=to_float(st.get("mdd_pct",0)); pos=st.get("positions",{})
+                pos_text=','.join(name_of(s) for s in pos) if pos else '현금'
+                learn=''
+                if aid.startswith('L'):
+                    learn=f"<br><span class='small yellow'>선택: {safe(','.join(st.get('selected_sources',[]) or []) or '자료부족')}</span>"
+                rows.append(f"<tr><td>{rank}</td><td><b>{aid}</b><br><span class='small'>{safe(st.get('name',aid))}</span>{learn}</td><td>{fmt_won(st.get('asset',0))}</td><td class='{color_class(pr)}'>{pr:+.2f}%</td><td class='{color_class(mdd)}'>{mdd:+.2f}%</td><td>{safe(pos_text)}</td><td class='small'>{safe(st.get('last_action',''))}</td></tr>")
+            cls='' if key=='ALL' else ' hide'
+            blocks.append(f"<div id='grp_{key}' class='ai-group{cls}'><div class='scroll'><table><tr><th>#</th><th>전략</th><th>자산</th><th>수익</th><th>MDD</th><th>상태</th><th>최근 행동</th></tr>{''.join(rows)}</table></div></div>")
+        return f"<div class='card'><h2>가상전략 실시간 비교</h2><div class='tabs'>{tabs}</div>{''.join(blocks)}</div>"
+
+    def system_health_card(self):
+        cap=S.get('market_data_capture',{})
+        gate=bool(cap.get('gate_ok',False)); reason=cap.get('gate_reason','')
+        fm=S.get('full_market',{})
+        ip=refresh_outbound_ip(False)
+        token_err=str(S.get('token_last_error','') or '')
+        ip_blocked=('IP address not allowed' in token_err or 'access_denied' in token_err)
+        return f"""<div class='card'><h2>시스템 상태</h2><table>
+        <tr><td>토스 외부 IP</td><td class='{'red' if ip_blocked else 'yellow'}'>{safe(ip)}</td></tr>
+        <tr><td>토스 토큰</td><td class='{'red' if token_err else 'green'}'>{'허용 IP 등록 필요' if ip_blocked else ('오류' if token_err else '정상')}</td></tr>
+        <tr><td>시장 안전게이트</td><td class='{'green' if gate else 'red'}'>{'정상' if gate else safe(reason)}</td></tr>
+        <tr><td>실주문</td><td class='{'red' if not ENABLE_REAL_ORDER else 'green'}'>{'차단' if not ENABLE_REAL_ORDER else '활성'}</td></tr>
+        <tr><td>가상자동</td><td>{'ON' if ENABLE_MULTI_PAPER_AI else 'OFF'}</td></tr>
+        <tr><td>가상전략 수</td><td>{len(MULTI_AI_IDS)}개</td></tr>
+        <tr><td>전체시장 후보</td><td>{len(fm.get('ranked',[]))}개 / {safe(fm.get('status','대기'))}</td></tr>
+        <tr><td>가격 갱신</td><td>{safe(S.get('updated','없음'))}</td></tr>
+        <tr><td>마지막 오류</td><td class='small red'>{safe(S.get('last_error','없음') or '없음')}</td></tr></table></div>"""
 
     def daytrade_card(self):
         return ""
@@ -5698,7 +5905,7 @@ function setQty(id,qty){{document.getElementById(id).value=qty;}}
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/ipcheck'">외부 IP 확인</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
@@ -5798,9 +6005,9 @@ def print_v431_selfcheck():
     print(" full_market_scanner_ready=", bool(universe) and ENABLE_FULL_MARKET_SCANNER, flush=True)
     print(" protected_real_symbols=", sorted(PROTECTED_REAL_SYMBOLS), flush=True)
     if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER:
-        raise RuntimeError("V4.32 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
-    if len(MULTI_AI_IDS) != 70:
-        raise RuntimeError("V4.32 계좌 수 오류: 70개가 아님")
+        raise RuntimeError("V4.33 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
+    if len(MULTI_AI_IDS) != 75:
+        raise RuntimeError("V4.33 계좌 수 오류: 75개가 아님")
     if not universe:
         print(" WARNING: 토스 /api/v1/rankings에서 전체시장 후보를 받지 못해 G01~G05는 대기합니다.", flush=True)
 
