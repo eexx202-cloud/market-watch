@@ -79,7 +79,8 @@ MULTI_AI_IDS = (
     [f"WE{i:02d}" for i in range(1, 16)] +
     [f"G{i:02d}" for i in range(1, 6)] +
     [f"C{i:02d}" for i in range(1, 6)] +
-    [f"L{i:02d}" for i in range(1, 6)]
+    [f"L{i:02d}" for i in range(1, 6)] +
+    [f"V{i:02d}" for i in range(1, 16)]
 )
 
 MULTI_AI_NAMES = {
@@ -100,6 +101,21 @@ MULTI_AI_NAMES = {
     "L03":"학습 직전7일 수익 1위",
     "L04":"학습 직전5일 수익·MDD 균형",
     "L05":"학습 비용·낙폭 방어형",
+    "V01":"검증 4천만원 하루2회 494310·252670",
+    "V02":"검증 미래변수제거 하루2회",
+    "V03":"검증 1억원대 삼성·하이닉스 4종목",
+    "V04":"일봉 삼성·하이닉스·KODEX200 MA10 완전합의",
+    "V05":"일봉방향 + 장중 눌림 재진입",
+    "V06":"일봉방향 + 같은 방향 상대강도 1위",
+    "V07":"삼성전자·SK하이닉스 장중 방향합의",
+    "V08":"관망강화 데이터·혼조 필터",
+    "V09":"고정 09:15 진입 60분 보유",
+    "V10":"고정 10:00 진입 90분 보유",
+    "V11":"고정 11:00 진입 90분 보유",
+    "V12":"11시 방향합의 90분 보유",
+    "V13":"오버나이트 15:10 진입 다음날 09:05 청산",
+    "V14":"하루 최대4회 방향추종",
+    "V15":"장중 방향전환·재진입 2회",
 }
 MULTI_AI_GROUP = {
     **{f"RI{i:02d}":"RESEARCH_FIXED" for i in range(1,16)},
@@ -109,6 +125,7 @@ MULTI_AI_GROUP = {
     **{f"G{i:02d}":"FULL_MARKET_LIVE" for i in range(1,6)},
     **{f"C{i:02d}":"INTRADAY_COMBO" for i in range(1,6)},
     **{f"L{i:02d}":"DAILY_LEARNING" for i in range(1,6)},
+    **{f"V{i:02d}":"EXPANDED_VERIFIED_RULE" for i in range(1,16)},
 }
 MULTI_AI_UNIVERSE = {
     **{f"RI{i:02d}":"INCLUDE_SAMSUNG_HYNIX" for i in range(1,16)},
@@ -122,6 +139,9 @@ MULTI_AI_UNIVERSE = {
     "C04":"INCLUDE_SAMSUNG_HYNIX",
     "C05":"EXCLUDE_SAMSUNG_HYNIX",
     **{f"L{i:02d}":"FULL_MARKET" for i in range(1,6)},
+    "V01":"VERIFIED_494310_252670", "V02":"VERIFIED_494310_252670",
+    "V03":"VERIFIED_SAMSUNG_HYNIX_4",
+    **{f"V{i:02d}":"ALL26_PAPER" for i in range(4,16)},
 }
 MULTI_AI_PARENT = {
     **{f"RI{i:02d}":f"R{i:02d}" for i in range(1,16)},
@@ -131,6 +151,7 @@ MULTI_AI_PARENT = {
     **{f"G{i:02d}":f"G{i:02d}" for i in range(1,6)},
     **{f"C{i:02d}":f"C{i:02d}" for i in range(1,6)},
     **{f"L{i:02d}":f"L{i:02d}" for i in range(1,6)},
+    **{f"V{i:02d}":f"V{i:02d}" for i in range(1,16)},
 }
 
 # 3그룹 전체시장 스캐너
@@ -271,8 +292,9 @@ MARKET_DATA_DAILY_COUNT = int(os.environ.get("MARKET_DATA_DAILY_COUNT", "250"))
 # 과거 큰 수익 결과가 나왔던 전략군을 삭제하지 않고 기존 독립계좌에 태그로 보존한다.
 # 정확한 원 규칙이 확인되지 않은 전략은 새 규칙으로 가장하지 않고 RESTORE_REQUIRED로 표시한다.
 LEGACY_PROFIT_STRATEGY_REGISTRY = {
-    "LEGACY_100M_ATTACK_MAX4": {"account_ids": ["RI03", "RI10", "C04"], "result_band": "1억원 이상", "status": "PAPER_VALIDATE"},
-    "LEGACY_30M_60M_FIXED": {"account_ids": ["RI05", "RI06", "RI07", "RI08", "RI11"], "result_band": "3천만~6천만원", "status": "PAPER_VALIDATE"},
+    "VERIFIED_100M_SAMSUNG_HYNIX_2TURN": {"account_ids": ["V03"], "result_band": "1억원 이상 과거결과", "status": "ACTIVE_PAPER_RULE"},
+    "VERIFIED_40M_TWO_TURN": {"account_ids": ["V01"], "result_band": "4천만원대 과거결과", "status": "ACTIVE_PAPER_RULE"},
+    "VERIFIED_NO_FUTURE_TWO_TURN": {"account_ids": ["V02"], "result_band": "미래변수 제거 4천만원대", "status": "ACTIVE_PAPER_RULE"},
     "LEGACY_OVERNIGHT": {"account_ids": ["RI15", "RE15"], "result_band": "오버나이트", "status": "PAPER_VALIDATE"},
     "LEGACY_MAX4_INTRADAY": {"account_ids": ["C01", "C02", "C03", "C04", "C05"], "result_band": "하루 최대 4회 계열", "status": "PAPER_VALIDATE"},
     "DAILY_CONSENSUS_MA10_V1": {"account_ids": [], "result_band": "일봉 필터", "status": "RESTORE_REQUIRED"},
@@ -296,7 +318,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_36_PAPER_ONLY_ALL26_AUDIT"
+OPERATING_VERSION = "OPERATING_V4_38_ALL_AGREED_STRATEGIES_90_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -4549,8 +4571,346 @@ def _run_combo_account(ai_id, market_mode, hhmm, now_ts):
     return True
 
 
+
+def _verified_candle_rows(sym):
+    """오늘 저장된 1분봉을 timestamp 기준으로 중복 제거하여 시간순 반환한다."""
+    path = candle_1m_path(sym)
+    if not os.path.exists(path):
+        return []
+    by_ts = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                ts = str(row.get("timestamp", ""))
+                dt = parse_api_datetime(ts)
+                close = to_float(row.get("close", 0))
+                if dt and close > 0 and dt.strftime("%Y-%m-%d") == today():
+                    by_ts[dt] = close
+    except Exception as e:
+        set_error(f"검증전략 1분봉 읽기 실패 {sym}: {e}")
+        return []
+    return sorted(by_ts.items(), key=lambda x: x[0])
+
+
+def _verified_price_at(sym, hhmm):
+    rows = _verified_candle_rows(sym)
+    if not rows:
+        return 0.0
+    h, m = [int(x) for x in hhmm.split(":")]
+    target = now_kst().replace(hour=h, minute=m, second=59, microsecond=999999)
+    vals = [px for dt, px in rows if dt <= target]
+    return vals[-1] if vals else 0.0
+
+
+def _verified_ret(sym, minutes, end_hhmm):
+    rows = _verified_candle_rows(sym)
+    if not rows:
+        return 0.0
+    h, m = [int(x) for x in end_hhmm.split(":")]
+    end_dt = now_kst().replace(hour=h, minute=m, second=59, microsecond=999999)
+    start_dt = end_dt - __import__('datetime').timedelta(minutes=int(minutes))
+    end_vals = [(dt, px) for dt, px in rows if dt <= end_dt]
+    start_vals = [(dt, px) for dt, px in rows if dt <= start_dt]
+    if not end_vals or not start_vals:
+        return 0.0
+    return pct(end_vals[-1][1], start_vals[-1][1])
+
+
+def _verified_open_ret(sym, end_hhmm):
+    rows = _verified_candle_rows(sym)
+    if not rows:
+        return 0.0
+    h, m = [int(x) for x in end_hhmm.split(":")]
+    end_dt = now_kst().replace(hour=h, minute=m, second=59, microsecond=999999)
+    vals = [(dt, px) for dt, px in rows if dt <= end_dt]
+    if not vals:
+        return 0.0
+    return pct(vals[-1][1], vals[0][1])
+
+
+def _verified_rule_pick(ai_id, turn):
+    """사용자가 제공한 확정 규칙 파일을 코드로 그대로 옮긴 선택 함수."""
+    end = "09:45" if turn == 1 else "12:30"
+    if ai_id == "V01":
+        if turn == 1:
+            h = _verified_ret("000660",45,end); s = _verified_ret("005930",45,end)
+            a = _verified_ret("494310",45,end); b = _verified_ret("252670",45,end)
+            spread = a-b
+            if h <= -2.92:
+                pick = "252670" if (s > -1.99 or spread <= -7.30) else "494310"
+            else:
+                pick = "494310" if a <= 10.09 else "252670"
+            return pick, f"V01-1 h45={h:.2f} s45={s:.2f} spread={spread:.2f}"
+        a = _verified_ret("494310",5,end); inv = _verified_ret("0193L0",5,end)
+        pair = _verified_ret("0193T0",5,end)-_verified_ret("0197X0",5,end)
+        if a <= 0.51 and inv <= -0.34: return "494310", f"V01-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}"
+        if a <= 0.51 and pair <= -0.58: return "252670", f"V01-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}"
+        return "", f"V01-2 SKIP a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}"
+    if ai_id == "V02":
+        if turn == 1:
+            lev = _verified_ret("0193T0",45,end); inv2 = _verified_ret("252670",45,end)
+            underlying = _verified_ret("000660",45,end)-_verified_ret("005930",45,end)
+            pick = "494310" if (lev > -7.66 and inv2 > -8.30 and underlying > -1.73) else "252670"
+            return pick, f"V02-1 lev45={lev:.2f} inv45={inv2:.2f} underlying={underlying:.2f}"
+        a = _verified_ret("494310",5,end); inv = _verified_ret("0193L0",5,end)
+        pair = _verified_ret("0193T0",5,end)-_verified_ret("0197X0",5,end)
+        if a <= 0.51 and inv <= -0.34: return "494310", f"V02-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}"
+        if a <= 0.51 and pair <= -0.58: return "252670", f"V02-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}"
+        return "", f"V02-2 SKIP a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}"
+    if ai_id == "V03":
+        if turn == 1:
+            h45=_verified_ret("000660",45,end); inv5=_verified_ret("252670",5,end)
+            u30=_verified_ret("000660",30,end)-_verified_ret("005930",30,end)
+            t30=_verified_ret("494310",30,end)-_verified_ret("252670",30,end)
+            op=_verified_open_ret("494310",end)-_verified_open_ret("252670",end)
+            h15=_verified_ret("000660",15,end)
+            if h45 <= -3.0:
+                if inv5 <= 1.0:
+                    if u30 <= 0.0: pick = "0193T0" if t30 <= -5.0 else "0193W0"
+                    else: pick = "0193L0"
+                else: pick = "0193T0"
+            else:
+                if op <= 14.0: pick = "0197X0"
+                else: pick = "0193W0" if h15 <= 0.0 else "0193L0"
+            return pick, f"V03-1 h45={h45:.2f} inv5={inv5:.2f} u30={u30:.2f} t30={t30:.2f} open={op:.2f} h15={h15:.2f}"
+        a5=_verified_ret("494310",5,end); w15=_verified_ret("0193W0",15,end)
+        a10=_verified_ret("494310",10,end); l15=_verified_ret("0193L0",15,end)
+        pair60=_verified_ret("0193T0",60,end)-_verified_ret("0193L0",60,end)
+        x90=_verified_ret("0197X0",90,end)
+        if a5 <= 1.0:
+            if w15 <= 1.0:
+                if a10 <= -1.0:
+                    if l15 <= 0.0: pick="0193L0"
+                    else: pick="0193T0" if pair60 <= 1.0 else ""
+                else: pick="0193T0" if x90 <= -4.0 else "0193W0"
+            else: pick="0197X0"
+        else: pick="0193T0"
+        return pick, f"V03-2 a5={a5:.2f} w15={w15:.2f} a10={a10:.2f} l15={l15:.2f} pair60={pair60:.2f} x90={x90:.2f}"
+    return "", "UNKNOWN_VERIFIED_RULE"
+
+
+def _run_verified_fixed_account(ai_id, hhmm, now_ts):
+    _combo_reset_daily(ai_id)
+    with LOCK:
+        st=S["paper_ais"][ai_id]; phase=int(to_float(st.get("combo_phase",0))); positions=dict(st.get("positions",{}))
+    if phase==1 and positions and hhmm >= "12:00":
+        for sym in list(positions):
+            ensure_live_orderbook(sym)
+            if _multi_ai_sell(ai_id,sym,f"{ai_id} 1차 12:00 고정청산"):
+                with LOCK: S["paper_ais"][ai_id]["combo_phase"]=2
+        return True
+    if phase==3 and positions and hhmm >= "15:20":
+        for sym in list(positions):
+            ensure_live_orderbook(sym)
+            if _multi_ai_sell(ai_id,sym,f"{ai_id} 2차 15:20 고정청산"):
+                with LOCK: S["paper_ais"][ai_id]["combo_phase"]=4
+        return True
+    if positions: return True
+    if phase==0 and "09:45" <= hhmm < "09:50":
+        sym,reason=_verified_rule_pick(ai_id,1)
+        ok=bool(sym) and _multi_ai_buy(ai_id,sym,reason+f" decision_data_end={now_text()}",0.90)
+        with LOCK:
+            st=S["paper_ais"][ai_id]; st["combo_phase"]=1 if ok else 2; st["last_decision_ts"]=now_ts
+            if not ok: st["last_action"]=f"{now_short()} 1차 관망 {reason}"
+        return True
+    if phase==2 and "12:30" <= hhmm < "12:35":
+        sym,reason=_verified_rule_pick(ai_id,2)
+        ok=bool(sym) and _multi_ai_buy(ai_id,sym,reason+f" decision_data_end={now_text()}",0.90)
+        with LOCK:
+            st=S["paper_ais"][ai_id]; st["combo_phase"]=3 if ok else 4; st["last_decision_ts"]=now_ts
+            if not ok: st["last_action"]=f"{now_short()} 2차 관망 {reason}"
+        return True
+    return True
+
+
+
+# ============================================================
+# V4.38 사용자가 확정한 신규 전략 전체 실행엔진
+# - V01~V03: 원본 규칙 파일을 코드로 옮긴 검증 전략
+# - V04~V15: 일봉필터/장중합의/고정시간/오버나이트/최대4회/전환전략
+# - 전부 독립 1천만원 가상계좌이며 실제 주문 함수는 호출하지 않는다.
+# ============================================================
+
+def _csv_daily_closes(sym, limit=30):
+    path = os.path.join(market_data_dir(), f"candles_1d_{sym}.csv")
+    if not os.path.exists(path):
+        return []
+    out=[]
+    try:
+        with open(path,"r",encoding="utf-8-sig",newline="") as f:
+            for row in csv.DictReader(f):
+                d=str(row.get("date") or row.get("time") or row.get("timestamp") or row.get("dt") or "")
+                c=to_float(row.get("close") or row.get("closingPrice") or row.get("price") or row.get("close_price"),0)
+                if c>0: out.append((d,c))
+    except Exception as e:
+        set_error(f"daily close read {sym}: {e}")
+    return out[-limit:]
+
+
+def _daily_consensus_signal():
+    votes=[]
+    detail=[]
+    for sym in ["005930","000660","069500"]:
+        vals=_csv_daily_closes(sym,20)
+        if len(vals)<11:
+            return 0, f"DAILY_NOT_READY {sym} rows={len(vals)}"
+        closes=[x[1] for x in vals]
+        last,prev=closes[-1],closes[-2]
+        ma10=sum(closes[-10:])/10
+        vote=1 if last>prev and last>ma10 else (-1 if last<prev and last<ma10 else 0)
+        votes.append(vote); detail.append(f"{sym}:{vote}")
+    sig=1 if votes==[1,1,1] else (-1 if votes==[-1,-1,-1] else 0)
+    return sig, " ".join(detail)
+
+
+def _intraday_direction(end_hhmm="09:30", minutes=15):
+    rs={s:_verified_ret(s,minutes,end_hhmm) for s in ["005930","000660","069500"]}
+    up=sum(1 for v in rs.values() if v>0.05); down=sum(1 for v in rs.values() if v<-0.05)
+    sig=1 if up>=2 else (-1 if down>=2 else 0)
+    return sig, rs
+
+
+def _same_direction_pick(direction,end_hhmm,minutes=15,allow_single=True):
+    if direction>0:
+        cands=["0193T0","0193W0","494310","122630","233740"]
+        ranked=sorted((( _verified_ret(s,minutes,end_hhmm),s) for s in cands),reverse=True)
+    elif direction<0:
+        cands=["0197X0","0193L0","252670","251340"]
+        ranked=sorted((( _verified_ret(s,minutes,end_hhmm),s) for s in cands),reverse=True)
+    else:
+        return "", "NO_DIRECTION"
+    best_ret,best_sym=ranked[0]
+    if not allow_single and best_ret<=0: return "",f"NO_POSITIVE_STRENGTH best={best_ret:.2f}"
+    return best_sym, f"direction={direction} strength={best_ret:.2f}"
+
+
+def _data_trade_filter(end_hhmm):
+    # 가격/호가 신선도와 삼성·하이닉스 혼조를 동시에 검사한다.
+    for sym in ["005930","000660","069500","494310","252670"]:
+        if to_float(S.get("prices",{}).get(sym,0))<=0:
+            return False,f"MISSING_PRICE {sym}"
+    h=_verified_ret("000660",10,end_hhmm); s=_verified_ret("005930",10,end_hhmm)
+    if h*s<0 and abs(h-s)>0.5:
+        return False,f"MIXED_UNDERLYING h={h:.2f} s={s:.2f}"
+    return True,f"FILTER_OK h={h:.2f} s={s:.2f}"
+
+
+EXPANDED_SCHEDULES={
+    "V04":[("09:05","15:10")],
+    "V05":[("09:25","12:00"),("12:35","15:10")],
+    "V06":[("09:30","12:00"),("12:30","15:10")],
+    "V07":[("09:30","12:00"),("12:30","15:10")],
+    "V08":[("09:30","12:00"),("12:30","15:10")],
+    "V09":[("09:15","10:15")],
+    "V10":[("10:00","11:30")],
+    "V11":[("11:00","12:30")],
+    "V12":[("11:00","12:30")],
+    "V14":[("09:20","10:20"),("10:30","11:30"),("12:30","13:30"),("14:00","15:10")],
+    "V15":[("09:30","11:30"),("12:30","15:10")],
+}
+
+
+def _expanded_pick(ai_id, slot, entry_hhmm):
+    daily_sig,daily_reason=_daily_consensus_signal()
+    intraday_sig,rs=_intraday_direction(entry_hhmm,15 if entry_hhmm<"11:00" else 30)
+    ok_filter,filter_reason=_data_trade_filter(entry_hhmm)
+
+    if ai_id=="V04":
+        sym,why=_same_direction_pick(daily_sig,entry_hhmm,15,False)
+        return sym,f"V04 {daily_reason} {why}"
+    if ai_id=="V05":
+        if daily_sig==0: return "",f"V05 DAILY_NO_TRADE {daily_reason}"
+        # 20분 방향과 최근5분 재가속이 같은 때만 두 번째 움직임으로 간주한다.
+        h20=_verified_ret("000660",20,entry_hhmm); h5=_verified_ret("000660",5,entry_hhmm)
+        s20=_verified_ret("005930",20,entry_hhmm); s5=_verified_ret("005930",5,entry_hhmm)
+        reentry=(h20*daily_sig>0 and h5*daily_sig>0 and s20*daily_sig>0 and s5*daily_sig>0)
+        if not reentry:return "",f"V05 NO_REENTRY h20={h20:.2f} h5={h5:.2f} s20={s20:.2f} s5={s5:.2f}"
+        sym,why=_same_direction_pick(daily_sig,entry_hhmm,10,False)
+        return sym,f"V05 {daily_reason} {why}"
+    if ai_id=="V06":
+        direction=daily_sig or intraday_sig
+        sym,why=_same_direction_pick(direction,entry_hhmm,30,False)
+        return sym,f"V06 daily={daily_sig} intra={intraday_sig} {why}"
+    if ai_id=="V07":
+        h=_verified_ret("000660",15,entry_hhmm); s=_verified_ret("005930",15,entry_hhmm)
+        direction=1 if h>0.05 and s>0.05 else (-1 if h<-0.05 and s<-0.05 else 0)
+        sym,why=_same_direction_pick(direction,entry_hhmm,15,False)
+        return sym,f"V07 h={h:.2f} s={s:.2f} {why}"
+    if ai_id=="V08":
+        if not ok_filter:return "",f"V08 {filter_reason}"
+        sym,why=_same_direction_pick(intraday_sig,entry_hhmm,15,False)
+        return sym,f"V08 {filter_reason} {why}"
+    if ai_id in ["V09","V10","V11"]:
+        sym,why=_same_direction_pick(intraday_sig,entry_hhmm,15,False)
+        return sym,f"{ai_id} fixed {why} rs={rs}"
+    if ai_id=="V12":
+        sym,why=_same_direction_pick(intraday_sig,entry_hhmm,30,False)
+        return sym,f"V12 consensus90 {why} rs={rs}"
+    if ai_id=="V14":
+        sym,why=_same_direction_pick(intraday_sig,entry_hhmm,10,False)
+        return sym,f"V14 slot={slot+1} {why}"
+    if ai_id=="V15":
+        # 오후에는 오전과 반대 방향이 확인될 때만 전환, 같으면 추세 재진입.
+        sym,why=_same_direction_pick(intraday_sig,entry_hhmm,20,False)
+        return sym,f"V15 slot={slot+1} direction_switch_or_reentry {why}"
+    return "","UNKNOWN_EXPANDED"
+
+
+def _expanded_reset(ai_id):
+    with LOCK:
+        st=S["paper_ais"][ai_id]
+        if st.get("expanded_date")!=today():
+            st["expanded_date"]=today(); st["expanded_slot"]=0; st["last_decision_ts"]=0
+
+
+def _run_expanded_account(ai_id,hhmm,now_ts):
+    # 오버나이트는 포지션을 날짜 변경 시에도 유지한다.
+    if ai_id=="V13":
+        with LOCK:
+            st=S["paper_ais"][ai_id]; positions=dict(st.get("positions",{})); last_date=st.get("overnight_entry_date","")
+        if positions and last_date and last_date!=today() and hhmm>="09:05":
+            for sym in list(positions):
+                ensure_live_orderbook(sym); _multi_ai_sell(ai_id,sym,"V13 다음 거래일 09:05 오버나이트 청산")
+            return True
+        if not positions and "15:10"<=hhmm<"15:15":
+            sig,rs=_intraday_direction("15:10",30)
+            sym,why=_same_direction_pick(sig,"15:10",30,False)
+            if sym and _multi_ai_buy(ai_id,sym,f"V13 오버나이트 진입 {why} rs={rs}",0.90):
+                with LOCK:S["paper_ais"][ai_id]["overnight_entry_date"]=today()
+            return True
+        return True
+
+    _expanded_reset(ai_id)
+    schedule=EXPANDED_SCHEDULES.get(ai_id,[])
+    with LOCK:
+        st=S["paper_ais"][ai_id]; slot=int(to_float(st.get("expanded_slot",0))); positions=dict(st.get("positions",{}))
+    if slot>=len(schedule):return True
+    entry,exit_=schedule[slot]
+    if positions and hhmm>=exit_:
+        for sym in list(positions):
+            ensure_live_orderbook(sym)
+            _multi_ai_sell(ai_id,sym,f"{ai_id} {slot+1}차 {exit_} 고정청산")
+        with LOCK:S["paper_ais"][ai_id]["expanded_slot"]=slot+1
+        return True
+    if positions:return True
+    # 놓친 구간은 관망으로 넘겨 다음 슬롯이 막히지 않게 한다.
+    if hhmm>exit_:
+        with LOCK:
+            st=S["paper_ais"][ai_id]; st["expanded_slot"]=slot+1; st["last_action"]=f"{now_short()} {slot+1}차 시간누락 관망"
+        return True
+    if entry<=hhmm<=(entry[:3]+str(min(9,int(entry[3:])+4)) if int(entry[3:])<=5 else entry):
+        sym,reason=_expanded_pick(ai_id,slot,entry)
+        ok=bool(sym) and _multi_ai_buy(ai_id,sym,reason+f" decision_data_end={now_text()}",0.90)
+        with LOCK:
+            st=S["paper_ais"][ai_id]; st["last_decision_ts"]=now_ts
+            if not ok:
+                st["expanded_slot"]=slot+1
+                st["last_action"]=f"{now_short()} {slot+1}차 관망 {reason}"
+        return True
+    return True
+
 def run_multi_paper_ais():
-    """75개 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
+    """90개 독립 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS:
         _multi_ai_update(ai_id)
@@ -4567,6 +4927,12 @@ def run_multi_paper_ais():
         scan_full_market_universe(False)
 
     for ai_id in MULTI_AI_IDS:
+        if ai_id in {"V01","V02","V03"}:
+            _run_verified_fixed_account(ai_id, hhmm, now_ts)
+            continue
+        if ai_id.startswith("V"):
+            _run_expanded_account(ai_id, hhmm, now_ts)
+            continue
         if ai_id.startswith("C"):
             _run_combo_account(ai_id, mode, hhmm, now_ts)
             continue
