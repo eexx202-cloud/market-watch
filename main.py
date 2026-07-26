@@ -252,6 +252,31 @@ WATCH = {
     "0127R0": "AI클라우드",
 }
 ALL = {**MAIN, **MARKET, **WATCH}
+
+# ============================================================
+# V4.36 26개 전 종목 동등 수집 원칙
+# - 특정 핵심종목 우선 수집 금지
+# - 26개 모두 동일 항목/동일 주기/동일 형식
+# ============================================================
+ALL26_SYMBOLS = list(ALL.keys())
+MARKET_DATA_CORE_SYMBOLS = ALL26_SYMBOLS.copy()
+MARKET_DATA_ORDERFLOW_SYMBOLS = ALL26_SYMBOLS.copy()
+MARKET_DATA_DAILY_SYMBOLS = ALL26_SYMBOLS.copy()
+MARKET_DATA_METADATA_SYMBOLS = ALL26_SYMBOLS.copy()
+MARKET_DATA_DAILY_REFRESH_SEC = int(os.environ.get("MARKET_DATA_DAILY_REFRESH_SEC", "1800"))
+MARKET_DATA_METADATA_REFRESH_SEC = int(os.environ.get("MARKET_DATA_METADATA_REFRESH_SEC", "21600"))
+MARKET_DATA_AUDIT_SEC = int(os.environ.get("MARKET_DATA_AUDIT_SEC", "300"))
+MARKET_DATA_DAILY_COUNT = int(os.environ.get("MARKET_DATA_DAILY_COUNT", "250"))
+
+# 과거 큰 수익 결과가 나왔던 전략군을 삭제하지 않고 기존 독립계좌에 태그로 보존한다.
+# 정확한 원 규칙이 확인되지 않은 전략은 새 규칙으로 가장하지 않고 RESTORE_REQUIRED로 표시한다.
+LEGACY_PROFIT_STRATEGY_REGISTRY = {
+    "LEGACY_100M_ATTACK_MAX4": {"account_ids": ["RI03", "RI10", "C04"], "result_band": "1억원 이상", "status": "PAPER_VALIDATE"},
+    "LEGACY_30M_60M_FIXED": {"account_ids": ["RI05", "RI06", "RI07", "RI08", "RI11"], "result_band": "3천만~6천만원", "status": "PAPER_VALIDATE"},
+    "LEGACY_OVERNIGHT": {"account_ids": ["RI15", "RE15"], "result_band": "오버나이트", "status": "PAPER_VALIDATE"},
+    "LEGACY_MAX4_INTRADAY": {"account_ids": ["C01", "C02", "C03", "C04", "C05"], "result_band": "하루 최대 4회 계열", "status": "PAPER_VALIDATE"},
+    "DAILY_CONSENSUS_MA10_V1": {"account_ids": [], "result_band": "일봉 필터", "status": "RESTORE_REQUIRED"},
+}
 LEV = "0193T0"
 INV = "0197X0"
 HYNIX = "000660"
@@ -271,7 +296,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_35_FINAL_DASHBOARD_IPSAFE_LEARNING"
+OPERATING_VERSION = "OPERATING_V4_36_PAPER_ONLY_ALL26_AUDIT"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -366,8 +391,8 @@ ENABLE_KAKAO_MIRROR = os.environ.get("ENABLE_KAKAO_MIRROR", "false").lower() == 
 # - 자동매도는 실전 허용 종목 + 수익권에서만 실행
 # - 빨간색 추격이 아니라 VI/당일 저점 대비 살아나는 종목을 감지
 # ============================================================
-ENABLE_REAL_AUTO_BUY = os.environ.get("ENABLE_REAL_AUTO_BUY", "false").lower() == "true"
-ENABLE_REAL_AUTO_SELL = os.environ.get("ENABLE_REAL_AUTO_SELL", "true").lower() == "true"
+ENABLE_REAL_AUTO_BUY = False  # V4.36: 실제 자동매수 강제 OFF
+ENABLE_REAL_AUTO_SELL = False  # V4.36: 완전 가상검증, 실제 자동매도도 강제 OFF
 AUTO_SELL_PROFIT_ONLY = os.environ.get("AUTO_SELL_PROFIT_ONLY", "true").lower() == "true"
 AUTO_SELL_LOSS_CUT = os.environ.get("AUTO_SELL_LOSS_CUT", "false").lower() == "true"
 AUTO_SELL_MIN_PROFIT_PCT = float(os.environ.get("AUTO_SELL_MIN_PROFIT_PCT", "1.0"))
@@ -580,6 +605,9 @@ S = {
         "last_candle_ts": 0,
         "last_orderflow_ts": 0,
         "last_investor_ts": 0,
+        "last_daily_ts": 0,
+        "last_metadata_ts": 0,
+        "last_audit_ts": 0,
         "last_candle_minute": {},
         "last_trade_timestamp": {},
         "last_orderbook_timestamp": {},
@@ -901,6 +929,18 @@ def market_indicator_path():
 
 def investor_trading_path():
     return os.path.join(market_data_dir(), f"investor_trading_{today()}.csv")
+
+def candle_daily_path(sym):
+    return os.path.join(market_data_dir(), f"candles_1d_{sym}.csv")
+
+def stock_metadata_path(sym):
+    return os.path.join(market_data_dir(), f"stock_metadata_{sym}_{today()}.csv")
+
+def data_quality_audit_path():
+    return os.path.join(market_data_dir(), f"data_quality_audit_{today()}.csv")
+
+def raw_api_error_path():
+    return os.path.join(market_data_dir(), f"api_errors_{today()}.csv")
 
 def write_row(path, headers, row):
     try:
@@ -1354,34 +1394,47 @@ def _is_invalid_token(status_code, data):
     return "invalid-token" in text or "invalid_token" in text or "유효하지 않은 토큰" in text or status_code == 401
 
 def api_get(path, params=None, account=False, timeout=10):
-    try:
-        r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
-        data = _json_or_raw(r)
-
-        # 401 invalid-token이면 조용히 토큰 캐시를 지우고 새 토큰으로 1회 재시도한다.
-        # 재시도까지 실패했을 때만 빨간 오류로 남긴다.
-        if _is_invalid_token(r.status_code, data):
-            clear_token()
+    """토스 GET 공통 호출. 401은 토큰 재발급, 429/5xx는 짧은 백오프로 재시도한다."""
+    last_data = {}
+    for attempt in range(3):
+        try:
             r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
             data = _json_or_raw(r)
-
-            # 재시도 후에도 invalid-token이면 장외 계좌조회/토큰 갱신 흔들림으로 처리하고
-            # 빨간 오류를 반복 저장하지 않는다. 가격 저장 루프는 계속 돈다.
+            last_data = data
             if _is_invalid_token(r.status_code, data):
-                set_status_once(f"INVALID_TOKEN_{path}", f"토스 토큰 재발급 대기: {path}", INVALID_TOKEN_STATUS_COOLDOWN_SEC)
+                clear_token()
+                if attempt < 2:
+                    time.sleep(0.25)
+                    continue
+            if r.status_code == 429:
+                retry_after = to_float(r.headers.get("Retry-After", 0), 0)
+                wait = max(0.25, retry_after, (2 ** attempt) * 0.35)
+                write_row(raw_api_error_path(), ["time","method","path","status","attempt","response"], {
+                    "time": now_text(), "method": "GET", "path": path, "status": 429,
+                    "attempt": attempt + 1, "response": str(data)[:1000],
+                })
+                if attempt < 2:
+                    time.sleep(wait)
+                    continue
+                set_status(f"토스 요청 제한 대기: {path}")
                 return r.status_code, data
-
-        # 429는 토스 요청 한도 초과다. 서버 장애가 아니므로 상태만 바꾸고 빨간 오류 폭탄은 막는다.
-        if r.status_code == 429:
-            set_status(f"토스 요청 제한 대기: {path}")
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep((2 ** attempt) * 0.5)
+                continue
+            if r.status_code >= 400:
+                write_row(raw_api_error_path(), ["time","method","path","status","attempt","response"], {
+                    "time": now_text(), "method": "GET", "path": path, "status": r.status_code,
+                    "attempt": attempt + 1, "response": str(data)[:1000],
+                })
+                set_error(f"GET {path} {r.status_code}: {str(data)[:300]}")
             return r.status_code, data
-
-        if r.status_code >= 400:
-            set_error(f"GET {path} {r.status_code}: {str(data)[:300]}")
-        return r.status_code, data
-    except Exception as e:
-        set_error(f"GET {path} 예외: {e}")
-        return 0, {"error": str(e)}
+        except Exception as e:
+            last_data = {"error": str(e)}
+            if attempt < 2:
+                time.sleep((2 ** attempt) * 0.5)
+                continue
+            set_error(f"GET {path} 예외: {e}")
+    return 0, last_data
 
 def api_post(path, body=None, account=False, timeout=10):
     try:
@@ -5046,7 +5099,10 @@ def capture_candles_1m():
             state["last_candle_minute"][sym] = key
 
 def capture_orderbook_and_trades():
-    if not ENABLE_TOSS_MARKET_DATA_CAPTURE or not market_data_focus_time():
+    if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
+        return
+    market_ok, _market_reason = regular_market_open_now()
+    if not market_ok:
         return
     state = S.setdefault("market_data_capture", {})
     ob_headers = [
@@ -5112,6 +5168,96 @@ def capture_orderbook_and_trades():
                 "price": to_float(last_trade.get("price", 0)),
                 "volume": to_float(last_trade.get("volume", 0)),
             }
+
+def capture_daily_candles_all26():
+    """26개 전 종목 일봉을 같은 형식으로 저장한다."""
+    headers = ["saved_at","symbol","timestamp","open","high","low","close","volume","currency"]
+    for sym in MARKET_DATA_DAILY_SYMBOLS:
+        code, data = api_get("/api/v1/candles", params={
+            "symbol": sym, "interval": "1d",
+            "count": max(10, min(500, MARKET_DATA_DAILY_COUNT)), "adjusted": "true",
+        }, timeout=12)
+        if code != 200:
+            continue
+        result = _result_dict(data)
+        candles = result.get("candles", []) if isinstance(result, dict) else []
+        if not isinstance(candles, list):
+            continue
+        # 매번 파일을 재작성해 중복 일봉을 방지한다.
+        path = candle_daily_path(sym)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                for c in reversed(candles):
+                    if not isinstance(c, dict):
+                        continue
+                    w.writerow({
+                        "saved_at": now_text(), "symbol": sym, "timestamp": c.get("timestamp", ""),
+                        "open": c.get("openPrice", 0), "high": c.get("highPrice", 0),
+                        "low": c.get("lowPrice", 0), "close": c.get("closePrice", 0),
+                        "volume": c.get("volume", 0), "currency": c.get("currency", "KRW"),
+                    })
+            os.replace(tmp, path)
+        except Exception as e:
+            set_error(f"일봉 저장 실패 {sym}: {e}")
+
+def capture_stock_metadata_all26():
+    """종목정보·경고·상하한가를 26개 모두 동일하게 수집한다."""
+    headers = ["saved_at","symbol","name","stock_http","warning_http","limits_http","stock_json","warning_json","limits_json"]
+    for sym in MARKET_DATA_METADATA_SYMBOLS:
+        c1, d1 = api_get("/api/v1/stocks", params={"symbols": sym}, timeout=8)
+        c2, d2 = api_get(f"/api/v1/stocks/{sym}/warnings", timeout=8)
+        c3, d3 = api_get("/api/v1/price-limits", params={"symbol": sym}, timeout=8)
+        write_row(stock_metadata_path(sym), headers, {
+            "saved_at": now_text(), "symbol": sym, "name": name_of(sym),
+            "stock_http": c1, "warning_http": c2, "limits_http": c3,
+            "stock_json": json.dumps(d1, ensure_ascii=False, separators=(",", ":"))[:10000],
+            "warning_json": json.dumps(d2, ensure_ascii=False, separators=(",", ":"))[:10000],
+            "limits_json": json.dumps(d3, ensure_ascii=False, separators=(",", ":"))[:10000],
+        })
+
+def write_data_quality_audit_all26():
+    """전략 실행 전 확인 가능한 26개 데이터 무결성 감사표."""
+    headers = ["time","date","symbol","name","snapshot_rows","candle_rows","unique_prices","first_price","low","high","last_price","price_age_sec","orderbook_age_sec","trade_age_sec","status","reason"]
+    cap = S.setdefault("market_data_capture", {})
+    for sym in ALL26_SYMBOLS:
+        snap_path = symbol_path(sym)
+        candle_path = candle_1m_path(sym)
+        prices=[]
+        snapshot_rows=0
+        candle_rows=0
+        try:
+            if os.path.exists(snap_path):
+                with open(snap_path, newline="", encoding="utf-8-sig") as f:
+                    for row in csv.DictReader(f):
+                        snapshot_rows += 1
+                        px=to_float(row.get("price",0))
+                        if px>0: prices.append(px)
+            if os.path.exists(candle_path):
+                with open(candle_path, newline="", encoding="utf-8-sig") as f:
+                    candle_rows=sum(1 for _ in csv.DictReader(f))
+        except Exception:
+            pass
+        price_age=data_age_seconds(cap.get("price_timestamp",{}).get(sym))
+        ob_age=data_age_seconds(cap.get("latest_orderbook",{}).get(sym,{}).get("timestamp"))
+        tr_age=data_age_seconds(cap.get("latest_trade",{}).get(sym,{}).get("timestamp"))
+        reasons=[]
+        if not prices: reasons.append("MISSING_PRICE")
+        if candle_rows == 0: reasons.append("MISSING_1M")
+        if price_age > MAX_PRICE_AGE_SEC: reasons.append("STALE_PRICE")
+        if ob_age > MAX_ORDERBOOK_AGE_SEC: reasons.append("STALE_ORDERBOOK")
+        status="OK" if not reasons else "|".join(reasons)
+        write_row(data_quality_audit_path(), headers, {
+            "time": now_text(), "date": today(), "symbol": sym, "name": name_of(sym),
+            "snapshot_rows": snapshot_rows, "candle_rows": candle_rows,
+            "unique_prices": len(set(prices)), "first_price": prices[0] if prices else 0,
+            "low": min(prices) if prices else 0, "high": max(prices) if prices else 0,
+            "last_price": prices[-1] if prices else 0, "price_age_sec": round(price_age,1),
+            "orderbook_age_sec": round(ob_age,1), "trade_age_sec": round(tr_age,1),
+            "status": status, "reason": ",".join(reasons),
+        })
 
 def capture_market_investor_data():
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
@@ -5182,6 +5328,15 @@ def maybe_capture_toss_market_data():
         if now_ts - to_float(state.get("last_investor_ts", 0)) >= MARKET_DATA_INVESTOR_SEC:
             capture_market_investor_data()
             state["last_investor_ts"] = now_ts
+        if now_ts - to_float(state.get("last_daily_ts", 0)) >= MARKET_DATA_DAILY_REFRESH_SEC:
+            capture_daily_candles_all26()
+            state["last_daily_ts"] = now_ts
+        if now_ts - to_float(state.get("last_metadata_ts", 0)) >= MARKET_DATA_METADATA_REFRESH_SEC:
+            capture_stock_metadata_all26()
+            state["last_metadata_ts"] = now_ts
+        if now_ts - to_float(state.get("last_audit_ts", 0)) >= MARKET_DATA_AUDIT_SEC:
+            write_data_quality_audit_all26()
+            state["last_audit_ts"] = now_ts
         state["status"] = "정상"
     except Exception as e:
         state["errors"] = to_int(state.get("errors", 0)) + 1
@@ -5999,15 +6154,17 @@ def print_v431_selfcheck():
     print(" paper_only_mode=", PAPER_ONLY_MODE, flush=True)
     print(" real_order_enabled=", ENABLE_REAL_ORDER, flush=True)
     print(" paper_accounts=", len(MULTI_AI_IDS), flush=True)
+    print(" all26_equal_capture=", len(ALL26_SYMBOLS) == 26, "symbols=", len(ALL26_SYMBOLS), flush=True)
+    print(" legacy_profit_strategy_registry=", LEGACY_PROFIT_STRATEGY_REGISTRY, flush=True)
     print(" groups=", {g:sum(1 for x in MULTI_AI_IDS if MULTI_AI_GROUP[x]==g) for g in set(MULTI_AI_GROUP.values())}, flush=True)
     print(" universes=", {u:sum(1 for x in MULTI_AI_IDS if MULTI_AI_UNIVERSE[x]==u) for u in set(MULTI_AI_UNIVERSE.values())}, flush=True)
     print(" full_market_universe_count=", len(universe), flush=True)
     print(" full_market_scanner_ready=", bool(universe) and ENABLE_FULL_MARKET_SCANNER, flush=True)
     print(" protected_real_symbols=", sorted(PROTECTED_REAL_SYMBOLS), flush=True)
-    if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER:
-        raise RuntimeError("V4.33 안전차단 실패: PAPER_ONLY_MODE=true, ENABLE_REAL_ORDER=false 필요")
-    if len(MULTI_AI_IDS) != 75:
-        raise RuntimeError("V4.33 계좌 수 오류: 75개가 아님")
+    if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER or ENABLE_REAL_AUTO_BUY or ENABLE_REAL_AUTO_SELL:
+        raise RuntimeError("V4.36 안전차단 실패: 실제 주문/자동매수/자동매도 모두 OFF 필요")
+    if len(ALL26_SYMBOLS) != 26:
+        raise RuntimeError(f"V4.36 감시종목 수 오류: {len(ALL26_SYMBOLS)}개 (26개 필요)")
     if not universe:
         print(" WARNING: 토스 /api/v1/rankings에서 전체시장 후보를 받지 못해 G01~G05는 대기합니다.", flush=True)
 
