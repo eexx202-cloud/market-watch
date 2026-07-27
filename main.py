@@ -46,7 +46,7 @@ ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAX_BUY_RATIO = float(os.environ.get("MAX_BUY_RATIO", "0.70"))
 VIRTUAL_BASE_CASH = int(float(os.environ.get("VIRTUAL_BASE_CASH", "10000000")))
 
-# 75개 독립 가상계좌
+# 90개 독립 가상계좌
 # 1그룹 고정전략: RI01~RI15(삼성·하이닉스 포함), RE01~RE15(제외)
 # 2그룹 순방향: WI01~WI15(삼성·하이닉스 포함), WE01~WE15(제외)
 # 3그룹 전체시장: G01~G05 기존 방식 유지
@@ -287,7 +287,10 @@ MARKET_DATA_METADATA_SYMBOLS = ALL26_SYMBOLS.copy()
 MARKET_DATA_DAILY_REFRESH_SEC = int(os.environ.get("MARKET_DATA_DAILY_REFRESH_SEC", "1800"))
 MARKET_DATA_METADATA_REFRESH_SEC = int(os.environ.get("MARKET_DATA_METADATA_REFRESH_SEC", "21600"))
 MARKET_DATA_AUDIT_SEC = int(os.environ.get("MARKET_DATA_AUDIT_SEC", "300"))
-MARKET_DATA_DAILY_COUNT = int(os.environ.get("MARKET_DATA_DAILY_COUNT", "250"))
+# 토스 일봉 count 허용범위는 최대 200. 환경변수 오입력도 시작 시 강제 보정한다.
+MARKET_DATA_DAILY_COUNT = max(1, min(200, int(os.environ.get("MARKET_DATA_DAILY_COUNT", "200"))))
+# 26종목 동일 수집 중 429를 줄이기 위한 호출 간 최소 간격.
+MARKET_DATA_REQUEST_GAP_SEC = max(0.0, float(os.environ.get("MARKET_DATA_REQUEST_GAP_SEC", "0.12")))
 
 # 과거 큰 수익 결과가 나왔던 전략군을 삭제하지 않고 기존 독립계좌에 태그로 보존한다.
 # 정확한 원 규칙이 확인되지 않은 전략은 새 규칙으로 가장하지 않고 RESTORE_REQUIRED로 표시한다.
@@ -318,7 +321,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_38_ALL_AGREED_STRATEGIES_90_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_39_DATA_SAFE_90_STRATEGIES_UNCHANGED_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -1430,7 +1433,7 @@ def api_get(path, params=None, account=False, timeout=10):
                     continue
             if r.status_code == 429:
                 retry_after = to_float(r.headers.get("Retry-After", 0), 0)
-                wait = max(0.25, retry_after, (2 ** attempt) * 0.35)
+                wait = max(1.0, retry_after, float(2 ** attempt))
                 write_row(raw_api_error_path(), ["time","method","path","status","attempt","response"], {
                     "time": now_text(), "method": "GET", "path": path, "status": 429,
                     "attempt": attempt + 1, "response": str(data)[:1000],
@@ -1855,7 +1858,11 @@ def get_sellable_quantity(sym, force=False):
     if code == 200:
         qty = parse_sellable_qty(data)
     else:
-        # 429/일시 오류면 기존 캐시를 먼저 쓰고, 없으면 보유수량으로 fallback.
+        # 실제 매도 직전(force=True) 조회 실패 시 추정 수량으로 주문하지 않는다.
+        if force:
+            set_error(f"매도가능수량 조회 실패 {sym}: HTTP {code}; 실제 매도 차단")
+            return 0
+        # 화면 표시/일반 감시에서는 기존 캐시를 우선 사용하고, 없으면 보유수량을 표시용으로만 사용한다.
         qty = to_float(cache.get("qty", 0)) if isinstance(cache, dict) else 0
         if qty <= 0:
             qty = holding_qty
@@ -5403,6 +5410,11 @@ def _result_dict(data):
     result = data.get("result", data)
     return result if isinstance(result, dict) else {}
 
+def _market_data_request_gap():
+    """26종목 동등 수집 중 API 요청 폭주를 막는다."""
+    if MARKET_DATA_REQUEST_GAP_SEC > 0:
+        time.sleep(MARKET_DATA_REQUEST_GAP_SEC)
+
 def capture_candles_1m():
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
         return
@@ -5415,6 +5427,7 @@ def capture_candles_1m():
             "count": max(1, min(10, MARKET_DATA_CANDLE_COUNT)),
             "adjusted": "true",
         }, timeout=10)
+        _market_data_request_gap()
         if code != 200:
             continue
         result = _result_dict(data)
@@ -5443,6 +5456,7 @@ def capture_candles_1m():
         code, data = api_get(f"/api/v1/market-indicators/{sym}/candles", params={
             "interval": "1m", "count": max(1, min(10, MARKET_DATA_CANDLE_COUNT))
         }, timeout=10)
+        _market_data_request_gap()
         if code != 200:
             continue
         result = _result_dict(data)
@@ -5478,6 +5492,7 @@ def capture_orderbook_and_trades():
     tr_headers = ["saved_at", "symbol", "timestamp", "price", "volume", "currency"]
     for sym in MARKET_DATA_ORDERFLOW_SYMBOLS:
         code, data = api_get("/api/v1/orderbook", params={"symbol": sym}, timeout=8)
+        _market_data_request_gap()
         if code == 200:
             result = _result_dict(data)
             asks = result.get("asks", []) if isinstance(result.get("asks", []), list) else []
@@ -5506,6 +5521,7 @@ def capture_orderbook_and_trades():
         code, data = api_get("/api/v1/trades", params={
             "symbol": sym, "count": max(1, min(50, MARKET_DATA_TRADE_COUNT))
         }, timeout=8)
+        _market_data_request_gap()
         if code != 200:
             continue
         result = data.get("result", []) if isinstance(data, dict) else []
@@ -5541,8 +5557,9 @@ def capture_daily_candles_all26():
     for sym in MARKET_DATA_DAILY_SYMBOLS:
         code, data = api_get("/api/v1/candles", params={
             "symbol": sym, "interval": "1d",
-            "count": max(10, min(500, MARKET_DATA_DAILY_COUNT)), "adjusted": "true",
+            "count": MARKET_DATA_DAILY_COUNT, "adjusted": "true",
         }, timeout=12)
+        _market_data_request_gap()
         if code != 200:
             continue
         result = _result_dict(data)
@@ -5574,8 +5591,11 @@ def capture_stock_metadata_all26():
     headers = ["saved_at","symbol","name","stock_http","warning_http","limits_http","stock_json","warning_json","limits_json"]
     for sym in MARKET_DATA_METADATA_SYMBOLS:
         c1, d1 = api_get("/api/v1/stocks", params={"symbols": sym}, timeout=8)
+        _market_data_request_gap()
         c2, d2 = api_get(f"/api/v1/stocks/{sym}/warnings", timeout=8)
+        _market_data_request_gap()
         c3, d3 = api_get("/api/v1/price-limits", params={"symbol": sym}, timeout=8)
+        _market_data_request_gap()
         write_row(stock_metadata_path(sym), headers, {
             "saved_at": now_text(), "symbol": sym, "name": name_of(sym),
             "stock_http": c1, "warning_http": c2, "limits_http": c3,
@@ -6237,7 +6257,7 @@ function showAiGroup(g,btn){{document.querySelectorAll('.ai-group').forEach(x=>x
         profitable=sum(1 for x in states if to_float(x.get("profit_rate",0))>0)
         best=max(((to_float(st.get("profit_rate",0)),aid) for aid,st in zip(MULTI_AI_IDS,states)),default=(0,""))
         worst=min(((to_float(st.get("profit_rate",0)),aid) for aid,st in zip(MULTI_AI_IDS,states)),default=(0,""))
-        return f"""<div class='card'><h2>75개 가상전략 요약</h2><div class='summary-grid'>
+        return f"""<div class='card'><h2>{len(MULTI_AI_IDS)}개 가상전략 요약</h2><div class='summary-grid'>
         <div class='metric small'>총 가상자산<b>{fmt_won(total_asset)}</b></div><div class='metric small'>통합수익률<b class='{color_class(total_asset-total_start)}'>{pct(total_asset,total_start):+.2f}%</b></div>
         <div class='metric small'>보유 계좌<b>{active}개</b></div><div class='metric small'>수익 계좌<b>{profitable}개</b></div></div>
         <div class='small'>최고 <span class='green'>{best[1]} {best[0]:+.2f}%</span> / 최저 <span class='red'>{worst[1]} {worst[0]:+.2f}%</span></div>
@@ -6520,6 +6540,8 @@ def print_v431_selfcheck():
     print(" paper_only_mode=", PAPER_ONLY_MODE, flush=True)
     print(" real_order_enabled=", ENABLE_REAL_ORDER, flush=True)
     print(" paper_accounts=", len(MULTI_AI_IDS), flush=True)
+    print(" daily_candle_count=", MARKET_DATA_DAILY_COUNT, flush=True)
+    print(" market_data_request_gap_sec=", MARKET_DATA_REQUEST_GAP_SEC, flush=True)
     print(" all26_equal_capture=", len(ALL26_SYMBOLS) == 26, "symbols=", len(ALL26_SYMBOLS), flush=True)
     print(" legacy_profit_strategy_registry=", LEGACY_PROFIT_STRATEGY_REGISTRY, flush=True)
     print(" groups=", {g:sum(1 for x in MULTI_AI_IDS if MULTI_AI_GROUP[x]==g) for g in set(MULTI_AI_GROUP.values())}, flush=True)
@@ -6530,7 +6552,11 @@ def print_v431_selfcheck():
     if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER or ENABLE_REAL_AUTO_BUY or ENABLE_REAL_AUTO_SELL:
         raise RuntimeError("V4.36 안전차단 실패: 실제 주문/자동매수/자동매도 모두 OFF 필요")
     if len(ALL26_SYMBOLS) != 26:
-        raise RuntimeError(f"V4.36 감시종목 수 오류: {len(ALL26_SYMBOLS)}개 (26개 필요)")
+        raise RuntimeError(f"V4.39 감시종목 수 오류: {len(ALL26_SYMBOLS)}개 (26개 필요)")
+    if len(MULTI_AI_IDS) != 90:
+        raise RuntimeError(f"V4.39 가상전략 수 오류: {len(MULTI_AI_IDS)}개 (90개 필요)")
+    if MARKET_DATA_DAILY_COUNT < 1 or MARKET_DATA_DAILY_COUNT > 200:
+        raise RuntimeError(f"V4.39 일봉 count 오류: {MARKET_DATA_DAILY_COUNT} (1~200 필요)")
     if not universe:
         print(" WARNING: 토스 /api/v1/rankings에서 전체시장 후보를 받지 못해 G01~G05는 대기합니다.", flush=True)
 
