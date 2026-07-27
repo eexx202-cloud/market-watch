@@ -321,7 +321,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_39_DATA_SAFE_90_STRATEGIES_UNCHANGED_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_40_CALENDAR_STATUS_FIXED_90_STRATEGIES_UNCHANGED_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -815,6 +815,29 @@ def refresh_kr_market_calendar(force=False):
         "regular_end": str(regular.get("endTime", "")) if isinstance(regular, dict) else "",
         "auction_start": str(regular.get("singlePriceAuctionStartTime", "")) if isinstance(regular, dict) else "",
     }
+
+    # 캘린더 조회 직후 상태를 즉시 갱신한다.
+    # 장 마감 후에도 NOT_CHECKED가 남아 사용자가 오류로 오해하는 문제를 방지한다.
+    cal = state["calendar"]
+    if not cal.get("date") or cal.get("date") != today():
+        state["gate_ok"] = False
+        state["gate_reason"] = "CALENDAR_NOT_TODAY"
+    elif not cal.get("is_business_day"):
+        state["gate_ok"] = False
+        state["gate_reason"] = "MARKET_CLOSED"
+    else:
+        start = parse_api_datetime(cal.get("regular_start"))
+        end = parse_api_datetime(cal.get("regular_end"))
+        if not start or not end:
+            state["gate_ok"] = False
+            state["gate_reason"] = "REGULAR_SESSION_MISSING"
+        elif not (start <= now_kst() <= end):
+            state["gate_ok"] = False
+            state["gate_reason"] = "OUTSIDE_REGULAR_SESSION"
+        else:
+            # 정규장 중에는 가격·호가 신선도 검사가 끝날 때까지 대기 상태로 둔다.
+            state["gate_ok"] = False
+            state["gate_reason"] = "WAITING_FRESH_DATA"
     return True
 
 def regular_market_open_now():
