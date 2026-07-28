@@ -10,6 +10,9 @@ import uuid
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
+import hashlib
+import random
+from collections import defaultdict
 
 import requests
 import pytz
@@ -35,8 +38,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # V4.24 기본 운용은 완전 가상실전이다. PAPER_ONLY_MODE=true이면
 # Render 환경변수가 실수로 켜져 있어도 실제 주문 API를 호출하지 않는다.
-PAPER_ONLY_MODE = os.environ.get("PAPER_ONLY_MODE", "true").lower() == "true"
-ENABLE_REAL_ORDER = (os.environ.get("ENABLE_REAL_ORDER", "false").lower() == "true") and (not PAPER_ONLY_MODE)
+# V4.41 안전 고정: 이 빌드는 데이터 수집·가상매매 전용이다.
+# 환경변수 오입력으로도 실제 주문을 켤 수 없다.
+PAPER_ONLY_MODE = True
+ENABLE_REAL_ORDER = False
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
 ENABLE_PAPER_AUTO = os.environ.get("ENABLE_PAPER_AUTO", "true").lower() == "true"
 NEWS_REFRESH_SEC = int(os.environ.get("NEWS_REFRESH_SEC", "600"))
@@ -292,6 +297,66 @@ MARKET_DATA_DAILY_COUNT = max(1, min(200, int(os.environ.get("MARKET_DATA_DAILY_
 # 26종목 동일 수집 중 429를 줄이기 위한 호출 간 최소 간격.
 MARKET_DATA_REQUEST_GAP_SEC = max(0.0, float(os.environ.get("MARKET_DATA_REQUEST_GAP_SEC", "0.12")))
 
+
+# ============================================================
+# V4.41 토스 공식 API 기반 KR/US 공통 데이터 보존·재생 준비
+# - 공식 OpenAPI 1.2.5: REST, prices 최대 200, candles 1m/1d,
+#   orderbook/trades 종목별, KR/US calendar, KRW/USD exchange-rate
+# - 미국은 우선 데이터 수집만. 가상/실주문 OFF.
+# ============================================================
+TOSS_OPENAPI_SPEC_VERSION = "1.2.5"
+ENABLE_RAW_API_CAPTURE = os.environ.get("ENABLE_RAW_API_CAPTURE", "true").lower() == "true"
+RAW_API_MAX_BODY_CHARS = int(os.environ.get("RAW_API_MAX_BODY_CHARS", "2000000"))
+US_DATA_ENABLED = os.environ.get("US_DATA_ENABLED", "true").lower() == "true"
+US_PAPER_TRADING_ENABLED = False
+US_REAL_ORDER_ENABLED = False
+US_PRICE_INTERVAL_REGULAR_SEC = int(os.environ.get("US_PRICE_INTERVAL_REGULAR_SEC", "5"))
+US_PRICE_INTERVAL_EXTENDED_SEC = int(os.environ.get("US_PRICE_INTERVAL_EXTENDED_SEC", "10"))
+US_CANDLE_INTERVAL_SEC = int(os.environ.get("US_CANDLE_INTERVAL_SEC", "60"))
+US_ORDERFLOW_ROTATION_GAP_SEC = max(0.12, float(os.environ.get("US_ORDERFLOW_ROTATION_GAP_SEC", "0.18")))
+US_STOCK_INFO_REFRESH_SEC = int(os.environ.get("US_STOCK_INFO_REFRESH_SEC", "21600"))
+US_FX_REFRESH_SEC = int(os.environ.get("US_FX_REFRESH_SEC", "60"))
+US_CALENDAR_REFRESH_SEC = int(os.environ.get("US_CALENDAR_REFRESH_SEC", "1800"))
+US_CANDLE_COUNT = max(2, min(10, int(os.environ.get("US_CANDLE_COUNT", "3"))))
+US_TRADE_COUNT = max(1, min(50, int(os.environ.get("US_TRADE_COUNT", "20"))))
+
+# 고정 매매목록이 아니라 데이터 연구 후보군. 시작 시 토스 API 지원 여부를 검증한다.
+US_CANDIDATE_SYMBOLS = list(dict.fromkeys([
+    # 시장 대표
+    "SPY","QQQ","DIA","IWM","VTI","RSP","MDY","IWC",
+    # 나스닥/S&P 방향성
+    "QLD","TQQQ","PSQ","QID","SQQQ","SSO","SPXL","SH","SPXS",
+    # 반도체
+    "SOXX","SMH","XSD","SOXL","SOXS","USD","SSG","PSI",
+    # 11개 업종
+    "XLK","XLC","XLY","XLP","XLF","XLV","XLI","XLE","XLB","XLU","XLRE",
+    # 채권·금리
+    "SHY","IEF","TLT","BIL","HYG","LQD","TIP","TMF",
+    # 원자재·달러
+    "GLD","SLV","USO","UNG","DBA","UUP","UDN",
+    # 대표 개별주
+    "NVDA","AMD","AVGO","INTC","TSM","AAPL","MSFT","AMZN","GOOGL","META","TSLA","JPM","XOM","LLY","WMT","UNH",
+]))
+
+# API 그룹별 실제 응답 헤더를 기록하고, 429 시 그룹만 감속한다.
+RATE_GROUP_BY_PATH = {
+    "/api/v1/prices": "MARKET_DATA",
+    "/api/v1/orderbook": "MARKET_DATA",
+    "/api/v1/trades": "MARKET_DATA",
+    "/api/v1/price-limits": "MARKET_DATA",
+    "/api/v1/candles": "MARKET_DATA_CHART",
+    "/api/v1/stocks": "STOCK",
+    "/api/v1/rankings": "RANKING",
+    "/api/v1/exchange-rate": "MARKET_INFO",
+    "/api/v1/market-calendar/KR": "MARKET_INFO",
+    "/api/v1/market-calendar/US": "MARKET_INFO",
+}
+API_CALL_LOCK = threading.RLock()
+TOKEN_REFRESH_LOCK = threading.RLock()
+INGEST_LOCK = threading.RLock()
+INGEST_SEQ = 0
+RATE_STATE = defaultdict(dict)
+
 # 과거 큰 수익 결과가 나왔던 전략군을 삭제하지 않고 기존 독립계좌에 태그로 보존한다.
 # 정확한 원 규칙이 확인되지 않은 전략은 새 규칙으로 가장하지 않고 RESTORE_REQUIRED로 표시한다.
 LEGACY_PROFIT_STRATEGY_REGISTRY = {
@@ -321,7 +386,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_40_CALENDAR_STATUS_FIXED_90_STRATEGIES_UNCHANGED_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_41_TOSS_OFFICIAL_KR_US_REPLAY_READY_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -643,6 +708,21 @@ S = {
         "calendar_checked_at": 0,
         "gate_ok": False,
         "gate_reason": "NOT_CHECKED",
+        "status": "대기",
+        "errors": 0,
+    },
+    "us_market_data": {
+        "verified_symbols": [],
+        "rejected_symbols": {},
+        "calendar": {},
+        "calendar_checked_at": 0,
+        "session": "CLOSED",
+        "fx": {},
+        "last_fx_ts": 0,
+        "last_info_ts": 0,
+        "last_price_ts": 0,
+        "last_candle_ts": 0,
+        "orderflow_cursor": 0,
         "status": "대기",
         "errors": 0,
     },
@@ -989,6 +1069,80 @@ def data_quality_audit_path():
 
 def raw_api_error_path():
     return os.path.join(market_data_dir(), f"api_errors_{today()}.csv")
+
+
+def raw_market_dir(market="KR"):
+    path = os.path.join(day_dir(), "raw", str(market).upper())
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def normalized_market_dir(market="KR"):
+    path = os.path.join(day_dir(), "normalized", str(market).upper())
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _next_ingest_seq():
+    global INGEST_SEQ
+    with INGEST_LOCK:
+        INGEST_SEQ += 1
+        return INGEST_SEQ
+
+def _infer_market_from_params(params):
+    p = params or {}
+    symbols = str(p.get("symbols") or p.get("symbol") or "")
+    for sym in [x.strip() for x in symbols.split(",") if x.strip()]:
+        # 국내 토스 종목코드는 6자리 숫자뿐 아니라 0193T0 같은 영숫자 코드도 있다.
+        if sym in ALL or (len(sym) == 6 and sym[0].isdigit()):
+            continue
+        if sym.startswith("KR_") or sym in {"KOSPI", "KOSDAQ"}:
+            continue
+        return "US"
+    return "KR"
+
+def _safe_json_dump(data):
+    try:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        return json.dumps({"raw": str(data)}, ensure_ascii=False)
+
+def write_raw_api_event(method, path, params, status, data, requested_at, received_at, elapsed_ms, headers=None):
+    """원본 API 응답을 append-only JSONL로 보존한다."""
+    if not ENABLE_RAW_API_CAPTURE:
+        return ""
+    market = _infer_market_from_params(params)
+    seq = _next_ingest_seq()
+    raw_id = f"{today()}-{seq:012d}-{uuid.uuid4().hex[:10]}"
+    body = _safe_json_dump(data)
+    if len(body) > RAW_API_MAX_BODY_CHARS:
+        body = body[:RAW_API_MAX_BODY_CHARS] + "...TRUNCATED"
+    row = {
+        "raw_id": raw_id,
+        "ingest_seq": seq,
+        "method": method,
+        "path": path,
+        "params": params or {},
+        "status": status,
+        "requested_at": requested_at,
+        "received_at": received_at,
+        "saved_at": now_text(),
+        "elapsed_ms": round(float(elapsed_ms), 3),
+        "rate_limit": {
+            "limit": (headers or {}).get("X-RateLimit-Limit", ""),
+            "remaining": (headers or {}).get("X-RateLimit-Remaining", ""),
+            "reset": (headers or {}).get("X-RateLimit-Reset", ""),
+            "retry_after": (headers or {}).get("Retry-After", ""),
+        },
+        "body": body,
+    }
+    filepath = os.path.join(raw_market_dir(market), f"api_{today()}.jsonl")
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with LOCK:
+        S.setdefault("last_api_meta", {})[(path, str(params or {}))] = {
+            "raw_id": raw_id, "ingest_seq": seq, "requested_at": requested_at,
+            "received_at": received_at, "elapsed_ms": elapsed_ms,
+        }
+    return raw_id
 
 def write_row(path, headers, row):
     try:
@@ -1376,6 +1530,10 @@ def send_alert_once(key, sym, title):
 # ============================================================
 
 def get_token():
+    with TOKEN_REFRESH_LOCK:
+        return _get_token_locked()
+
+def _get_token_locked():
     if not CLIENT_ID or not CLIENT_SECRET:
         set_status("토스 키 없음")
         return ""
@@ -1442,32 +1600,54 @@ def _is_invalid_token(status_code, data):
     return "invalid-token" in text or "invalid_token" in text or "유효하지 않은 토큰" in text or status_code == 401
 
 def api_get(path, params=None, account=False, timeout=10):
-    """토스 GET 공통 호출. 401은 토큰 재발급, 429/5xx는 짧은 백오프로 재시도한다."""
+    """토스 GET 공통 호출.
+    - 401: 단일 토큰 재발급 후 재시도
+    - 429: Retry-After + 지수 백오프 + jitter
+    - 모든 호출: 요청/수신/저장시각, rate-limit 헤더, 원본 응답 보존
+    기존 호출부 호환을 위해 (status_code, data) 2개만 반환한다.
+    """
     last_data = {}
-    for attempt in range(3):
+    group = RATE_GROUP_BY_PATH.get(path, "OTHER")
+    for attempt in range(4):
+        requested_at = now_kst().isoformat()
+        t0 = time.time()
         try:
             r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
+            received_at = now_kst().isoformat()
+            elapsed_ms = (time.time() - t0) * 1000.0
             data = _json_or_raw(r)
             last_data = data
+            raw_id = write_raw_api_event("GET", path, params or {}, r.status_code, data,
+                                         requested_at, received_at, elapsed_ms, dict(r.headers))
+            RATE_STATE[group] = {
+                "status": r.status_code,
+                "limit": r.headers.get("X-RateLimit-Limit", ""),
+                "remaining": r.headers.get("X-RateLimit-Remaining", ""),
+                "reset": r.headers.get("X-RateLimit-Reset", ""),
+                "retry_after": r.headers.get("Retry-After", ""),
+                "updated_at": received_at,
+                "raw_id": raw_id,
+            }
             if _is_invalid_token(r.status_code, data):
                 clear_token()
-                if attempt < 2:
-                    time.sleep(0.25)
+                if attempt < 3:
+                    time.sleep(0.35 + random.random() * 0.2)
                     continue
             if r.status_code == 429:
                 retry_after = to_float(r.headers.get("Retry-After", 0), 0)
-                wait = max(1.0, retry_after, float(2 ** attempt))
+                reset = to_float(r.headers.get("X-RateLimit-Reset", 0), 0)
+                wait = max(1.0, retry_after, reset, float(2 ** attempt)) + random.uniform(0.05, 0.35)
                 write_row(raw_api_error_path(), ["time","method","path","status","attempt","response"], {
                     "time": now_text(), "method": "GET", "path": path, "status": 429,
                     "attempt": attempt + 1, "response": str(data)[:1000],
                 })
-                if attempt < 2:
+                if attempt < 3:
                     time.sleep(wait)
                     continue
-                set_status(f"토스 요청 제한 대기: {path}")
+                set_status(f"토스 요청 제한 대기: {group}")
                 return r.status_code, data
-            if r.status_code >= 500 and attempt < 2:
-                time.sleep((2 ** attempt) * 0.5)
+            if r.status_code >= 500 and attempt < 3:
+                time.sleep((2 ** attempt) * 0.5 + random.uniform(0.05, 0.25))
                 continue
             if r.status_code >= 400:
                 write_row(raw_api_error_path(), ["time","method","path","status","attempt","response"], {
@@ -1477,9 +1657,13 @@ def api_get(path, params=None, account=False, timeout=10):
                 set_error(f"GET {path} {r.status_code}: {str(data)[:300]}")
             return r.status_code, data
         except Exception as e:
+            received_at = now_kst().isoformat()
+            elapsed_ms = (time.time() - t0) * 1000.0
             last_data = {"error": str(e)}
-            if attempt < 2:
-                time.sleep((2 ** attempt) * 0.5)
+            write_raw_api_event("GET", path, params or {}, 0, last_data,
+                                requested_at, received_at, elapsed_ms, {})
+            if attempt < 3:
+                time.sleep((2 ** attempt) * 0.5 + random.uniform(0.05, 0.25))
                 continue
             set_error(f"GET {path} 예외: {e}")
     return 0, last_data
@@ -5990,6 +6174,183 @@ def loop():
             set_error(f"루프 오류: {e}")
         time.sleep(max(10, REFRESH_SEC))
 
+
+# ============================================================
+# V4.41 미국시장 데이터 수집 (데이터 전용, 가상/실주문 OFF)
+# ============================================================
+def us_data_path(kind, symbol=""):
+    suffix = f"_{symbol}" if symbol else ""
+    return os.path.join(normalized_market_dir("US"), f"{kind}{suffix}_{today()}.csv")
+
+def refresh_us_market_calendar(force=False):
+    st = S.setdefault("us_market_data", {})
+    if (not force) and time.time() - to_float(st.get("calendar_checked_at", 0)) < US_CALENDAR_REFRESH_SEC:
+        return bool(st.get("calendar"))
+    code, data = api_get("/api/v1/market-calendar/US", params={}, timeout=10)
+    st["calendar_checked_at"] = time.time()
+    if code != 200:
+        st["calendar"] = {}
+        st["status"] = f"US_CALENDAR_HTTP_{code}"
+        return False
+    result = _result_dict(data)
+    ti = result.get("today", {}) if isinstance(result, dict) else {}
+    st["calendar"] = ti if isinstance(ti, dict) else {}
+    st["status"] = "US_CALENDAR_OK"
+    return True
+
+def _session_window(info, key):
+    v = info.get(key) if isinstance(info, dict) else None
+    if not isinstance(v, dict):
+        return None, None
+    return parse_api_datetime(v.get("startTime")), parse_api_datetime(v.get("endTime"))
+
+def current_us_session():
+    refresh_us_market_calendar(False)
+    info = S.setdefault("us_market_data", {}).get("calendar", {})
+    n = now_kst()
+    for key, label in [("dayMarket","DAY"),("preMarket","PRE"),("regularMarket","REGULAR"),("afterMarket","AFTER")]:
+        start, end = _session_window(info, key)
+        if start and end and start <= n <= end:
+            S["us_market_data"]["session"] = label
+            return label
+    S["us_market_data"]["session"] = "CLOSED"
+    return "CLOSED"
+
+def capture_us_fx():
+    st = S.setdefault("us_market_data", {})
+    if time.time() - to_float(st.get("last_fx_ts", 0)) < US_FX_REFRESH_SEC:
+        return
+    code, data = api_get("/api/v1/exchange-rate", params={"baseCurrency":"USD","quoteCurrency":"KRW"}, timeout=10)
+    st["last_fx_ts"] = time.time()
+    if code != 200:
+        return
+    result = data.get("result", data) if isinstance(data, dict) else {}
+    st["fx"] = result
+    write_row(us_data_path("exchange_rate"),
+              ["saved_at","session","base_currency","quote_currency","rate","raw"],
+              {"saved_at":now_text(),"session":current_us_session(),
+               "base_currency":result.get("baseCurrency", "KRW") if isinstance(result,dict) else "",
+               "quote_currency":result.get("quoteCurrency", "USD") if isinstance(result,dict) else "",
+               "rate":result.get("rate", "") if isinstance(result,dict) else "",
+               "raw":_safe_json_dump(result)})
+
+def verify_us_symbols(force=False):
+    st = S.setdefault("us_market_data", {})
+    if st.get("verified_symbols") and (not force) and time.time() - to_float(st.get("last_info_ts",0)) < US_STOCK_INFO_REFRESH_SEC:
+        return list(st.get("verified_symbols", []))
+    verified=[]; rejected={}
+    # /stocks는 공식 종목정보 엔드포인트. 심볼별 실제 지원 여부는 prices/candles 호출로 재확인한다.
+    for sym in US_CANDIDATE_SYMBOLS:
+        code_p, data_p = api_get("/api/v1/prices", params={"symbols":sym}, timeout=10)
+        time.sleep(0.12)
+        code_c, data_c = api_get("/api/v1/candles", params={"symbol":sym,"interval":"1m","count":2,"adjusted":"true"}, timeout=10)
+        time.sleep(0.12)
+        ok = code_p == 200 and code_c == 200
+        if ok:
+            verified.append(sym)
+        else:
+            rejected[sym] = {"prices":code_p,"candles_1m":code_c}
+        write_row(us_data_path("symbol_registry"),
+                  ["verified_at","symbol","market","currency","price_supported","candle_1m_supported","enabled","reason"],
+                  {"verified_at":now_text(),"symbol":sym,"market":"US","currency":"USD",
+                   "price_supported":code_p==200,"candle_1m_supported":code_c==200,
+                   "enabled":ok,"reason":"" if ok else str(rejected[sym])})
+    st["verified_symbols"] = verified
+    st["rejected_symbols"] = rejected
+    st["last_info_ts"] = time.time()
+    st["status"] = f"US_VERIFIED_{len(verified)}"
+    return verified
+
+def capture_us_prices():
+    syms = verify_us_symbols(False)
+    if not syms:
+        return
+    code, data = api_get("/api/v1/prices", params={"symbols":",".join(syms[:200])}, timeout=20)
+    if code != 200:
+        return
+    result = data.get("result", []) if isinstance(data,dict) else []
+    if not isinstance(result,list):
+        return
+    session=current_us_session()
+    headers=["saved_at","session","symbol","timestamp","last_price","currency"]
+    for p in result:
+        if not isinstance(p,dict): continue
+        write_row(us_data_path("prices"), headers, {
+            "saved_at":now_text(),"session":session,"symbol":p.get("symbol",""),
+            "timestamp":p.get("timestamp",""),"last_price":p.get("lastPrice",0),
+            "currency":p.get("currency","USD")})
+    S["us_market_data"]["last_price_ts"] = time.time()
+
+def capture_us_candles():
+    syms=verify_us_symbols(False)
+    session=current_us_session()
+    headers=["saved_at","session","symbol","timestamp","open","high","low","close","volume","currency"]
+    for sym in syms:
+        code,data=api_get("/api/v1/candles",params={"symbol":sym,"interval":"1m","count":US_CANDLE_COUNT,"adjusted":"true"},timeout=12)
+        time.sleep(0.22)
+        if code!=200: continue
+        result=_result_dict(data); candles=result.get("candles",[]) if isinstance(result,dict) else []
+        for c in reversed(candles if isinstance(candles,list) else []):
+            if not isinstance(c,dict): continue
+            write_row(us_data_path("candles_1m",sym),headers,{
+                "saved_at":now_text(),"session":session,"symbol":sym,"timestamp":c.get("timestamp",""),
+                "open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),
+                "close":c.get("closePrice",0),"volume":c.get("volume",0),"currency":c.get("currency","USD")})
+    S["us_market_data"]["last_candle_ts"] = time.time()
+
+def capture_us_orderflow_slice(max_symbols=4):
+    syms=verify_us_symbols(False)
+    if not syms: return
+    st=S.setdefault("us_market_data",{}); cur=int(st.get("orderflow_cursor",0))%len(syms)
+    selected=[syms[(cur+i)%len(syms)] for i in range(min(max_symbols,len(syms)))]
+    st["orderflow_cursor"]=(cur+len(selected))%len(syms)
+    session=current_us_session()
+    for sym in selected:
+        code,data=api_get("/api/v1/orderbook",params={"symbol":sym},timeout=10)
+        if code==200:
+            result=_result_dict(data)
+            write_row(us_data_path("orderbook",sym),["saved_at","session","symbol","timestamp","currency","asks_json","bids_json"],{
+                "saved_at":now_text(),"session":session,"symbol":sym,"timestamp":result.get("timestamp",""),
+                "currency":result.get("currency","USD"),"asks_json":_safe_json_dump(result.get("asks",[])),
+                "bids_json":_safe_json_dump(result.get("bids",[]))})
+        time.sleep(US_ORDERFLOW_ROTATION_GAP_SEC)
+        code,data=api_get("/api/v1/trades",params={"symbol":sym,"count":US_TRADE_COUNT},timeout=10)
+        if code==200:
+            result=data.get("result",[]) if isinstance(data,dict) else []
+            for idx,t in enumerate(result if isinstance(result,list) else []):
+                if not isinstance(t,dict):continue
+                write_row(us_data_path("trades",sym),["saved_at","session","symbol","batch_index","timestamp","price","volume","currency"],{
+                    "saved_at":now_text(),"session":session,"symbol":sym,"batch_index":idx,
+                    "timestamp":t.get("timestamp",""),"price":t.get("price",0),"volume":t.get("volume",0),
+                    "currency":t.get("currency","USD")})
+        time.sleep(US_ORDERFLOW_ROTATION_GAP_SEC)
+
+def us_market_data_loop():
+    """미국 데이터 전용 루프. 주문·가상매매를 호출하지 않는다."""
+    while True:
+        try:
+            if not US_DATA_ENABLED:
+                time.sleep(60); continue
+            refresh_us_market_calendar(False)
+            capture_us_fx()
+            session=current_us_session()
+            if session != "CLOSED":
+                capture_us_prices()
+                if time.time()-to_float(S["us_market_data"].get("last_candle_ts",0)) >= US_CANDLE_INTERVAL_SEC:
+                    capture_us_candles()
+                capture_us_orderflow_slice(4)
+                wait=US_PRICE_INTERVAL_REGULAR_SEC if session=="REGULAR" else US_PRICE_INTERVAL_EXTENDED_SEC
+                time.sleep(max(2,wait))
+            else:
+                # 휴장/장외에는 종목 검증과 캘린더만 저빈도로 유지
+                verify_us_symbols(False)
+                time.sleep(60)
+        except Exception as e:
+            S.setdefault("us_market_data",{})["errors"] = int(S.setdefault("us_market_data",{}).get("errors",0))+1
+            S["us_market_data"]["status"] = f"ERROR {str(e)[:120]}"
+            set_error(f"미국 데이터 수집 오류: {e}")
+            time.sleep(15)
+
 # ============================================================
 # 웹 대시보드
 # ============================================================
@@ -6021,6 +6382,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.json_response({
                 "ok": True,
                 "version": OPERATING_VERSION,
+                "toss_openapi_spec_version": TOSS_OPENAPI_SPEC_VERSION,
+                "raw_api_capture": ENABLE_RAW_API_CAPTURE,
+                "us_data_enabled": US_DATA_ENABLED,
+                "us_paper_trading_enabled": US_PAPER_TRADING_ENABLED,
+                "us_real_order_enabled": US_REAL_ORDER_ENABLED,
+                "us_verified_symbol_count": len(S.get("us_market_data", {}).get("verified_symbols", [])),
+                "us_session": S.get("us_market_data", {}).get("session", "CLOSED"),
+                "rate_state": dict(RATE_STATE),
                 "paper_only_mode": PAPER_ONLY_MODE,
                 "market_safety_gate_enabled": ENABLE_MARKET_SAFETY_GATE,
                 "market_gate_ok": S.get("market_data_capture", {}).get("gate_ok", False),
@@ -6572,7 +6941,7 @@ def print_v431_selfcheck():
     print(" full_market_universe_count=", len(universe), flush=True)
     print(" full_market_scanner_ready=", bool(universe) and ENABLE_FULL_MARKET_SCANNER, flush=True)
     print(" protected_real_symbols=", sorted(PROTECTED_REAL_SYMBOLS), flush=True)
-    if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER or ENABLE_REAL_AUTO_BUY or ENABLE_REAL_AUTO_SELL:
+    if (not PAPER_ONLY_MODE) or ENABLE_REAL_ORDER or ENABLE_REAL_AUTO_BUY or ENABLE_REAL_AUTO_SELL or US_REAL_ORDER_ENABLED:
         raise RuntimeError("V4.36 안전차단 실패: 실제 주문/자동매수/자동매도 모두 OFF 필요")
     if len(ALL26_SYMBOLS) != 26:
         raise RuntimeError(f"V4.39 감시종목 수 오류: {len(ALL26_SYMBOLS)}개 (26개 필요)")
@@ -6588,4 +6957,6 @@ if __name__ == "__main__":
     print_operating_config()
     print("80억 프로젝트 실전 반자동 관제센터 시작:", PORT, flush=True)
     threading.Thread(target=loop, daemon=True).start()
+    if US_DATA_ENABLED:
+        threading.Thread(target=us_market_data_loop, daemon=True).start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
