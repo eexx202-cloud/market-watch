@@ -305,6 +305,8 @@ MARKET_DATA_REQUEST_GAP_SEC = max(0.0, float(os.environ.get("MARKET_DATA_REQUEST
 # - 미국은 우선 데이터 수집만. 가상/실주문 OFF.
 # ============================================================
 TOSS_OPENAPI_SPEC_VERSION = "1.2.5"
+TOSS_OPENAPI_SPEC_URL = "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json"
+US_EASTERN = pytz.timezone("America/New_York")
 ENABLE_RAW_API_CAPTURE = os.environ.get("ENABLE_RAW_API_CAPTURE", "true").lower() == "true"
 RAW_API_MAX_BODY_CHARS = int(os.environ.get("RAW_API_MAX_BODY_CHARS", "2000000"))
 US_DATA_ENABLED = os.environ.get("US_DATA_ENABLED", "true").lower() == "true"
@@ -403,7 +405,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_43_TOSS_OFFICIAL_KR_US_SESSION_STATE_FIXED_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_46_TOSS_OFFICIAL_OPENAPI_1_2_5_FIXED_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -1219,7 +1221,31 @@ def _rate_wait_before_call(group):
 
 def _rate_penalize(group, seconds):
     with API_CALL_LOCK:
-        RATE_NEXT_ALLOWED[group] = max(RATE_NEXT_ALLOWED[group], time.monotonic() + max(0.0, seconds))
+        RATE_NEXT_ALLOWED[group] = max(
+            RATE_NEXT_ALLOWED[group],
+            time.monotonic() + max(0.0, seconds),
+        )
+
+
+def _apply_official_rate_headers(group, headers, status_code):
+    """토스 공식 Rate Limit 응답 헤더를 다음 호출 시각에 반영한다."""
+    headers = headers or {}
+    limit = to_float(headers.get("X-RateLimit-Limit", 0), 0)
+    remaining = to_float(headers.get("X-RateLimit-Remaining", -1), -1)
+    reset = to_float(headers.get("X-RateLimit-Reset", 0), 0)
+    retry_after = to_float(headers.get("Retry-After", 0), 0)
+
+    # burst capacity가 제공되면 최소 간격을 1/limit보다 빠르지 않게 보정한다.
+    if limit > 0:
+        RATE_MIN_GAP_SEC[group] = max(
+            RATE_MIN_GAP_SEC.get(group, RATE_MIN_GAP_SEC["OTHER"]),
+            1.0 / limit,
+        )
+
+    if status_code == 429:
+        _rate_penalize(group, max(1.0, retry_after, reset))
+    elif remaining == 0 and reset > 0:
+        _rate_penalize(group, reset)
 
 def write_row(path, headers, row):
     try:
@@ -1621,22 +1647,52 @@ def send_alert_once(key, sym, title):
 # 토스 API
 # ============================================================
 
-def get_token():
+def get_token(force=False, stale_token=""):
+    """토스 OAuth 토큰을 단일 스레드에서만 발급한다.
+
+    client 당 유효 access token은 1개이므로, 여러 요청이 동시에 401을 받아도
+    잠금 획득 후 다른 스레드가 이미 토큰을 교체했는지 다시 확인한다.
+    """
     with TOKEN_REFRESH_LOCK:
+        with LOCK:
+            current = str(S.get("token", "") or "")
+            exp = float(S.get("token_exp", 0) or 0)
+
+        if stale_token and current and current != stale_token and time.time() < exp:
+            return current
+
+        if not force and current and time.time() < exp:
+            return current
+
         return _get_token_locked()
+
 
 def _get_token_locked():
     if not CLIENT_ID or not CLIENT_SECRET:
         set_status("토스 키 없음")
         return ""
+
     try:
-        r = requests.post(BASE + "/oauth2/token", data={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}, timeout=10)
+        r = requests.post(
+            BASE + "/oauth2/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
         data = r.json() if r.text else {}
+
         if r.status_code != 200:
             raw = str(data).replace("\n", " ")[:800]
             with LOCK:
                 S["token_last_error"] = raw
-            if "IP address not allowed" in raw or "access_denied" in raw:
+
+            if r.status_code == 403 and (
+                "IP address not allowed" in raw or "access_denied" in raw
+            ):
                 ip = refresh_outbound_ip(True)
                 set_status(f"IP 차단: {ip}")
                 set_error(f"토스 허용 IP 아님: {ip} / {raw}")
@@ -1644,31 +1700,47 @@ def _get_token_locked():
                 set_status(f"토큰 오류 {r.status_code}")
                 set_error(f"토큰 오류: {raw}")
             return ""
-        token = data.get("access_token", "")
-        exp = int(data.get("expires_in", 3600))
+
+        token = str(data.get("access_token", "") or "")
+        expires_in = int(data.get("expires_in", 86400) or 86400)
+
+        if not token:
+            set_error("토큰 응답에 access_token 없음")
+            return ""
+
+        # 공식 expires_in보다 5분 먼저 내부 만료 처리
         with LOCK:
             S["token"] = token
-            S["token_exp"] = time.time() + max(60, exp - 300)
+            S["token_exp"] = time.time() + max(60, expires_in - 300)
             S["token_last_error"] = ""
+
         set_status("토큰 정상")
         return token
+
     except Exception as e:
         set_error(f"토큰 예외: {e}")
         return ""
 
+
 def ensure_token():
     with LOCK:
-        token = S["token"]
-        exp = S["token_exp"]
+        token = str(S.get("token", "") or "")
+        exp = float(S.get("token_exp", 0) or 0)
+
     if not token or time.time() >= exp:
-        return get_token()
+        return get_token(force=False)
     return token
 
-def clear_token():
-    # 토스가 401 invalid-token을 주면 서버 메모리에 남은 토큰을 버리고 재발급한다.
+
+def clear_token(expected_token=""):
+    """실패한 토큰이 아직 현재 토큰일 때만 폐기한다."""
     with LOCK:
+        current = str(S.get("token", "") or "")
+        if expected_token and current and current != expected_token:
+            return
         S["token"] = ""
         S["token_exp"] = 0
+
 
 def auth_headers(account=False):
     token = ensure_token() or ""
@@ -1685,11 +1757,20 @@ def _json_or_raw(resp):
     except Exception:
         return {"raw": resp.text}
 
+def _api_error_code(data):
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error", {})
+    if isinstance(error, dict):
+        return str(error.get("code", "") or "").strip().lower()
+    return ""
+
+
 def _is_invalid_token(status_code, data):
+    """401 중 공식 토큰 오류 두 종류만 재발급 대상으로 본다."""
     if status_code != 401:
         return False
-    text = str(data).lower()
-    return "invalid-token" in text or "invalid_token" in text or "유효하지 않은 토큰" in text or status_code == 401
+    return _api_error_code(data) in {"invalid-token", "expired-token"}
 
 def api_get(path, params=None, account=False, timeout=10):
     """토스 GET 공통 호출.
@@ -1705,7 +1786,16 @@ def api_get(path, params=None, account=False, timeout=10):
         requested_at = now_kst().isoformat()
         t0 = time.time()
         try:
-            r = requests.get(BASE + path, headers=auth_headers(account), params=params or {}, timeout=timeout)
+            request_headers = auth_headers(account)
+            used_token = str(
+                request_headers.get("Authorization", "")
+            ).replace("Bearer ", "", 1)
+            r = requests.get(
+                BASE + path,
+                headers=request_headers,
+                params=params or {},
+                timeout=timeout,
+            )
             received_at = now_kst().isoformat()
             elapsed_ms = (time.time() - t0) * 1000.0
             data = _json_or_raw(r)
@@ -1721,10 +1811,14 @@ def api_get(path, params=None, account=False, timeout=10):
                 "updated_at": received_at,
                 "raw_id": raw_id,
             }
+            _apply_official_rate_headers(group, dict(r.headers), r.status_code)
             if _is_invalid_token(r.status_code, data):
-                clear_token()
+                # 현재 토큰이 실패한 토큰과 같을 때만 폐기한다.
+                # 다른 스레드가 이미 토큰을 바꿨다면 새 토큰을 재사용한다.
+                clear_token(expected_token=used_token)
+                get_token(force=True, stale_token=used_token)
                 if attempt < 3:
-                    time.sleep(0.35 + random.random() * 0.2)
+                    time.sleep(0.20 + random.random() * 0.15)
                     continue
             if r.status_code == 429:
                 retry_after = to_float(r.headers.get("Retry-After", 0), 0)
@@ -6101,17 +6195,69 @@ def write_swing_decision_log():
         write_row(swing_path(), headers, row)
 
 def create_backup_zip():
+    """한국 날짜 로그와 미국 현지 거래일 정규화 데이터를 함께 압축한다."""
     path = backup_zip_path()
     base = day_dir()
+    included_files = 0
+    included_bytes = 0
+    us_normalized_files = 0
+    us_trade_dates = set()
+
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        # 당일 한국 날짜 기준 로그
         for root, dirs, files in os.walk(base):
             for fn in files:
                 fp = os.path.join(root, fn)
-                if fp == path:
+                if os.path.abspath(fp) == os.path.abspath(path):
                     continue
                 arc = os.path.relpath(fp, base)
                 z.write(fp, arc)
+                included_files += 1
+                included_bytes += os.path.getsize(fp)
+
+        # 미국 현지 거래일별 정규화 로그
+        us_root = os.path.abspath(US_NORMALIZED_ROOT)
+        if os.path.isdir(us_root):
+            for root, dirs, files in os.walk(us_root):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    rel = os.path.relpath(fp, us_root)
+                    arc = os.path.join("us_trade_dates", rel)
+                    z.write(fp, arc)
+                    included_files += 1
+                    included_bytes += os.path.getsize(fp)
+                    us_normalized_files += 1
+
+                    first = rel.split(os.sep, 1)[0]
+                    if re.match(r"^\d{4}-\d{2}-\d{2}$", first):
+                        us_trade_dates.add(first)
+
+        manifest = {
+            "created_at_kst": now_text(),
+            "version": OPERATING_VERSION,
+            "toss_openapi_spec_version": TOSS_OPENAPI_SPEC_VERSION,
+            "toss_openapi_spec_url": TOSS_OPENAPI_SPEC_URL,
+            "toss_openapi_spec_version": TOSS_OPENAPI_SPEC_VERSION,
+            "toss_openapi_spec_url": TOSS_OPENAPI_SPEC_URL,
+            "kr_log_date": today(),
+            "included_files": included_files,
+            "uncompressed_bytes": included_bytes,
+            "us_normalized_included": bool(us_normalized_files),
+            "us_normalized_files": us_normalized_files,
+            "us_trade_dates": sorted(us_trade_dates),
+            "paper_only_mode": PAPER_ONLY_MODE,
+            "real_order_enabled": ENABLE_REAL_ORDER,
+            "real_auto_buy": ENABLE_REAL_AUTO_BUY,
+            "real_auto_sell": ENABLE_REAL_AUTO_SELL,
+            "us_real_order_enabled": US_REAL_ORDER_ENABLED,
+        }
+        z.writestr(
+            "backup_manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+
     return path
+
 
 def maybe_send_daily_backup():
     if not ENABLE_DAILY_BACKUP_ALERT:
@@ -6126,7 +6272,26 @@ def maybe_send_daily_backup():
         S["last_alert"][key] = time.time()
     path = create_backup_zip()
     url = f"{APP_URL}/download_backup" if APP_URL else "/download_backup"
-    caption = f"📦 오늘 데이터 백업 완료\n날짜: {today()}\n시간: {now_short()}\n다운로드 링크: {url}"
+    us_file_count = 0
+    us_trade_dates = set()
+
+    if os.path.isdir(US_NORMALIZED_ROOT):
+        for root, dirs, files in os.walk(US_NORMALIZED_ROOT):
+            us_file_count += len(files)
+            rel = os.path.relpath(root, US_NORMALIZED_ROOT)
+            first = rel.split(os.sep, 1)[0]
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", first):
+                us_trade_dates.add(first)
+
+    caption = (
+        f"📦 오늘 데이터 백업 완료\n"
+        f"날짜: {today()}\n"
+        f"시간: {now_short()}\n"
+        f"미국 정규화 포함: {'예' if us_file_count else '아니오'}\n"
+        f"미국 정규화 파일: {us_file_count}개\n"
+        f"미국 거래일 폴더: {len(us_trade_dates)}개\n"
+        f"다운로드 링크: {url}"
+    )
     ok, msg = send_telegram_file(path, caption, force=True)
     if not ok:
         send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]], force=True)
@@ -6267,7 +6432,12 @@ def refresh_us_market_calendar(force=False):
     st = S.setdefault("us_market_data", {})
     if (not force) and time.time() - to_float(st.get("calendar_checked_at", 0)) < US_CALENDAR_REFRESH_SEC:
         return bool(st.get("calendar_by_trade_date"))
-    code, data = api_get("/api/v1/market-calendar/US", params={}, timeout=10)
+    us_local_date = datetime.now(US_EASTERN).strftime("%Y-%m-%d")
+    code, data = api_get(
+        "/api/v1/market-calendar/US",
+        params={"date": us_local_date},
+        timeout=10,
+    )
     st["calendar_checked_at"] = time.time()
     if code != 200:
         st["status"] = f"US_CALENDAR_HTTP_{code}"
@@ -6350,29 +6520,138 @@ def capture_us_fx():
 
 
 def verify_us_symbols(force=False):
-    """prices는 공식 최대 200개 다건 조회. DAY 미제공을 종목 전체 미지원으로 확정하지 않는다."""
+    """공식 /stocks 응답으로 미국 종목 지원 여부를 검증한다."""
     st = S.setdefault("us_market_data", {})
-    if st.get("verified_symbols") and (not force) and time.time() - to_float(st.get("last_info_ts",0)) < US_STOCK_INFO_REFRESH_SEC:
+
+    if (
+        st.get("verified_symbols")
+        and not force
+        and time.time() - to_float(st.get("last_info_ts", 0))
+        < US_STOCK_INFO_REFRESH_SEC
+    ):
         return list(st.get("verified_symbols", []))
-    code, data = api_get("/api/v1/prices", params={"symbols":",".join(US_CANDIDATE_SYMBOLS[:200])}, timeout=20)
-    returned = set()
-    if code == 200 and isinstance(data, dict) and isinstance(data.get("result"), list):
-        returned = {str(x.get("symbol","")) for x in data["result"] if isinstance(x,dict)}
-    # 장외/데이 미제공으로 현재가가 빠질 수 있으므로 후보 자체는 유지한다.
-    verified = list(US_CANDIDATE_SYMBOLS)
+
+    candidates = list(dict.fromkeys(US_CANDIDATE_SYMBOLS))[:200]
+    code, data = api_get(
+        "/api/v1/stocks",
+        params={"symbols": ",".join(candidates)},
+        timeout=20,
+    )
+
+    rows = []
+    if code == 200 and isinstance(data, dict):
+        result = data.get("result", [])
+        if isinstance(result, list):
+            rows = result
+
+    stock_by_symbol = {
+        str(row.get("symbol", "") or "").upper(): row
+        for row in rows
+        if isinstance(row, dict) and row.get("symbol")
+    }
+
+    verified = []
     rejected = {}
-    td = _active_us_trade_date() or today()
+
+    for sym in candidates:
+        info = stock_by_symbol.get(sym.upper())
+        if not info:
+            rejected[sym] = {
+                "reason": "NOT_RETURNED_BY_STOCKS",
+                "http": code,
+            }
+            continue
+
+        status = str(info.get("status", "") or "").upper()
+        currency = str(info.get("currency", "") or "").upper()
+
+        if status != "ACTIVE" or currency != "USD":
+            rejected[sym] = {
+                "reason": "NOT_ACTIVE_US_SYMBOL",
+                "status": status,
+                "currency": currency,
+            }
+            continue
+
+        verified.append(sym)
+
+    # /prices 누락은 특정 세션 시세 미제공 가능성이 있으므로
+    # /stocks에서 ACTIVE로 확인된 종목을 rejected로 내리지 않는다.
+    visible_symbols = set()
+    if verified:
+        p_code, p_data = api_get(
+            "/api/v1/prices",
+            params={"symbols": ",".join(verified[:200])},
+            timeout=20,
+        )
+        if p_code == 200 and isinstance(p_data, dict):
+            p_result = p_data.get("result", [])
+            if isinstance(p_result, list):
+                visible_symbols = {
+                    str(row.get("symbol", "") or "").upper()
+                    for row in p_result
+                    if isinstance(row, dict)
+                }
+
+    trade_date = (
+        _active_us_trade_date()
+        or datetime.now(US_EASTERN).strftime("%Y-%m-%d")
+    )
+    session = current_us_session()
+
     for sym in verified:
-        status = "PRICE_VISIBLE" if sym in returned else "SESSION_NOT_PROVIDED_OR_NO_QUOTE"
-        write_row_unique(us_data_path("symbol_registry", local_trade_date=td),
-            ["verified_at","local_trade_date","symbol","market","currency","enabled","price_status","reason"],
-            {"verified_at":now_text(),"local_trade_date":td,"symbol":sym,"market":"US","currency":"USD",
-             "enabled":True,"price_status":status,"reason":"데이마켓 미제공 가능; PRE/REGULAR에서 재확인" if sym not in returned else ""},
-            ["local_trade_date","symbol"])
+        info = stock_by_symbol.get(sym.upper(), {})
+        price_visible = sym.upper() in visible_symbols
+
+        write_row_unique(
+            us_data_path("symbol_registry", local_trade_date=trade_date),
+            [
+                "verified_at",
+                "local_trade_date",
+                "session",
+                "symbol",
+                "name",
+                "english_name",
+                "market",
+                "security_type",
+                "currency",
+                "listing_status",
+                "enabled",
+                "price_status",
+                "reason",
+            ],
+            {
+                "verified_at": now_text(),
+                "local_trade_date": trade_date,
+                "session": session,
+                "symbol": sym,
+                "name": info.get("name", ""),
+                "english_name": info.get("englishName", ""),
+                "market": info.get("market", ""),
+                "security_type": info.get("securityType", ""),
+                "currency": info.get("currency", ""),
+                "listing_status": info.get("status", ""),
+                "enabled": True,
+                "price_status": (
+                    "PRICE_VISIBLE"
+                    if price_visible
+                    else "SESSION_NOT_PROVIDED_OR_NO_QUOTE"
+                ),
+                "reason": (
+                    ""
+                    if price_visible
+                    else "현재 세션 가격 미제공 가능; /stocks ACTIVE 확인"
+                ),
+            },
+            ["local_trade_date", "session", "symbol"],
+        )
+
     st["verified_symbols"] = verified
     st["rejected_symbols"] = rejected
     st["last_info_ts"] = time.time()
-    st["status"] = f"US_CANDIDATES_{len(verified)}"
+    st["status"] = (
+        f"US_VERIFIED_{len(verified)}_REJECTED_{len(rejected)}"
+    )
     return verified
 
 
@@ -6417,7 +6696,7 @@ def capture_us_candles():
         reached_checkpoint = False
         newest_by_td = {}
         for _page in range(US_CANDLE_MAX_PAGES):
-            params={"symbol":sym,"interval":"1m","count":US_CANDLE_PAGE_COUNT,"adjusted":"true"}
+            params={"symbol":sym,"interval":"1m","count":US_CANDLE_PAGE_COUNT,"adjusted":True}
             if before:
                 params["before"] = before
             code,data=api_get("/api/v1/candles",params=params,timeout=15)
@@ -6438,8 +6717,14 @@ def capture_us_candles():
                      "calendar_verified":verified,"symbol":sym,"timestamp":ts,
                      "open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),
                      "close":c.get("closePrice",0),"volume":c.get("volume",0),"currency":c.get("currency","USD")}
-                if write_row_unique(us_data_path("candles_1m",sym,td),headers,row,["symbol","timestamp"]):
-                    newest_by_td[td] = max(newest_by_td.get(td,""), ts)
+                write_row_unique(
+                    us_data_path("candles_1m", sym, td),
+                    headers,
+                    row,
+                    ["symbol", "timestamp"],
+                )
+                # before가 inclusive라 중복 봉이 다시 와도 체크포인트는 전진시킨다.
+                newest_by_td[td] = max(newest_by_td.get(td, ""), ts)
             next_before = result.get("nextBefore") if isinstance(result,dict) else None
             if reached_checkpoint or not next_before:
                 break
