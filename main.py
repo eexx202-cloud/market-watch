@@ -12,6 +12,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import hashlib
 import random
+import re
 from collections import defaultdict
 
 import requests
@@ -405,7 +406,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_46_TOSS_OFFICIAL_OPENAPI_1_2_5_FIXED_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_47_TOSS_OFFICIAL_OPENAPI_1_2_5_IMPORT_RE_FIXED_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
