@@ -403,7 +403,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_42_TOSS_OFFICIAL_KR_US_DATA_FIXED_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_43_TOSS_OFFICIAL_KR_US_SESSION_STATE_FIXED_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -1257,6 +1257,14 @@ def save_state():
                 "paper_ais": S.get("paper_ais", {}),
                 "shadow_fixed": S.get("shadow_fixed", {}),
                 "real_watch": S.get("real_watch", {}),
+                # 미국 데이터 수집 재시작 안전성: 대용량 캘린더/실시간 값은 제외하고
+                # 중복 방지 체크포인트와 완료 알림 전송 이력만 영구 보존한다.
+                "us_market_data_persistent": {
+                    "candle_checkpoints": dict(S.get("us_market_data", {}).get("candle_checkpoints", {})),
+                    "data_reports_sent": dict(S.get("us_market_data", {}).get("data_reports_sent", {})),
+                    "unsupported_by_session": dict(S.get("us_market_data", {}).get("unsupported_by_session", {})),
+                    "session_stats": dict(S.get("us_market_data", {}).get("session_stats", {})),
+                },
             }
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1286,6 +1294,13 @@ def load_state():
             rw = data.get("real_watch")
             if isinstance(rw, dict):
                 S["real_watch"] = rw
+            us_persistent = data.get("us_market_data_persistent")
+            if isinstance(us_persistent, dict):
+                us_state = S.setdefault("us_market_data", {})
+                for key in ("candle_checkpoints", "data_reports_sent", "unsupported_by_session", "session_stats"):
+                    value = us_persistent.get(key)
+                    if isinstance(value, dict):
+                        us_state[key] = value
             if S["paper"].get("start_cash", 0) <= 0:
                 S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
     except Exception as e:
@@ -6286,7 +6301,7 @@ def classify_us_event(value):
     for td, info in by_date.items():
         for key, label in (("dayMarket","DAY"),("preMarket","PRE"),("regularMarket","REGULAR"),("afterMarket","AFTER")):
             start, end = _session_window(info, key)
-            if start and end and start <= dt <= end:
+            if start and end and start <= dt < end:
                 return str(td), label, True
     return dt.strftime("%Y-%m-%d"), "OUTSIDE_SESSION", False
 
@@ -6298,7 +6313,7 @@ def _active_us_trade_date():
     for td, info in by_date.items():
         for key in ("dayMarket","preMarket","regularMarket","afterMarket"):
             start, end = _session_window(info, key)
-            if start and end and start <= n <= end:
+            if start and end and start <= n < end:
                 return str(td)
     return ""
 
@@ -6486,6 +6501,8 @@ def _maybe_send_us_data_reports():
             ok,_=send_telegram(msg, force=True)
             if ok:
                 st["data_reports_sent"][report_key]=now_text()
+                # 서버 재시작 뒤 같은 거래일 완료 알림이 반복되지 않도록 즉시 영구 저장한다.
+                save_state()
 
 
 def us_market_data_loop():
