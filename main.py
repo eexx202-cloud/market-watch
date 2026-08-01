@@ -1,4 +1,4 @@
-# OPERATING_V4_48_TOSS_OFFICIAL_1_2_5_KR_ONLY_PAPER_ONLY
+# OPERATING_V4_49_TOSS_OFFICIAL_1_2_5_KR_ONLY_DRIVE_BACKUP_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime
@@ -37,6 +37,22 @@ CLIENT_SECRET = os.environ.get("TOSS_CLIENT_SECRET", "").strip()
 KAKAO_TOKEN = os.environ.get("KAKAO_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+# Google Drive 백업은 실주문 기능과 완전히 분리한다. 인증값은 코드에 저장하지 않고
+# Render 환경변수로만 받는다. 업로드 활성화 여부도 별도 스위치로 관리한다.
+GOOGLE_DRIVE_CLIENT_ID = os.environ.get("GOOGLE_DRIVE_CLIENT_ID", "").strip()
+GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET", "").strip()
+GOOGLE_DRIVE_REFRESH_TOKEN = os.environ.get("GOOGLE_DRIVE_REFRESH_TOKEN", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+GOOGLE_DRIVE_REDIRECT_URI = os.environ.get(
+    "GOOGLE_DRIVE_REDIRECT_URI",
+    "https://market-watch-6zgo.onrender.com/google/oauth/callback",
+).strip()
+GOOGLE_DRIVE_UPLOAD_ENABLED = os.environ.get("GOOGLE_DRIVE_UPLOAD_ENABLED", "false").lower() == "true"
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_DRIVE_CHUNK_BYTES = 8 * 1024 * 1024
+GOOGLE_OAUTH_STATE = ""
+GOOGLE_OAUTH_STATE_EXPIRES_AT = 0.0
 
 # V4.24 기본 운용은 완전 가상실전이다. PAPER_ONLY_MODE=true이면
 # Render 환경변수가 실수로 켜져 있어도 실제 주문 API를 호출하지 않는다.
@@ -371,7 +387,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_48_TOSS_OFFICIAL_1_2_5_KR_ONLY_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_49_TOSS_OFFICIAL_1_2_5_KR_ONLY_DRIVE_BACKUP_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -614,6 +630,17 @@ S = {
     "last_alert": {},
     "orders": [],
     "pending_orders": {},
+    "google_drive": {
+        "status": "DISABLED" if not GOOGLE_DRIVE_UPLOAD_ENABLED else "WAITING_FOR_BACKUP",
+        "last_attempt_at": "",
+        "last_success_at": "",
+        "last_file_name": "",
+        "last_file_id": "",
+        "last_file_size": 0,
+        "last_web_view_link": "",
+        "last_error": "",
+        "retry_count": 0,
+    },
     # 실계좌 보유관리: 내가 산 종목의 매수가/매수 후 최고가를 기억해서
     # 손절, 수익보호, 익절, 교체 후보 알림을 보냄.
     "real_watch": {},
@@ -1229,6 +1256,7 @@ def save_state():
                 "paper_ais": S.get("paper_ais", {}),
                 "shadow_fixed": S.get("shadow_fixed", {}),
                 "real_watch": S.get("real_watch", {}),
+                "google_drive": S.get("google_drive", {}),
             }
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1258,6 +1286,9 @@ def load_state():
             rw = data.get("real_watch")
             if isinstance(rw, dict):
                 S["real_watch"] = rw
+            drive_state = data.get("google_drive")
+            if isinstance(drive_state, dict):
+                S["google_drive"].update(drive_state)
             if S["paper"].get("start_cash", 0) <= 0:
                 S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
     except Exception as e:
@@ -6100,6 +6131,258 @@ def create_backup_zip():
     return path
 
 
+def google_drive_credentials_ready(require_refresh=True):
+    basic = bool(
+        GOOGLE_DRIVE_CLIENT_ID
+        and GOOGLE_DRIVE_CLIENT_SECRET
+        and GOOGLE_DRIVE_FOLDER_ID
+        and GOOGLE_DRIVE_REDIRECT_URI
+    )
+    return basic and (bool(GOOGLE_DRIVE_REFRESH_TOKEN) if require_refresh else True)
+
+
+def google_drive_oauth_start_url():
+    """최초 1회 Google 승인을 위한 URL을 만든다. 토큰은 로그에 남기지 않는다."""
+    global GOOGLE_OAUTH_STATE, GOOGLE_OAUTH_STATE_EXPIRES_AT
+    if not google_drive_credentials_ready(require_refresh=False):
+        raise RuntimeError("Google Drive OAuth 기본 환경변수가 설정되지 않았습니다.")
+    with LOCK:
+        GOOGLE_OAUTH_STATE = uuid.uuid4().hex + uuid.uuid4().hex
+        GOOGLE_OAUTH_STATE_EXPIRES_AT = time.time() + 600
+        state = GOOGLE_OAUTH_STATE
+    params = {
+        "client_id": GOOGLE_DRIVE_CLIENT_ID,
+        "redirect_uri": GOOGLE_DRIVE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GOOGLE_DRIVE_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def google_drive_exchange_oauth_code(qs):
+    """OAuth callback 코드를 refresh token으로 교환한다. 반환 토큰은 사용자가 Render에 직접 저장한다."""
+    global GOOGLE_OAUTH_STATE, GOOGLE_OAUTH_STATE_EXPIRES_AT
+    if qs.get("error"):
+        raise RuntimeError("Google 승인 실패: " + str(qs.get("error", [""])[0]))
+    code = str(qs.get("code", [""])[0])
+    state = str(qs.get("state", [""])[0])
+    with LOCK:
+        expected = GOOGLE_OAUTH_STATE
+        expires_at = GOOGLE_OAUTH_STATE_EXPIRES_AT
+        GOOGLE_OAUTH_STATE = ""
+        GOOGLE_OAUTH_STATE_EXPIRES_AT = 0.0
+    if not code:
+        raise RuntimeError("Google authorization code가 없습니다.")
+    if not expected or state != expected or time.time() > expires_at:
+        raise RuntimeError("OAuth state가 일치하지 않거나 10분이 지났습니다. 처음부터 다시 승인하세요.")
+    r = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_DRIVE_CLIENT_ID,
+            "client_secret": GOOGLE_DRIVE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_DRIVE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Google token 교환 실패 HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    refresh_token = str(data.get("refresh_token", "")).strip()
+    if not refresh_token:
+        raise RuntimeError("refresh token이 발급되지 않았습니다. Google 권한을 취소한 뒤 prompt=consent로 다시 승인하세요.")
+    return refresh_token
+
+
+def google_drive_access_token():
+    if not google_drive_credentials_ready(require_refresh=True):
+        raise RuntimeError("GOOGLE_DRIVE_REFRESH_TOKEN을 포함한 Drive 환경변수가 아직 완성되지 않았습니다.")
+    r = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GOOGLE_DRIVE_CLIENT_ID,
+            "client_secret": GOOGLE_DRIVE_CLIENT_SECRET,
+            "refresh_token": GOOGLE_DRIVE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Google access token 갱신 실패 HTTP {r.status_code}: {r.text[:300]}")
+    token = str(r.json().get("access_token", "")).strip()
+    if not token:
+        raise RuntimeError("Google access token 응답이 비어 있습니다.")
+    return token
+
+
+def validate_backup_zip_for_drive(path):
+    if not os.path.isfile(path):
+        raise RuntimeError("업로드할 ZIP 파일이 없습니다.")
+    if os.path.getsize(path) <= 0:
+        raise RuntimeError("업로드할 ZIP 파일 크기가 0입니다.")
+    with zipfile.ZipFile(path, "r") as z:
+        bad = z.testzip()
+        if bad:
+            raise RuntimeError(f"ZIP 무결성 검사 실패: {bad}")
+        if "backup_manifest.json" not in z.namelist():
+            raise RuntimeError("backup_manifest.json이 ZIP에 없습니다.")
+
+
+def file_md5(path):
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def google_drive_find_file(access_token, filename):
+    escaped = filename.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name = '{escaped}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+    r = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": q, "fields": "files(id,name,size,md5Checksum,webViewLink)", "pageSize": 10},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Drive 중복 파일 조회 실패 HTTP {r.status_code}: {r.text[:300]}")
+    files = r.json().get("files", [])
+    return files[0] if files else None
+
+
+def google_drive_resumable_upload(path):
+    """큰 ZIP도 메모리에 전부 올리지 않고 8MiB 단위로 업로드한다."""
+    validate_backup_zip_for_drive(path)
+    access_token = google_drive_access_token()
+    filename = os.path.basename(path)
+    total = os.path.getsize(path)
+    local_md5 = file_md5(path)
+    existing = google_drive_find_file(access_token, filename)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": "application/zip",
+        "X-Upload-Content-Length": str(total),
+    }
+    if existing:
+        init_url = f"https://www.googleapis.com/upload/drive/v3/files/{existing['id']}"
+        init = requests.patch(
+            init_url,
+            headers=headers,
+            params={"uploadType": "resumable", "fields": "id,name,size,md5Checksum,webViewLink"},
+            json={"name": filename},
+            timeout=30,
+        )
+    else:
+        init_url = "https://www.googleapis.com/upload/drive/v3/files"
+        init = requests.post(
+            init_url,
+            headers=headers,
+            params={"uploadType": "resumable", "fields": "id,name,size,md5Checksum,webViewLink"},
+            json={"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]},
+            timeout=30,
+        )
+    if init.status_code not in (200, 201):
+        raise RuntimeError(f"Drive resumable 세션 생성 실패 HTTP {init.status_code}: {init.text[:300]}")
+    session_url = init.headers.get("Location", "")
+    if not session_url:
+        raise RuntimeError("Drive resumable 업로드 Location 헤더가 없습니다.")
+
+    final_response = None
+    offset = 0
+    with open(path, "rb") as f:
+        while offset < total:
+            chunk = f.read(GOOGLE_DRIVE_CHUNK_BYTES)
+            if not chunk:
+                break
+            end = offset + len(chunk) - 1
+            put = requests.put(
+                session_url,
+                headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{total}",
+                    "Content-Type": "application/zip",
+                },
+                data=chunk,
+                timeout=180,
+            )
+            if put.status_code == 308:
+                offset = end + 1
+                continue
+            if put.status_code not in (200, 201):
+                raise RuntimeError(f"Drive ZIP 전송 실패 HTTP {put.status_code}: {put.text[:300]}")
+            final_response = put
+            offset = end + 1
+
+    if final_response is None or offset != total:
+        raise RuntimeError(f"Drive ZIP 전송이 완료되지 않았습니다: {offset}/{total} bytes")
+    uploaded = final_response.json()
+    file_id = str(uploaded.get("id") or (existing or {}).get("id") or "")
+    if not file_id:
+        raise RuntimeError("업로드 응답에 Drive file ID가 없습니다.")
+    verify = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"fields": "id,name,size,md5Checksum,webViewLink"},
+        timeout=30,
+    )
+    if verify.status_code != 200:
+        raise RuntimeError(f"Drive 업로드 검증 실패 HTTP {verify.status_code}: {verify.text[:300]}")
+    meta = verify.json()
+    if int(meta.get("size", -1)) != total:
+        raise RuntimeError(f"Drive 파일 크기 불일치: local={total}, drive={meta.get('size')}")
+    if meta.get("md5Checksum") and str(meta.get("md5Checksum")) != local_md5:
+        raise RuntimeError("Drive MD5 검증 불일치")
+    return meta
+
+
+def upload_backup_to_google_drive(path):
+    with LOCK:
+        S["google_drive"].update({
+            "status": "UPLOADING",
+            "last_attempt_at": now_text(),
+            "last_file_name": os.path.basename(path),
+            "last_error": "",
+            "retry_count": 0,
+        })
+    last_error = ""
+    for attempt, wait_sec in enumerate((0, 2, 5), start=1):
+        if wait_sec:
+            time.sleep(wait_sec)
+        try:
+            meta = google_drive_resumable_upload(path)
+            with LOCK:
+                S["google_drive"].update({
+                    "status": "SUCCESS",
+                    "last_success_at": now_text(),
+                    "last_file_name": str(meta.get("name", os.path.basename(path))),
+                    "last_file_id": str(meta.get("id", "")),
+                    "last_file_size": int(meta.get("size", 0)),
+                    "last_web_view_link": str(meta.get("webViewLink", "")),
+                    "last_error": "",
+                    "retry_count": attempt - 1,
+                })
+            save_state()
+            return True, meta
+        except Exception as e:
+            last_error = str(e)
+            with LOCK:
+                S["google_drive"].update({"status": "RETRYING", "last_error": last_error, "retry_count": attempt})
+    with LOCK:
+        S["google_drive"].update({"status": "FAILED", "last_error": last_error})
+    save_state()
+    return False, {"error": last_error}
+
+
 def maybe_send_daily_backup():
     if not ENABLE_DAILY_BACKUP_ALERT:
         return
@@ -6121,9 +6404,45 @@ def maybe_send_daily_backup():
         f"미국 데이터: 미포함\n"
         f"다운로드 링크: {url}"
     )
-    ok, msg = send_telegram_file(path, caption, force=True)
-    if not ok:
-        send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]], force=True)
+    if GOOGLE_DRIVE_UPLOAD_ENABLED:
+        if not google_drive_credentials_ready(require_refresh=True):
+            with LOCK:
+                S["google_drive"].update({
+                    "status": "CONFIG_INCOMPLETE",
+                    "last_attempt_at": now_text(),
+                    "last_error": "GOOGLE_DRIVE_REFRESH_TOKEN 또는 필수 환경변수 누락",
+                })
+            send_telegram(
+                caption + "\n❌ Google Drive 업로드: 설정 미완료\nRender 환경변수를 확인하세요.",
+                [[telegram_button("백업 다운로드", url)]],
+                force=True,
+            )
+            return
+        drive_ok, result = upload_backup_to_google_drive(path)
+        if drive_ok:
+            size_mb = int(result.get("size", 0)) / (1024 * 1024)
+            drive_link = str(result.get("webViewLink", ""))
+            msg = (
+                caption
+                + f"\n✅ Google Drive 업로드 성공"
+                + f"\n파일 크기: {size_mb:.1f} MB"
+                + f"\nDrive 파일 ID: {result.get('id', '')}"
+            )
+            buttons = [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else []
+            send_telegram(msg, buttons, force=True)
+        else:
+            send_telegram(
+                caption
+                + "\n❌ Google Drive 업로드 실패"
+                + f"\n오류: {str(result.get('error', ''))[:500]}"
+                + "\n서버 ZIP은 유지되며 다운로드 링크를 사용할 수 있습니다.",
+                [[telegram_button("백업 다운로드", url)]],
+                force=True,
+            )
+    else:
+        ok, msg = send_telegram_file(path, caption, force=True)
+        if not ok:
+            send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]], force=True)
 
 def loop():
     load_state()
@@ -6254,6 +6573,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         qs = parse_qs(urlparse(self.path).query)
+        if path == "/google/oauth/start":
+            try:
+                return self.redirect(google_drive_oauth_start_url())
+            except Exception as e:
+                return self.result_page("Google Drive OAuth 시작 실패", str(e))
+        if path == "/google/oauth/callback":
+            try:
+                refresh_token = google_drive_exchange_oauth_code(qs)
+                token_html = html.escape(refresh_token, quote=True)
+                return self.html_response(
+                    "<html><head><meta charset='utf-8'>"
+                    + CSS
+                    + "</head><body><div class='card'><h1>Google Drive 승인 성공</h1>"
+                    + "<p>아래 refresh token을 지금 한 번만 복사해 Render의 "
+                    + "<b>GOOGLE_DRIVE_REFRESH_TOKEN</b> 환경변수에 저장하세요.</p>"
+                    + "<p style='color:#ff8087'>이 값을 캡처하거나 채팅에 보내지 마세요.</p>"
+                    + f"<textarea id='rt' readonly style='width:100%;height:100px'>{token_html}</textarea>"
+                    + "<button class='gold' onclick=\"navigator.clipboard.writeText(document.getElementById('rt').value)\">토큰 복사</button>"
+                    + "<p>저장 후 GOOGLE_DRIVE_UPLOAD_ENABLED를 true로 바꾸고 재배포하면 됩니다.</p>"
+                    + "</div></body></html>"
+                )
+            except Exception as e:
+                return self.result_page("Google Drive OAuth 승인 실패", str(e))
         if path == "/ipcheck":
             try:
                 r = requests.get("https://api.ipify.org?format=json", timeout=8)
@@ -6382,6 +6724,14 @@ class Handler(BaseHTTPRequestHandler):
                 "real_order_result_alert": ENABLE_REAL_ORDER_RESULT_ALERT,
                 "real_autosell_result_alert": ENABLE_REAL_AUTOSELL_RESULT_ALERT,
                 "daily_backup_alert": ENABLE_DAILY_BACKUP_ALERT,
+                "google_drive_upload_enabled": GOOGLE_DRIVE_UPLOAD_ENABLED,
+                "google_drive_oauth_base_configured": google_drive_credentials_ready(require_refresh=False),
+                "google_drive_refresh_token_configured": bool(GOOGLE_DRIVE_REFRESH_TOKEN),
+                "google_drive_ready": google_drive_credentials_ready(require_refresh=True),
+                "google_drive_folder_id": GOOGLE_DRIVE_FOLDER_ID,
+                "google_drive_redirect_uri": GOOGLE_DRIVE_REDIRECT_URI,
+                "google_drive_state": dict(S.get("google_drive", {})),
+                "google_drive_oauth_start": "/google/oauth/start",
                 "kakao_mirror": ENABLE_KAKAO_MIRROR,
                 "shadow_fixed_strategy_id": SHADOW_FIXED_STRATEGY_ID,
                 "shadow_inv_symbol": SHADOW_INV_SYMBOL,
@@ -6776,7 +7126,12 @@ function showAiGroup(g,btn){{document.querySelectorAll('.ai-group').forEach(x=>x
             self.wfile.write(f.read())
 
     def html_response(self, body):
-        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(body.encode("utf-8"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
 
     def json_response(self, data):
         self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
@@ -6793,6 +7148,9 @@ def print_operating_config():
     print("[운영 설정 확인]", flush=True)
     print(f"version={OPERATING_VERSION}", flush=True)
     print(f"market_mode={MARKET_MODE}", flush=True)
+    print(f"google_drive_upload_enabled={GOOGLE_DRIVE_UPLOAD_ENABLED}", flush=True)
+    print(f"google_drive_base_configured={google_drive_credentials_ready(require_refresh=False)}", flush=True)
+    print(f"google_drive_refresh_token_configured={bool(GOOGLE_DRIVE_REFRESH_TOKEN)}", flush=True)
     print(f"paper_only_mode={PAPER_ONLY_MODE}", flush=True)
     print(f"real_order={ENABLE_REAL_ORDER}", flush=True)
     print(f"real_auto_buy={ENABLE_REAL_AUTO_BUY}", flush=True)
