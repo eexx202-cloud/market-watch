@@ -1,4 +1,4 @@
-# OPERATING_V4_53_TOSS_OFFICIAL_1_2_5_GRADE1_AUTO_DRIVE_KR_US_PAPER_ONLY
+# OPERATING_V4_56_TOSS_OFFICIAL_1_2_5_KR_US_SELF_HEALING_GRADE1_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -402,7 +402,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_53_TOSS_OFFICIAL_1_2_5_GRADE1_AUTO_DRIVE_KR_US_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_56_TOSS_OFFICIAL_1_2_5_KR_US_SELF_HEALING_GRADE1_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -1094,6 +1094,9 @@ def market_data_dir():
 
 def candle_1m_path(sym):
     return os.path.join(market_data_dir(), f"candles_1m_{sym}_{today()}.csv")
+
+def price_snapshot_path(sym):
+    return os.path.join(market_data_dir(), f"prices_{sym}_{today()}.csv")
 
 def orderbook_path(sym):
     return os.path.join(market_data_dir(), f"orderbook_{sym}_{today()}.csv")
@@ -5814,6 +5817,32 @@ def _market_data_request_gap():
     if MARKET_DATA_REQUEST_GAP_SEC > 0:
         time.sleep(MARKET_DATA_REQUEST_GAP_SEC)
 
+def capture_kr_prices_all26():
+    """공식 /prices 한 번으로 26종목을 같은 요청시각·형식으로 저장한다."""
+    requested = now_kst(); started = time.time()
+    code, data = api_get("/api/v1/prices", params={"symbols": ",".join(ALL26_SYMBOLS)}, timeout=10)
+    received = now_kst(); latency = round((time.time() - started) * 1000, 3)
+    if code != 200:
+        return False, [f"PRICES_HTTP_{code}"]
+    result = data.get("result", []) if isinstance(data, dict) else []
+    seen = set()
+    headers = ["requested_at","received_at","saved_at","latency_ms","symbol","timestamp","last_price","currency"]
+    for item in result if isinstance(result, list) else []:
+        if not isinstance(item, dict):
+            continue
+        sym = str(item.get("symbol", ""))
+        if sym not in ALL26_SYMBOLS:
+            continue
+        seen.add(sym)
+        write_row(price_snapshot_path(sym), headers, {
+            "requested_at": requested.isoformat(), "received_at": received.isoformat(),
+            "saved_at": now_text(), "latency_ms": latency, "symbol": sym,
+            "timestamp": item.get("timestamp", ""), "last_price": item.get("lastPrice", 0),
+            "currency": item.get("currency", "KRW"),
+        })
+    missing = [s for s in ALL26_SYMBOLS if s not in seen]
+    return not missing, [f"{s}:PRICE_MISSING" for s in missing]
+
 def capture_candles_1m():
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
         return
@@ -6184,6 +6213,9 @@ def maybe_capture_toss_market_data():
     state = S.setdefault("market_data_capture", {})
     now_ts = time.time()
     try:
+        if now_ts - to_float(state.get("last_price_snapshot_ts", 0)) >= MARKET_DATA_ORDERFLOW_SEC:
+            capture_kr_prices_all26()
+            state["last_price_snapshot_ts"] = now_ts
         if now_ts - to_float(state.get("last_candle_ts", 0)) >= MARKET_DATA_CANDLE_SEC:
             capture_candles_1m()
             state["last_candle_ts"] = now_ts
@@ -6329,7 +6361,7 @@ def finalize_all_paper_accounts():
         write_row(path,["time","ai_id","ai_name","action","symbol","name","price","qty","fee","pl","cash","asset","profit_rate","reason","partial","real_order"],row)
 
 def finalize_kr_candles_grade1():
-    """공식 before/nextBefore 페이지네이션으로 정규장 390개 완성봉을 재구성한다."""
+    """기존 정상 봉을 보존하며 공식 페이지네이션으로 정규장 완성봉을 복구한다."""
     state=S.setdefault("market_data_capture",{}); refresh_kr_market_calendar(True); cal=state.get("calendar",{})
     start=_parse_iso(cal.get("regular_start")); end=_parse_iso(cal.get("regular_end"))
     if not start or not end or cal.get("date") != today():
@@ -6337,7 +6369,13 @@ def finalize_kr_candles_grade1():
     headers=["saved_at","symbol","timestamp","open","high","low","close","volume","estimated_trade_value","currency"]
     failures=[]
     for sym in MARKET_DATA_CORE_SYMBOLS:
-        collected={}; before=end.isoformat(); seen=set()
+        # 장중에 이미 받은 정상 봉은 API 재조회 실패가 나도 절대 지우지 않는다.
+        collected={}
+        for row in _read_csv_rows(candle_1m_path(sym)):
+            ts=str(row.get("timestamp", "")); dt=_parse_iso(ts)
+            if dt and start <= dt < end:
+                collected[ts]={k:row.get(k, "") for k in headers}
+        before=end.isoformat(); seen=set()
         for _ in range(4):
             if before in seen: break
             seen.add(before)
@@ -6345,11 +6383,15 @@ def finalize_kr_candles_grade1():
             if code != 200:
                 failures.append(f"{sym}:HTTP_{code}"); break
             result=_result_dict(data); candles=result.get("candles",[]) if isinstance(result,dict) else []
+            page_times=[]
             for c in candles if isinstance(candles,list) else []:
                 ts=str(c.get("timestamp",""))
                 if _completed_session_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
+                    dt=_parse_iso(ts)
+                    if dt: page_times.append(dt)
                     collected[ts]={"saved_at":now_text(),"symbol":sym,"timestamp":ts,"open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),"close":c.get("closePrice",0),"volume":c.get("volume",0),"estimated_trade_value":round(to_float(c.get("closePrice",0))*to_float(c.get("volume",0)),4),"currency":c.get("currency","KRW")}
-            oldest=min((_parse_iso(x) for x in collected if _parse_iso(x)),default=None)
+            # 기존 파일의 오래된 봉이 아니라 이번 API 페이지의 최저시각으로 중단 여부를 판단한다.
+            oldest=min(page_times,default=None)
             if oldest and oldest <= start: break
             nxt=result.get("nextBefore") if isinstance(result,dict) else None
             if not nxt: break
@@ -6360,6 +6402,52 @@ def finalize_kr_candles_grade1():
         if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start or _parse_iso(rows[-1]["timestamp"])!=end-timedelta(minutes=1):
             failures.append(f"{sym}:CANDLES_{len(rows)}")
     return not failures,failures
+
+def repair_kr_required_files_before_backup():
+    """백업 직전 26종목 필수 파일을 재조회한다. 기존 정상 파일은 실패 시 보존한다."""
+    failures=[]
+    ok, price_failures = capture_kr_prices_all26()
+    if not ok: failures.extend(price_failures)
+    daily_headers=["saved_at","symbol","timestamp","open","high","low","close","volume","estimated_trade_value","currency"]
+    meta_headers=["saved_at","symbol","name","stock_http","warning_http","limits_http","stock_json","warning_json","limits_json"]
+    ob_headers=["saved_at","symbol","api_timestamp","best_ask","best_bid","spread","ask_total_volume","bid_total_volume","bid_ask_ratio","asks_json","bids_json"]
+    tr_headers=["saved_at","symbol","timestamp","price","volume","trade_value","currency"]
+    if not _read_csv_rows(market_indicator_path()) or not _read_csv_rows(investor_trading_path()):
+        capture_market_investor_data()
+    if not _read_csv_rows(market_indicator_path()): failures.append("MARKET_INDICATORS_MISSING")
+    if not _read_csv_rows(investor_trading_path()): failures.append("INVESTOR_TRADING_MISSING")
+    for sym in ALL26_SYMBOLS:
+        if not _read_csv_rows(candle_daily_path(sym)):
+            c,d=api_get("/api/v1/candles",params={"symbol":sym,"interval":"1d","count":MARKET_DATA_DAILY_COUNT,"adjusted":True},timeout=12); _market_data_request_gap()
+            candles=_result_dict(d).get("candles",[]) if c==200 else []
+            rows=[]
+            for x in reversed(candles if isinstance(candles,list) else []):
+                if not isinstance(x,dict): continue
+                rows.append({"saved_at":now_text(),"symbol":sym,"timestamp":x.get("timestamp",""),"open":x.get("openPrice",0),"high":x.get("highPrice",0),"low":x.get("lowPrice",0),"close":x.get("closePrice",0),"volume":x.get("volume",0),"estimated_trade_value":round(to_float(x.get("closePrice",0))*to_float(x.get("volume",0)),4),"currency":x.get("currency","KRW")})
+            if rows: _rewrite_csv(candle_daily_path(sym),daily_headers,rows)
+            if not _read_csv_rows(candle_daily_path(sym)): failures.append(f"{sym}:DAILY_HTTP_{c}")
+        metadata=_read_csv_rows(stock_metadata_path(sym))
+        meta_ok=bool(metadata) and all(str(metadata[-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http"))
+        if not meta_ok:
+            c1,d1=api_get("/api/v1/stocks",params={"symbols":sym},timeout=8);_market_data_request_gap();c2,d2=api_get(f"/api/v1/stocks/{sym}/warnings",timeout=8);_market_data_request_gap();c3,d3=api_get("/api/v1/price-limits",params={"symbol":sym},timeout=8);_market_data_request_gap()
+            if c1==c2==c3==200:
+                _rewrite_csv(stock_metadata_path(sym),meta_headers,[{"saved_at":now_text(),"symbol":sym,"name":name_of(sym),"stock_http":c1,"warning_http":c2,"limits_http":c3,"stock_json":json.dumps(d1,ensure_ascii=False,separators=(",",":"))[:10000],"warning_json":json.dumps(d2,ensure_ascii=False,separators=(",",":"))[:10000],"limits_json":json.dumps(d3,ensure_ascii=False,separators=(",",":"))[:10000]}])
+            metadata=_read_csv_rows(stock_metadata_path(sym))
+            if not metadata or not all(str(metadata[-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http")): failures.append(f"{sym}:METADATA_HTTP_{c1}_{c2}_{c3}")
+        if not _read_csv_rows(orderbook_path(sym)):
+            c,d=api_get("/api/v1/orderbook",params={"symbol":sym},timeout=8);_market_data_request_gap();r=_result_dict(d);asks=r.get("asks",[]) if isinstance(r.get("asks",[]),list) else [];bids=r.get("bids",[]) if isinstance(r.get("bids",[]),list) else [];ts=str(r.get("timestamp",""))
+            if c==200 and ts:
+                at=sum(to_float(x.get("volume",0)) for x in asks if isinstance(x,dict));bt=sum(to_float(x.get("volume",0)) for x in bids if isinstance(x,dict));ba=to_float(asks[0].get("price",0)) if asks else 0;bb=to_float(bids[0].get("price",0)) if bids else 0
+                write_row_unique(orderbook_path(sym),ob_headers,{"saved_at":now_text(),"symbol":sym,"api_timestamp":ts,"best_ask":ba,"best_bid":bb,"spread":ba-bb if ba and bb else 0,"ask_total_volume":int(at),"bid_total_volume":int(bt),"bid_ask_ratio":round(bt/at,4) if at else 0,"asks_json":json.dumps(asks,ensure_ascii=False,separators=(",",":")),"bids_json":json.dumps(bids,ensure_ascii=False,separators=(",",":"))},["symbol","api_timestamp"])
+            if not _read_csv_rows(orderbook_path(sym)): failures.append(f"{sym}:ORDERBOOK_HTTP_{c}")
+        if not _read_csv_rows(trades_path(sym)):
+            c,d=api_get("/api/v1/trades",params={"symbol":sym,"count":50},timeout=8);_market_data_request_gap();trades=d.get("result",[]) if isinstance(d,dict) else []
+            if c==200:
+                for x in reversed(trades if isinstance(trades,list) else []):
+                    if not isinstance(x,dict) or not x.get("timestamp"): continue
+                    write_row_unique(trades_path(sym),tr_headers,{"saved_at":now_text(),"symbol":sym,"timestamp":x.get("timestamp",""),"price":x.get("price",0),"volume":x.get("volume",0),"trade_value":round(to_float(x.get("price",0))*to_float(x.get("volume",0)),4),"currency":x.get("currency","KRW")},["symbol","timestamp","price","volume"])
+            if not _read_csv_rows(trades_path(sym)): failures.append(f"{sym}:TRADES_HTTP_{c}")
+    return failures
 
 def audit_kr_grade1():
     """파일명/용량이 아닌 실제 CSV 내용으로만 1등급을 판정한다."""
@@ -6376,7 +6464,9 @@ def audit_kr_grade1():
         ok=len(rows)==expected and times and times[0]==start and times[-1]==end-timedelta(minutes=1) and len(times)==len(set(times)) and gaps==0 and reverse==0 and future==0 and bad_ohlcv==0 and bad_amount==0
         if not os.path.isfile(orderbook_path(sym)) or not _read_csv_rows(orderbook_path(sym)): ok=False; failures.append(f"{sym}:ORDERBOOK")
         if not os.path.isfile(trades_path(sym)) or not _read_csv_rows(trades_path(sym)): ok=False; failures.append(f"{sym}:TRADES")
-        if not os.path.isfile(symbol_path(sym)) or not _read_csv_rows(symbol_path(sym)): ok=False; failures.append(f"{sym}:SNAPSHOT")
+        snapshots=_read_csv_rows(price_snapshot_path(sym))
+        if not snapshots: ok=False; failures.append(f"{sym}:SNAPSHOT")
+        elif any(str(snapshots[-1].get(k,""))=="" for k in ("requested_at","received_at","saved_at","latency_ms","timestamp","last_price")): ok=False; failures.append(f"{sym}:SNAPSHOT_FIELDS")
         if not os.path.isfile(candle_daily_path(sym)) or not _read_csv_rows(candle_daily_path(sym)): ok=False; failures.append(f"{sym}:DAILY")
         metadata=_read_csv_rows(stock_metadata_path(sym)) if os.path.isfile(stock_metadata_path(sym)) else []
         if not metadata: ok=False; failures.append(f"{sym}:METADATA")
@@ -6385,6 +6475,8 @@ def audit_kr_grade1():
         details[sym]={"rows":len(rows),"first":times[0].isoformat() if times else "","last":times[-1].isoformat() if times else "","gaps":gaps,"duplicate":len(times)-len(set(times)),"reverse":reverse,"future":future,"ohlcv_missing":bad_ohlcv,"trade_value_missing":bad_amount,"ok":ok}
     raw_path=os.path.join(raw_market_dir("KR"),f"api_{today()}.jsonl")
     if not os.path.isfile(raw_path) or os.path.getsize(raw_path)==0: failures.append("RAW_API_RESPONSES_MISSING")
+    if not _read_csv_rows(market_indicator_path()): failures.append("MARKET_INDICATORS_MISSING")
+    if not _read_csv_rows(investor_trading_path()): failures.append("INVESTOR_TRADING_MISSING")
     missing_accounts=[x for x in MULTI_AI_IDS if not _read_csv_rows(multi_ai_path(x)) or not os.path.isfile(multi_ai_state_path(x))]
     if missing_accounts: failures.append("PAPER_ACCOUNTS_MISSING:"+",".join(missing_accounts))
     return {"grade":"GRADE_1" if not failures else "GRADE_2_PARTIAL","failures":failures,"details":details,"paper_account_files":len(MULTI_AI_IDS)-len(missing_accounts)}
@@ -6392,8 +6484,10 @@ def audit_kr_grade1():
 def create_backup_zip():
     """한국 1등급 검사를 수행하고 결과를 포함해 압축한다."""
     finalize_all_paper_accounts()
+    repair_failures=repair_kr_required_files_before_backup()
     backfill_ok,backfill_failures=finalize_kr_candles_grade1()
     quality=audit_kr_grade1()
+    quality["repair_failures"]=repair_failures
     quality["backfill_ok"]=backfill_ok; quality["backfill_failures"]=backfill_failures
     S.setdefault("market_data_capture", {})["final_grade"] = quality.get("grade")
     S.setdefault("market_data_capture", {})["final_grade_failures"] = quality.get("failures", [])
@@ -6703,18 +6797,32 @@ def finalize_us_candles_grade1():
     if not start or not end: return False,["US_CALENDAR_INVALID"]
     headers=["requested_at","received_at","saved_at","latency_ms","symbol","timestamp","open","high","low","close","volume","estimated_trade_value","currency"]
     for sym in US_SYMBOLS:
-        collected={}; before=end.isoformat(); seen=set()
+        # 장중에 이미 저장된 정상 봉을 먼저 읽는다. 백필 API가 일부 실패해도
+        # 기존 데이터를 줄이거나 지우지 않고 timestamp 기준으로 병합한다.
+        collected={}
+        for old in _read_csv_rows(us_data_path("candles_1m",sym)):
+            ts=str(old.get("timestamp","")); dt=_parse_iso(ts)
+            if dt and start <= dt < end:
+                collected[ts]={h:old.get(h,"") for h in headers}
+        before=end.isoformat(); seen=set()
         for _ in range(4):
             if before in seen: break
             seen.add(before); req=now_kst();t0=time.time()
             code,data=api_get("/api/v1/candles",params={"symbol":sym,"interval":"1m","count":200,"before":before,"adjusted":True},timeout=12);rec=now_kst();latency=round((time.time()-t0)*1000,3)
             if code!=200: failures.append(f"{sym}:HTTP_{code}");break
             result=_result_dict(data); candles=result.get("candles",[]) if isinstance(result,dict) else []
+            page_times=[]
             for c in candles if isinstance(candles,list) else []:
                 ts=str(c.get("timestamp",""))
-                if _completed_session_candle(ts,cal.get("date"),cal.get("regular_start"),cal.get("regular_end")):
+                # 미국 정규장은 KST 자정을 넘는다. cal.date는 미국 현지 거래일이므로
+                # KST 날짜와 비교하면 자정 이후 정상 봉이 전부 탈락한다. 날짜가 아니라
+                # 공식 regularMarket startTime <= ts < endTime 범위로만 판정한다.
+                if _completed_session_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
+                    page_times.append(_parse_iso(ts))
                     close=to_float(c.get("closePrice",0));volume=to_float(c.get("volume",0));collected[ts]={"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"timestamp":ts,"open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),"close":c.get("closePrice",0),"volume":c.get("volume",0),"estimated_trade_value":round(close*volume,4),"currency":c.get("currency","USD")}
-            oldest=min((_parse_iso(x) for x in collected if _parse_iso(x)),default=None)
+            # 기존 CSV의 첫 봉이 아니라 이번 API 페이지의 가장 오래된 봉으로
+            # 페이지 종료 여부를 판단해야 중간 구간을 건너뛰지 않는다.
+            oldest=min((x for x in page_times if x),default=None)
             if oldest and oldest<=start: break
             nxt=result.get("nextBefore") if isinstance(result,dict) else None
             if not nxt: break
@@ -6723,6 +6831,52 @@ def finalize_us_candles_grade1():
         expected=int((end-start).total_seconds()//60)
         if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start or _parse_iso(rows[-1]["timestamp"])!=end-timedelta(minutes=1): failures.append(f"{sym}:CANDLES_{len(rows)}")
     return not failures,failures
+
+def repair_us_required_files_before_backup():
+    """백업 직전 재조회 가능한 필수 자료를 복구한다. 기존 파일은 성공 응답으로만 교체한다."""
+    failures=[]
+    price_headers=["requested_at","received_at","saved_at","latency_ms","symbol","timestamp","last_price","currency"]
+    req=now_kst();t0=time.time();code,data=api_get("/api/v1/prices",params={"symbols":",".join(US_SYMBOLS)},timeout=12);rec=now_kst();latency=round((time.time()-t0)*1000,3)
+    seen_prices=set()
+    if code==200:
+        for item in data.get("result",[]) if isinstance(data,dict) else []:
+            if not isinstance(item,dict):continue
+            sym=str(item.get("symbol","")).upper()
+            if sym not in US_SYMBOLS:continue
+            seen_prices.add(sym);write_row(us_data_path("prices",sym),price_headers,{"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"timestamp":item.get("timestamp",""),"last_price":item.get("lastPrice",0),"currency":item.get("currency","USD")})
+    for sym in US_SYMBOLS:
+        if not _read_csv_rows(us_data_path("prices",sym)) and sym not in seen_prices:failures.append(f"{sym}:PRICES_HTTP_{code}")
+
+    daily_headers=["requested_at","received_at","saved_at","latency_ms","symbol","timestamp","open","high","low","close","volume","currency"]
+    meta_headers=["requested_at","received_at","saved_at","latency_ms","symbol","stock_http","warning_http","limits_http","stock_json","warning_json","limits_json"]
+    for sym in US_SYMBOLS:
+        if not _read_csv_rows(us_data_path("candles_1d",sym)):
+            req=now_kst();t0=time.time();c,d=api_get("/api/v1/candles",params={"symbol":sym,"interval":"1d","count":200,"adjusted":True},timeout=12);rec=now_kst();latency=round((time.time()-t0)*1000,3)
+            if c==200:
+                rows=[]
+                for x in reversed(_result_dict(d).get("candles",[]) if isinstance(_result_dict(d).get("candles",[]),list) else []):
+                    if isinstance(x,dict):rows.append({"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"timestamp":x.get("timestamp",""),"open":x.get("openPrice",0),"high":x.get("highPrice",0),"low":x.get("lowPrice",0),"close":x.get("closePrice",0),"volume":x.get("volume",0),"currency":x.get("currency","USD")})
+                if rows:_rewrite_csv(us_data_path("candles_1d",sym),daily_headers,rows)
+            if not _read_csv_rows(us_data_path("candles_1d",sym)):failures.append(f"{sym}:DAILY_HTTP_{c}")
+        metadata=_read_csv_rows(us_data_path("metadata",sym))
+        meta_ok=bool(metadata) and all(str(metadata[-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http"))
+        if not meta_ok:
+            req=now_kst();t0=time.time();c1,d1=api_get("/api/v1/stocks",params={"symbols":sym},timeout=8);_market_data_request_gap();c2,d2=api_get(f"/api/v1/stocks/{sym}/warnings",timeout=8);_market_data_request_gap();c3,d3=api_get("/api/v1/price-limits",params={"symbol":sym},timeout=8);rec=now_kst();latency=round((time.time()-t0)*1000,3)
+            if c1==c2==c3==200:_rewrite_csv(us_data_path("metadata",sym),meta_headers,[{"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"stock_http":c1,"warning_http":c2,"limits_http":c3,"stock_json":json.dumps(d1,ensure_ascii=False,separators=(",",":"))[:10000],"warning_json":json.dumps(d2,ensure_ascii=False,separators=(",",":"))[:10000],"limits_json":json.dumps(d3,ensure_ascii=False,separators=(",",":"))[:10000]}])
+            else:failures.append(f"{sym}:METADATA_HTTP_{c1}_{c2}_{c3}")
+        # 호가·체결은 과거 전체 복구가 불가능하지만 파일 자체가 비었을 때 마지막으로 재조회한다.
+        if not _read_csv_rows(us_data_path("orderbook",sym)):
+            req=now_kst();t0=time.time();c,d=api_get("/api/v1/orderbook",params={"symbol":sym},timeout=8);rec=now_kst();latency=round((time.time()-t0)*1000,3);r=_result_dict(d)
+            asks=r.get("asks",[]) if isinstance(r.get("asks",[]),list) else [];bids=r.get("bids",[]) if isinstance(r.get("bids",[]),list) else [];ts=str(r.get("timestamp",""))
+            if c==200 and ts:write_row_unique(us_data_path("orderbook",sym),["requested_at","received_at","saved_at","latency_ms","symbol","api_timestamp","best_ask","best_bid","spread","ask_total_volume","bid_total_volume","asks_json","bids_json"],{"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"api_timestamp":ts,"best_ask":asks[0].get("price",0) if asks else 0,"best_bid":bids[0].get("price",0) if bids else 0,"spread":to_float(asks[0].get("price",0))-to_float(bids[0].get("price",0)) if asks and bids else 0,"ask_total_volume":sum(to_float(x.get("volume",0)) for x in asks if isinstance(x,dict)),"bid_total_volume":sum(to_float(x.get("volume",0)) for x in bids if isinstance(x,dict)),"asks_json":json.dumps(asks,separators=(",",":")),"bids_json":json.dumps(bids,separators=(",",":"))},["symbol","api_timestamp"])
+            if not _read_csv_rows(us_data_path("orderbook",sym)):failures.append(f"{sym}:ORDERBOOK_HTTP_{c}")
+        if not _read_csv_rows(us_data_path("trades",sym)):
+            req=now_kst();t0=time.time();c,d=api_get("/api/v1/trades",params={"symbol":sym,"count":50},timeout=8);rec=now_kst();latency=round((time.time()-t0)*1000,3)
+            for x in reversed(d.get("result",[]) if c==200 and isinstance(d,dict) and isinstance(d.get("result",[]),list) else []):
+                if not isinstance(x,dict) or not x.get("timestamp"):continue
+                write_row_unique(us_data_path("trades",sym),["requested_at","received_at","saved_at","latency_ms","symbol","timestamp","price","volume","trade_value","currency"],{"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"timestamp":x.get("timestamp",""),"price":x.get("price",0),"volume":x.get("volume",0),"trade_value":round(to_float(x.get("price",0))*to_float(x.get("volume",0)),4),"currency":x.get("currency","USD")},["symbol","timestamp","price","volume"])
+            if not _read_csv_rows(us_data_path("trades",sym)):failures.append(f"{sym}:TRADES_HTTP_{c}")
+    return failures
 
 def audit_us_grade1():
     cal=S.setdefault("us_market_data_capture",{}).get("calendar",{});start=_parse_iso(cal.get("regular_start"));end=_parse_iso(cal.get("regular_end"));failures=[];details={}
@@ -6742,7 +6896,7 @@ def audit_us_grade1():
     return {"grade":"GRADE_1" if not failures else "GRADE_2_PARTIAL","failures":failures,"details":details}
 
 def create_us_backup_zip():
-    ok,backfill_failures=finalize_us_candles_grade1();quality=audit_us_grade1();quality["backfill_ok"]=ok;quality["backfill_failures"]=backfill_failures
+    repair_failures=repair_us_required_files_before_backup();ok,backfill_failures=finalize_us_candles_grade1();quality=audit_us_grade1();quality["repair_failures"]=repair_failures;quality["backfill_ok"]=ok;quality["backfill_failures"]=backfill_failures
     with open(os.path.join(us_market_data_dir(),f"grade1_report_{us_trade_date_from_calendar()}.json"),"w",encoding="utf-8") as f:json.dump(quality,f,ensure_ascii=False,indent=2)
     path=os.path.join(us_day_dir(),f"backup_US_{us_trade_date_from_calendar()}.zip");base=us_day_dir();count=0;size=0
     with zipfile.ZipFile(path,"w",zipfile.ZIP_DEFLATED) as z:
@@ -6761,12 +6915,20 @@ def maybe_send_us_backup():
     nowv=now_kst();key=f"US_BACKUP_SENT_{cal.get('date','')}"
     # 종료 직후 10분 창을 놓쳐도 서버가 살아나는 즉시 해당 거래일 백업을 만든다.
     if not (end+timedelta(minutes=US_BACKUP_DELAY_MIN)<=nowv<=end+timedelta(hours=12)):return
+    attempt_key=key+"_ATTEMPT"
     with LOCK:
         if S["last_alert"].get(key):return
-        S["last_alert"][key]=time.time()
+        last_attempt=to_float(S["last_alert"].get(attempt_key,0))
+        if time.time()-last_attempt<600:return
+        S["last_alert"][attempt_key]=time.time()
     path,quality=create_us_backup_zip();grade=quality.get("grade","FAILED");msg=f"🇺🇸 미국 정규장 백업 {grade}\n거래일: {cal.get('date','')}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단"
+    completed=not GOOGLE_DRIVE_UPLOAD_ENABLED
     if GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
-        drive_ok,result=upload_backup_to_google_drive(path);msg += "\n✅ Drive 업로드 성공" if drive_ok else "\n❌ Drive 업로드 실패: "+str(result.get("error",""))[:300]
+        drive_ok,result=upload_backup_to_google_drive(path);completed=drive_ok;msg += "\n✅ Drive 업로드 성공" if drive_ok else "\n❌ Drive 업로드 실패: "+str(result.get("error",""))[:300]
+    elif GOOGLE_DRIVE_UPLOAD_ENABLED:
+        msg += "\n❌ Drive 설정 미완료"
+    if completed:
+        with LOCK:S["last_alert"][key]=time.time()
     send_telegram(msg,force=True)
 
 
@@ -6778,10 +6940,14 @@ def maybe_send_daily_backup():
     if is_weekend_kst() or (n.hour, n.minute) < (15, 35):
         return
     key = f"BACKUP_SENT_{today()}"
+    attempt_key = key + "_ATTEMPT"
     with LOCK:
         if S["last_alert"].get(key):
             return
-        S["last_alert"][key] = time.time()
+        last_attempt = to_float(S["last_alert"].get(attempt_key, 0))
+        if time.time() - last_attempt < 600:
+            return
+        S["last_alert"][attempt_key] = time.time()
     path = create_backup_zip()
     final_grade = S.setdefault("market_data_capture", {}).get("final_grade", "FAILED")
     url = f"{APP_URL}/download_backup" if APP_URL else "/download_backup"
@@ -6819,6 +6985,8 @@ def maybe_send_daily_backup():
             )
             buttons = [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else []
             send_telegram(msg, buttons, force=True)
+            with LOCK:
+                S["last_alert"][key] = time.time()
         else:
             send_telegram(
                 caption
@@ -6832,6 +7000,9 @@ def maybe_send_daily_backup():
         ok, msg = send_telegram_file(path, caption, force=True)
         if not ok:
             send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]], force=True)
+        else:
+            with LOCK:
+                S["last_alert"][key] = time.time()
 
 def loop():
     load_state()
