@@ -1,4 +1,4 @@
-# OPERATING_V4_52_TOSS_OFFICIAL_1_2_5_GRADE1_STRICT_KR_US_PAPER_ONLY
+# OPERATING_V4_53_TOSS_OFFICIAL_1_2_5_GRADE1_AUTO_DRIVE_KR_US_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -48,7 +48,8 @@ GOOGLE_DRIVE_REDIRECT_URI = os.environ.get(
     "GOOGLE_DRIVE_REDIRECT_URI",
     "https://market-watch-6zgo.onrender.com/google/oauth/callback",
 ).strip()
-GOOGLE_DRIVE_UPLOAD_ENABLED = os.environ.get("GOOGLE_DRIVE_UPLOAD_ENABLED", "false").lower() == "true"
+# 자동 백업이 기본 동작이다. 명시적으로 false를 준 경우에만 Drive 업로드를 끈다.
+GOOGLE_DRIVE_UPLOAD_ENABLED = os.environ.get("GOOGLE_DRIVE_UPLOAD_ENABLED", "true").lower() == "true"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_DRIVE_CHUNK_BYTES = 8 * 1024 * 1024
 GOOGLE_OAUTH_STATE = ""
@@ -401,7 +402,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_52_TOSS_OFFICIAL_1_2_5_GRADE1_STRICT_KR_US_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_53_TOSS_OFFICIAL_1_2_5_GRADE1_AUTO_DRIVE_KR_US_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -487,7 +488,7 @@ ENABLE_SHADOW_TRADE_ALERT = os.environ.get("ENABLE_SHADOW_TRADE_ALERT", "true").
 ENABLE_SHADOW_DAILY_SUMMARY_ALERT = os.environ.get("ENABLE_SHADOW_DAILY_SUMMARY_ALERT", "true").lower() == "true"
 ENABLE_REAL_ORDER_RESULT_ALERT = os.environ.get("ENABLE_REAL_ORDER_RESULT_ALERT", "true").lower() == "true"
 ENABLE_REAL_AUTOSELL_RESULT_ALERT = os.environ.get("ENABLE_REAL_AUTOSELL_RESULT_ALERT", "true").lower() == "true"
-ENABLE_DAILY_BACKUP_ALERT = os.environ.get("ENABLE_DAILY_BACKUP_ALERT", "true").lower() == "true"
+ENABLE_DAILY_BACKUP_ALERT = True
 ENABLE_KAKAO_MIRROR = os.environ.get("ENABLE_KAKAO_MIRROR", "false").lower() == "true"
 
 # ============================================================
@@ -6758,7 +6759,8 @@ def maybe_send_us_backup():
     state=S.setdefault("us_market_data_capture",{});cal=state.get("calendar",{});end=_parse_iso(cal.get("regular_end"))
     if not end:return
     nowv=now_kst();key=f"US_BACKUP_SENT_{cal.get('date','')}"
-    if not (end+timedelta(minutes=US_BACKUP_DELAY_MIN)<=nowv<=end+timedelta(minutes=US_BACKUP_DELAY_MIN+10)):return
+    # 종료 직후 10분 창을 놓쳐도 서버가 살아나는 즉시 해당 거래일 백업을 만든다.
+    if not (end+timedelta(minutes=US_BACKUP_DELAY_MIN)<=nowv<=end+timedelta(hours=12)):return
     with LOCK:
         if S["last_alert"].get(key):return
         S["last_alert"][key]=time.time()
@@ -6772,7 +6774,8 @@ def maybe_send_daily_backup():
     if not ENABLE_DAILY_BACKUP_ALERT:
         return
     n = now_kst()
-    if is_weekend_kst() or not (n.hour == 15 and 35 <= n.minute <= 37):
+    # 15:35 이후 한 번 실행한다. 재시작·API 지연으로 3분 창을 놓쳐도 자동 저장한다.
+    if is_weekend_kst() or (n.hour, n.minute) < (15, 35):
         return
     key = f"BACKUP_SENT_{today()}"
     with LOCK:
@@ -6994,7 +6997,7 @@ class Handler(BaseHTTPRequestHandler):
                     + "<p style='color:#ff8087'>이 값을 캡처하거나 채팅에 보내지 마세요.</p>"
                     + f"<textarea id='rt' readonly style='width:100%;height:100px'>{token_html}</textarea>"
                     + "<button class='gold' onclick=\"navigator.clipboard.writeText(document.getElementById('rt').value)\">토큰 복사</button>"
-                    + "<p>저장 후 GOOGLE_DRIVE_UPLOAD_ENABLED를 true로 바꾸고 재배포하면 됩니다.</p>"
+                    + "<p>저장 후 재배포하면 Google Drive 자동 업로드가 기본 활성화됩니다.</p>"
                     + "</div></body></html>"
                 )
             except Exception as e:
