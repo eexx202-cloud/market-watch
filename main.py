@@ -1,4 +1,4 @@
-# OPERATING_V4_56_TOSS_OFFICIAL_1_2_5_KR_US_SELF_HEALING_GRADE1_PAPER_ONLY
+# OPERATING_V4_57_TOSS_OFFICIAL_1_2_9_KR_FIRST_CANDLE_DRIVE_IMMUTABLE_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -331,14 +331,17 @@ US_BACKUP_DELAY_MIN = max(2, int(os.environ.get("US_BACKUP_DELAY_MIN", "5")))
 
 
 # ============================================================
-# V4.48 한국시장 전용 데이터 보존·재생
-# - 공식 OpenAPI 1.2.5: prices 최대 200, candles 1m/1d,
+# V4.57 한국·미국 데이터 보존·재생
+# - 공식 OpenAPI 1.2.9: prices 최대 200, candles 1m/1d,
 #   orderbook/trades/price-limits/종목정보를 26종목 동일 조건으로 수집
 # - 미국시장 수집·가상매매·실주문 코드는 운영 경로에서 제거
 # ============================================================
-TOSS_OPENAPI_SPEC_VERSION = "1.2.5"
+TOSS_OPENAPI_SPEC_VERSION = "1.2.9"
 TOSS_OPENAPI_SPEC_URL = "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json"
 MARKET_MODE = "KR_US_PAPER_ONLY"
+KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get("KR_FIRST_CANDLE_REPAIR_START_MIN", "2")))
+KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get("KR_FIRST_CANDLE_REPAIR_END_MIN", "5")))
+KR_TARGETED_BACKFILL_RETRIES = max(1, min(5, int(os.environ.get("KR_TARGETED_BACKFILL_RETRIES", "3"))))
 ENABLE_RAW_API_CAPTURE = os.environ.get("ENABLE_RAW_API_CAPTURE", "true").lower() == "true"
 RAW_API_MAX_BODY_CHARS = int(os.environ.get("RAW_API_MAX_BODY_CHARS", "2000000"))
 # 호출 전 중앙 속도 제어. 공식 응답 헤더가 있으면 그 값을 우선 기록하고,
@@ -402,7 +405,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_56_TOSS_OFFICIAL_1_2_5_KR_US_SELF_HEALING_GRADE1_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_57_TOSS_OFFICIAL_1_2_9_KR_FIRST_CANDLE_DRIVE_IMMUTABLE_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -6219,6 +6222,7 @@ def maybe_capture_toss_market_data():
         if now_ts - to_float(state.get("last_candle_ts", 0)) >= MARKET_DATA_CANDLE_SEC:
             capture_candles_1m()
             state["last_candle_ts"] = now_ts
+        repair_kr_first_candle_during_open()
         if now_ts - to_float(state.get("last_orderflow_ts", 0)) >= MARKET_DATA_ORDERFLOW_SEC:
             capture_orderbook_and_trades()
             state["last_orderflow_ts"] = now_ts
@@ -6360,6 +6364,87 @@ def finalize_all_paper_accounts():
         }
         write_row(path,["time","ai_id","ai_name","action","symbol","name","price","qty","fee","pl","cash","asset","profit_rate","reason","partial","real_order"],row)
 
+def _kr_candle_csv_row(sym, candle):
+    close = to_float(candle.get("closePrice", 0))
+    volume = to_float(candle.get("volume", 0))
+    return {
+        "saved_at": now_text(), "symbol": sym,
+        "timestamp": str(candle.get("timestamp", "")),
+        "open": candle.get("openPrice", 0), "high": candle.get("highPrice", 0),
+        "low": candle.get("lowPrice", 0), "close": candle.get("closePrice", 0),
+        "volume": candle.get("volume", 0),
+        "estimated_trade_value": round(close * volume, 4),
+        "currency": candle.get("currency", "KRW"),
+    }
+
+def _fetch_kr_candle_at(sym, target, cal):
+    """공식 before(inclusive)를 사용해 특정 1분봉 하나를 직접 복구한다."""
+    target_iso = target.isoformat()
+    attempts = []
+    for attempt in range(1, KR_TARGETED_BACKFILL_RETRIES + 1):
+        code, data = api_get("/api/v1/candles", params={
+            "symbol": sym, "interval": "1m", "count": 1,
+            "before": target_iso, "adjusted": True,
+        }, timeout=12)
+        result = _result_dict(data)
+        candles = result.get("candles", []) if isinstance(result, dict) else []
+        returned = [str(x.get("timestamp", "")) for x in candles if isinstance(x, dict)]
+        attempts.append({"attempt": attempt, "http": code, "before": target_iso, "returned": returned})
+        for candle in candles if isinstance(candles, list) else []:
+            if not isinstance(candle, dict):
+                continue
+            dt = _parse_iso(candle.get("timestamp"))
+            if dt == target and _completed_session_candle(
+                candle.get("timestamp"), cal.get("date"),
+                cal.get("regular_start"), cal.get("regular_end")
+            ):
+                return _kr_candle_csv_row(sym, candle), attempts
+        _market_data_request_gap()
+    return None, attempts
+
+def _merge_kr_candle_rows(sym, new_rows):
+    headers = ["saved_at","symbol","timestamp","open","high","low","close","volume","estimated_trade_value","currency"]
+    merged = {}
+    for row in _read_csv_rows(candle_1m_path(sym)):
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            merged[ts] = {k: row.get(k, "") for k in headers}
+    for row in new_rows:
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            merged[ts] = row
+    _rewrite_csv(candle_1m_path(sym), headers, [merged[k] for k in sorted(merged)])
+
+def repair_kr_first_candle_during_open():
+    """09:02~09:05에 26종목의 09:00 봉을 검사하고 누락 종목만 복구한다."""
+    state = S.setdefault("market_data_capture", {})
+    cal = state.get("calendar", {})
+    start = _parse_iso(cal.get("regular_start"))
+    if not start or cal.get("date") != today():
+        return
+    n = now_kst()
+    if n.date() != start.astimezone(KST).date():
+        return
+    minute_from_open = int((n - start).total_seconds() // 60)
+    if not (KR_FIRST_CANDLE_REPAIR_START_MIN <= minute_from_open <= KR_FIRST_CANDLE_REPAIR_END_MIN):
+        return
+    minute_key = f"{today()}_{n.strftime('%H:%M')}"
+    if state.get("first_candle_repair_minute_key") == minute_key:
+        return
+    state["first_candle_repair_minute_key"] = minute_key
+    failures = []
+    for sym in ALL26_SYMBOLS:
+        existing = {_parse_iso(x.get("timestamp")) for x in _read_csv_rows(candle_1m_path(sym))}
+        if start in existing:
+            continue
+        row, attempts = _fetch_kr_candle_at(sym, start, cal)
+        if row:
+            _merge_kr_candle_rows(sym, [row])
+        else:
+            failures.append({"symbol": sym, "target": start.isoformat(), "attempts": attempts})
+    state["first_candle_repair_last_at"] = now_text()
+    state["first_candle_repair_failures"] = failures
+
 def finalize_kr_candles_grade1():
     """기존 정상 봉을 보존하며 공식 페이지네이션으로 정규장 완성봉을 복구한다."""
     state=S.setdefault("market_data_capture",{}); refresh_kr_market_calendar(True); cal=state.get("calendar",{})
@@ -6396,6 +6481,19 @@ def finalize_kr_candles_grade1():
             nxt=result.get("nextBefore") if isinstance(result,dict) else None
             if not nxt: break
             before=str(nxt); _market_data_request_gap()
+        # 페이지네이션 경계에서 빠진 봉은 공식 before(inclusive)로 직접 요청한다.
+        expected_times = [start + timedelta(minutes=i) for i in range(int((end-start).total_seconds()//60))]
+        present = {_parse_iso(ts) for ts in collected}
+        missing_times = [ts for ts in expected_times if ts not in present]
+        targeted_failures = []
+        for target in missing_times:
+            row, attempts = _fetch_kr_candle_at(sym, target, cal)
+            if row:
+                collected[str(row["timestamp"])] = row
+            else:
+                targeted_failures.append({"target": target.isoformat(), "attempts": attempts})
+        if targeted_failures:
+            failures.append(f"{sym}:TARGETED_BACKFILL_FAILED=" + json.dumps(targeted_failures, ensure_ascii=False, separators=(",", ":")))
         rows=[collected[k] for k in sorted(collected)]
         _rewrite_csv(candle_1m_path(sym),headers,rows)
         expected=int((end-start).total_seconds()//60)
@@ -6670,37 +6768,33 @@ def google_drive_find_file(access_token, filename):
 
 
 def google_drive_resumable_upload(path):
-    """큰 ZIP도 메모리에 전부 올리지 않고 8MiB 단위로 업로드한다."""
+    """기존 Drive 파일을 수정·삭제하지 않고 새 ZIP만 추가한다."""
     validate_backup_zip_for_drive(path)
     access_token = google_drive_access_token()
     filename = os.path.basename(path)
     total = os.path.getsize(path)
     local_md5 = file_md5(path)
     existing = google_drive_find_file(access_token, filename)
+    if existing and int(existing.get("size", -1)) == total and str(existing.get("md5Checksum", "")) == local_md5:
+        return existing
+    upload_filename = filename
+    if existing:
+        stem, ext = os.path.splitext(filename)
+        upload_filename = f"{stem}__{now_kst().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json; charset=UTF-8",
         "X-Upload-Content-Type": "application/zip",
         "X-Upload-Content-Length": str(total),
     }
-    if existing:
-        init_url = f"https://www.googleapis.com/upload/drive/v3/files/{existing['id']}"
-        init = requests.patch(
-            init_url,
-            headers=headers,
-            params={"uploadType": "resumable", "fields": "id,name,size,md5Checksum,webViewLink"},
-            json={"name": filename},
-            timeout=30,
-        )
-    else:
-        init_url = "https://www.googleapis.com/upload/drive/v3/files"
-        init = requests.post(
-            init_url,
-            headers=headers,
-            params={"uploadType": "resumable", "fields": "id,name,size,md5Checksum,webViewLink"},
-            json={"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]},
-            timeout=30,
-        )
+    init_url = "https://www.googleapis.com/upload/drive/v3/files"
+    init = requests.post(
+        init_url,
+        headers=headers,
+        params={"uploadType": "resumable", "fields": "id,name,size,md5Checksum,webViewLink"},
+        json={"name": upload_filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]},
+        timeout=30,
+    )
     if init.status_code not in (200, 201):
         raise RuntimeError(f"Drive resumable 세션 생성 실패 HTTP {init.status_code}: {init.text[:300]}")
     session_url = init.headers.get("Location", "")
@@ -7764,6 +7858,9 @@ def print_v431_selfcheck():
     print(" real_order_enabled=", ENABLE_REAL_ORDER, flush=True)
     print(" paper_accounts=", len(MULTI_AI_IDS), flush=True)
     print(" daily_candle_count=", MARKET_DATA_DAILY_COUNT, flush=True)
+    print(" kr_first_candle_repair_window=", f"09:{KR_FIRST_CANDLE_REPAIR_START_MIN:02d}~09:{KR_FIRST_CANDLE_REPAIR_END_MIN:02d}", flush=True)
+    print(" kr_targeted_backfill_retries=", KR_TARGETED_BACKFILL_RETRIES, flush=True)
+    print(" google_drive_existing_files_immutable=", True, flush=True)
     print(" market_data_request_gap_sec=", MARKET_DATA_REQUEST_GAP_SEC, flush=True)
     print(" all26_equal_capture=", len(ALL26_SYMBOLS) == 26, "symbols=", len(ALL26_SYMBOLS), flush=True)
     print(" legacy_profit_strategy_registry=", LEGACY_PROFIT_STRATEGY_REGISTRY, flush=True)
