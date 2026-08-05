@@ -1,4 +1,4 @@
-# OPERATING_V4_57_TOSS_OFFICIAL_1_2_9_KR_FIRST_CANDLE_DRIVE_IMMUTABLE_PAPER_ONLY
+# OPERATING_V4_60_TOSS_1_2_9_KR_US_GRADE1_DRIVE_APPEND_ONLY_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -51,6 +51,15 @@ GOOGLE_DRIVE_REDIRECT_URI = os.environ.get(
 # 자동 백업이 기본 동작이다. 명시적으로 false를 준 경우에만 Drive 업로드를 끈다.
 GOOGLE_DRIVE_UPLOAD_ENABLED = os.environ.get("GOOGLE_DRIVE_UPLOAD_ENABLED", "true").lower() == "true"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+# Drive 보존 강제 정책:
+# - 기존 파일 삭제 금지
+# - 기존 파일 휴지통 이동 금지
+# - 기존 파일 내용/이름/부모 폴더 수정 금지
+# - 업로드는 POST create-only 방식만 허용
+GOOGLE_DRIVE_APPEND_ONLY = True
+GOOGLE_DRIVE_ALLOW_DELETE = False
+GOOGLE_DRIVE_ALLOW_UPDATE = False
+GOOGLE_DRIVE_VERIFY_EXISTING_UNCHANGED = True
 GOOGLE_DRIVE_CHUNK_BYTES = 8 * 1024 * 1024
 GOOGLE_OAUTH_STATE = ""
 GOOGLE_OAUTH_STATE_EXPIRES_AT = 0.0
@@ -340,15 +349,15 @@ TOSS_OPENAPI_SPEC_VERSION = "1.2.9"
 TOSS_OPENAPI_SPEC_URL = "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json"
 MARKET_MODE = "KR_US_PAPER_ONLY"
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get("KR_FIRST_CANDLE_REPAIR_START_MIN", "2")))
-KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get("KR_FIRST_CANDLE_REPAIR_END_MIN", "5")))
-KR_TARGETED_BACKFILL_RETRIES = max(1, min(5, int(os.environ.get("KR_TARGETED_BACKFILL_RETRIES", "3"))))
+KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get("KR_FIRST_CANDLE_REPAIR_END_MIN", "15")))
+KR_TARGETED_BACKFILL_RETRIES = max(1, min(8, int(os.environ.get("KR_TARGETED_BACKFILL_RETRIES", "5"))))
 ENABLE_RAW_API_CAPTURE = os.environ.get("ENABLE_RAW_API_CAPTURE", "true").lower() == "true"
 RAW_API_MAX_BODY_CHARS = int(os.environ.get("RAW_API_MAX_BODY_CHARS", "2000000"))
 # 호출 전 중앙 속도 제어. 공식 응답 헤더가 있으면 그 값을 우선 기록하고,
 # 이 기본 간격은 429 예방용 보수적 하한이다.
 RATE_MIN_GAP_SEC = {
     "MARKET_DATA": max(0.10, float(os.environ.get("RATE_GAP_MARKET_DATA", "0.12"))),
-    "MARKET_DATA_CHART": max(0.20, float(os.environ.get("RATE_GAP_MARKET_DATA_CHART", "0.22"))),
+    "MARKET_DATA_CHART": max(0.24, float(os.environ.get("RATE_GAP_MARKET_DATA_CHART", "0.28"))),
     "MARKET_INFO": max(0.34, float(os.environ.get("RATE_GAP_MARKET_INFO", "0.36"))),
     "STOCK": max(0.20, float(os.environ.get("RATE_GAP_STOCK", "0.22"))),
     "RANKING": max(0.20, float(os.environ.get("RATE_GAP_RANKING", "0.22"))),
@@ -405,7 +414,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_57_TOSS_OFFICIAL_1_2_9_KR_FIRST_CANDLE_DRIVE_IMMUTABLE_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_60_TOSS_1_2_9_KR_US_GRADE1_DRIVE_APPEND_ONLY_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -6378,28 +6387,74 @@ def _kr_candle_csv_row(sym, candle):
     }
 
 def _fetch_kr_candle_at(sym, target, cal):
-    """공식 before(inclusive)를 사용해 특정 1분봉 하나를 직접 복구한다."""
-    target_iso = target.isoformat()
+    """
+    특정 정규장 1분봉을 정확히 복구한다.
+
+    2026-08-05 한국 원본에서 before=09:00 요청은 09:00 봉이 아니라
+    전 거래일 마지막 봉을 반환했다. 따라서 before는 exclusive로 취급한다.
+    목표봉 T를 얻기 위해 T+1분 경계를 우선 사용하며, 정확히 T와 일치하는
+    응답만 저장한다. 전날 봉이나 다른 시각 봉은 성공으로 인정하지 않는다.
+    """
     attempts = []
+
+    # 모두 목표봉보다 뒤의 경계다. 잘못된 before=target 방식으로 되돌아가지 않는다.
+    boundaries = [
+        target + timedelta(minutes=1),
+        target + timedelta(minutes=1, seconds=1),
+        target + timedelta(minutes=2),
+    ]
+
     for attempt in range(1, KR_TARGETED_BACKFILL_RETRIES + 1):
-        code, data = api_get("/api/v1/candles", params={
-            "symbol": sym, "interval": "1m", "count": 1,
-            "before": target_iso, "adjusted": True,
-        }, timeout=12)
+        boundary = boundaries[min(attempt - 1, len(boundaries) - 1)]
+        before_iso = boundary.isoformat()
+
+        code, data = api_get(
+            "/api/v1/candles",
+            params={
+                "symbol": sym,
+                "interval": "1m",
+                "count": 3,
+                "before": before_iso,
+                "adjusted": True,
+            },
+            timeout=12,
+        )
+
         result = _result_dict(data)
         candles = result.get("candles", []) if isinstance(result, dict) else []
-        returned = [str(x.get("timestamp", "")) for x in candles if isinstance(x, dict)]
-        attempts.append({"attempt": attempt, "http": code, "before": target_iso, "returned": returned})
-        for candle in candles if isinstance(candles, list) else []:
-            if not isinstance(candle, dict):
-                continue
-            dt = _parse_iso(candle.get("timestamp"))
-            if dt == target and _completed_session_candle(
-                candle.get("timestamp"), cal.get("date"),
-                cal.get("regular_start"), cal.get("regular_end")
-            ):
+        returned = [
+            str(item.get("timestamp", ""))
+            for item in candles
+            if isinstance(item, dict)
+        ]
+        attempts.append({
+            "attempt": attempt,
+            "http": code,
+            "target": target.isoformat(),
+            "before": before_iso,
+            "returned": returned,
+        })
+
+        if code == 200:
+            for candle in candles if isinstance(candles, list) else []:
+                if not isinstance(candle, dict):
+                    continue
+                candle_dt = _parse_iso(candle.get("timestamp"))
+                if candle_dt != target:
+                    continue
+                if not _completed_session_candle(
+                    candle.get("timestamp"),
+                    cal.get("date"),
+                    cal.get("regular_start"),
+                    cal.get("regular_end"),
+                ):
+                    continue
                 return _kr_candle_csv_row(sym, candle), attempts
+
+        # 429 및 순간 지연을 포함해 외부 재시도 간격을 둔다.
+        time.sleep(min(0.8 * attempt, 4.0))
         _market_data_request_gap()
+
     return None, attempts
 
 def _merge_kr_candle_rows(sym, new_rows):
@@ -6416,7 +6471,7 @@ def _merge_kr_candle_rows(sym, new_rows):
     _rewrite_csv(candle_1m_path(sym), headers, [merged[k] for k in sorted(merged)])
 
 def repair_kr_first_candle_during_open():
-    """09:02~09:05에 26종목의 09:00 봉을 검사하고 누락 종목만 복구한다."""
+    """09:02~09:15에 26종목의 09:00 봉을 반복 검사하고 누락 종목만 복구한다."""
     state = S.setdefault("market_data_capture", {})
     cal = state.get("calendar", {})
     start = _parse_iso(cal.get("regular_start"))
@@ -6583,8 +6638,22 @@ def create_backup_zip():
     """한국 1등급 검사를 수행하고 결과를 포함해 압축한다."""
     finalize_all_paper_accounts()
     repair_failures=repair_kr_required_files_before_backup()
-    backfill_ok,backfill_failures=finalize_kr_candles_grade1()
-    quality=audit_kr_grade1()
+
+    # 26종목 전부 390개가 될 때까지 복구와 검사를 반복한다.
+    # 정상 API 응답이 존재하는데 한 번의 경계/순간 오류로 2등급이 되는 것을 막는다.
+    backfill_ok = False
+    backfill_failures = []
+    quality = {"grade": "FAILED", "failures": ["NOT_CHECKED"], "details": {}}
+    for grade1_pass in range(1, 6):
+        pass_ok, pass_failures = finalize_kr_candles_grade1()
+        quality = audit_kr_grade1()
+        backfill_ok = pass_ok and quality.get("grade") == "GRADE_1"
+        backfill_failures.extend(
+            [f"PASS_{grade1_pass}:{x}" for x in pass_failures]
+        )
+        if backfill_ok:
+            break
+        time.sleep(min(grade1_pass * 2, 5))
     quality["repair_failures"]=repair_failures
     quality["backfill_ok"]=backfill_ok; quality["backfill_failures"]=backfill_failures
     S.setdefault("market_data_capture", {})["final_grade"] = quality.get("grade")
@@ -6637,6 +6706,18 @@ def create_backup_zip():
         )
 
     return path
+
+
+def assert_google_drive_append_only_source_guard():
+    """
+    운영 소스에 Drive 삭제·수정 요청이 추가되는 실수를 시작 시 탐지한다.
+    현재 허용되는 Drive 쓰기는 upload/drive/v3/files POST 신규 생성뿐이다.
+    """
+    if not GOOGLE_DRIVE_APPEND_ONLY:
+        raise RuntimeError("GOOGLE_DRIVE_APPEND_ONLY는 반드시 True여야 합니다.")
+    if GOOGLE_DRIVE_ALLOW_DELETE or GOOGLE_DRIVE_ALLOW_UPDATE:
+        raise RuntimeError("Google Drive 기존 파일 삭제/수정은 허용되지 않습니다.")
+    return True
 
 
 def google_drive_credentials_ready(require_refresh=True):
@@ -6752,6 +6833,71 @@ def file_md5(path):
     return digest.hexdigest()
 
 
+def google_drive_folder_snapshot(access_token):
+    """대상 폴더의 기존 파일 ID·이름·크기·MD5를 읽기 전용으로 스냅샷한다."""
+    files = []
+    page_token = None
+    while True:
+        params = {
+            "q": f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false",
+            "fields": "nextPageToken,files(id,name,size,md5Checksum,modifiedTime,parents,trashed)",
+            "pageSize": 1000,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        r = requests.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Drive 기존 파일 보호 스냅샷 실패 HTTP {r.status_code}: {r.text[:300]}")
+        payload = r.json()
+        files.extend(payload.get("files", []))
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
+    return {
+        str(item.get("id")): {
+            "name": str(item.get("name", "")),
+            "size": str(item.get("size", "")),
+            "md5Checksum": str(item.get("md5Checksum", "")),
+            "modifiedTime": str(item.get("modifiedTime", "")),
+            "parents": tuple(sorted(item.get("parents", []) or [])),
+            "trashed": bool(item.get("trashed", False)),
+        }
+        for item in files
+        if item.get("id")
+    }
+
+
+def verify_drive_existing_files_unchanged(before_snapshot, after_snapshot, new_file_id):
+    """새로 만든 파일을 제외한 기존 파일이 그대로인지 강제 검증한다."""
+    if not GOOGLE_DRIVE_VERIFY_EXISTING_UNCHANGED:
+        return
+    missing = []
+    changed = []
+    for file_id, before in before_snapshot.items():
+        if file_id == new_file_id:
+            continue
+        after = after_snapshot.get(file_id)
+        if after is None:
+            missing.append(file_id)
+            continue
+        if before != after:
+            changed.append({
+                "id": file_id,
+                "before": before,
+                "after": after,
+            })
+    if missing or changed:
+        raise RuntimeError(
+            "Drive 기존 파일 불변성 검증 실패: "
+            f"missing={missing[:10]}, changed={changed[:3]}"
+        )
+
+
 def google_drive_find_file(access_token, filename):
     escaped = filename.replace("\\", "\\\\").replace("'", "\\'")
     q = f"name = '{escaped}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
@@ -6768,9 +6914,15 @@ def google_drive_find_file(access_token, filename):
 
 
 def google_drive_resumable_upload(path):
-    """기존 Drive 파일을 수정·삭제하지 않고 새 ZIP만 추가한다."""
+    """기존 Drive 파일을 절대 건드리지 않고 새 ZIP만 추가한다."""
+    if not GOOGLE_DRIVE_APPEND_ONLY:
+        raise RuntimeError("Drive APPEND_ONLY 보호가 꺼져 있어 업로드를 중단합니다.")
+    if GOOGLE_DRIVE_ALLOW_DELETE or GOOGLE_DRIVE_ALLOW_UPDATE:
+        raise RuntimeError("Drive 삭제/수정 허용 설정이 감지되어 업로드를 중단합니다.")
+
     validate_backup_zip_for_drive(path)
     access_token = google_drive_access_token()
+    before_snapshot = google_drive_folder_snapshot(access_token)
     filename = os.path.basename(path)
     total = os.path.getsize(path)
     local_md5 = file_md5(path)
@@ -6846,6 +6998,15 @@ def google_drive_resumable_upload(path):
         raise RuntimeError(f"Drive 파일 크기 불일치: local={total}, drive={meta.get('size')}")
     if meta.get("md5Checksum") and str(meta.get("md5Checksum")) != local_md5:
         raise RuntimeError("Drive MD5 검증 불일치")
+
+    # 업로드 뒤 기존 파일의 ID·이름·크기·MD5·수정시각·부모·휴지통 상태가
+    # 하나도 변하지 않았는지 확인한다. 새 파일만 예외다.
+    after_snapshot = google_drive_folder_snapshot(access_token)
+    verify_drive_existing_files_unchanged(
+        before_snapshot,
+        after_snapshot,
+        str(meta.get("id", "")),
+    )
     return meta
 
 
@@ -6990,7 +7151,23 @@ def audit_us_grade1():
     return {"grade":"GRADE_1" if not failures else "GRADE_2_PARTIAL","failures":failures,"details":details}
 
 def create_us_backup_zip():
-    repair_failures=repair_us_required_files_before_backup();ok,backfill_failures=finalize_us_candles_grade1();quality=audit_us_grade1();quality["repair_failures"]=repair_failures;quality["backfill_ok"]=ok;quality["backfill_failures"]=backfill_failures
+    repair_failures = repair_us_required_files_before_backup()
+    ok = False
+    backfill_failures = []
+    quality = {"grade": "FAILED", "failures": ["NOT_CHECKED"], "details": {}}
+    for grade1_pass in range(1, 4):
+        pass_ok, pass_failures = finalize_us_candles_grade1()
+        quality = audit_us_grade1()
+        ok = pass_ok and quality.get("grade") == "GRADE_1"
+        backfill_failures.extend(
+            [f"PASS_{grade1_pass}:{x}" for x in pass_failures]
+        )
+        if ok:
+            break
+        time.sleep(min(grade1_pass * 2, 5))
+    quality["repair_failures"] = repair_failures
+    quality["backfill_ok"] = ok
+    quality["backfill_failures"] = backfill_failures
     with open(os.path.join(us_market_data_dir(),f"grade1_report_{us_trade_date_from_calendar()}.json"),"w",encoding="utf-8") as f:json.dump(quality,f,ensure_ascii=False,indent=2)
     path=os.path.join(us_day_dir(),f"backup_US_{us_trade_date_from_calendar()}.zip");base=us_day_dir();count=0;size=0
     with zipfile.ZipFile(path,"w",zipfile.ZIP_DEFLATED) as z:
@@ -7401,6 +7578,10 @@ class Handler(BaseHTTPRequestHandler):
                 "real_autosell_result_alert": ENABLE_REAL_AUTOSELL_RESULT_ALERT,
                 "daily_backup_alert": ENABLE_DAILY_BACKUP_ALERT,
                 "google_drive_upload_enabled": GOOGLE_DRIVE_UPLOAD_ENABLED,
+        "google_drive_append_only": GOOGLE_DRIVE_APPEND_ONLY,
+        "google_drive_allow_delete": GOOGLE_DRIVE_ALLOW_DELETE,
+        "google_drive_allow_update": GOOGLE_DRIVE_ALLOW_UPDATE,
+        "google_drive_verify_existing_unchanged": GOOGLE_DRIVE_VERIFY_EXISTING_UNCHANGED,
                 "google_drive_oauth_base_configured": google_drive_credentials_ready(require_refresh=False),
                 "google_drive_refresh_token_configured": bool(GOOGLE_DRIVE_REFRESH_TOKEN),
                 "google_drive_ready": google_drive_credentials_ready(require_refresh=True),
