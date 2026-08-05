@@ -1,4 +1,4 @@
-# OPERATING_V4_60_TOSS_1_2_9_KR_US_GRADE1_DRIVE_APPEND_ONLY_PAPER_ONLY
+# OPERATING_V4_61_TOSS_1_2_9_KR_CANDLE_CLOSE_LABEL_FIXED_DRIVE_APPEND_ONLY_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -414,7 +414,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_60_TOSS_1_2_9_KR_US_GRADE1_DRIVE_APPEND_ONLY_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_61_TOSS_1_2_9_KR_CANDLE_CLOSE_LABEL_FIXED_DRIVE_APPEND_ONLY_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -6373,6 +6373,29 @@ def finalize_all_paper_accounts():
         }
         write_row(path,["time","ai_id","ai_name","action","symbol","name","price","qty","fee","pl","cash","asset","profit_rate","reason","partial","real_order"],row)
 
+def _completed_kr_trading_candle(ts, session_date, session_start, session_end, now_value=None):
+    """
+    국내 1분봉은 실제 원본에서 분 구간의 종료시각으로 라벨된다.
+    정규장 09:00~15:30의 390개 거래분봉은 09:01~15:30이다.
+    09:00의 0거래량 기준봉은 거래분봉 집계에서 제외한다.
+    """
+    dt = _parse_iso(ts)
+    start = _parse_iso(session_start)
+    end = _parse_iso(session_end)
+    now_value = now_value or now_kst()
+    if not dt or not start or not end:
+        return False
+    if session_date and dt.astimezone(KST).date().isoformat() != str(session_date):
+        return False
+    current_minute = now_value.replace(second=0, microsecond=0)
+    return start < dt <= end and dt < current_minute
+
+
+def _kr_expected_candle_times(start, end):
+    count = int((end - start).total_seconds() // 60)
+    return [start + timedelta(minutes=i) for i in range(1, count + 1)]
+
+
 def _kr_candle_csv_row(sym, candle):
     close = to_float(candle.get("closePrice", 0))
     volume = to_float(candle.get("volume", 0))
@@ -6388,26 +6411,12 @@ def _kr_candle_csv_row(sym, candle):
 
 def _fetch_kr_candle_at(sym, target, cal):
     """
-    특정 정규장 1분봉을 정확히 복구한다.
-
-    2026-08-05 한국 원본에서 before=09:00 요청은 09:00 봉이 아니라
-    전 거래일 마지막 봉을 반환했다. 따라서 before는 exclusive로 취급한다.
-    목표봉 T를 얻기 위해 T+1분 경계를 우선 사용하며, 정확히 T와 일치하는
-    응답만 저장한다. 전날 봉이나 다른 시각 봉은 성공으로 인정하지 않는다.
+    토스 공식 Open API 1.2.9의 before는 inclusive다.
+    before=target을 그대로 사용하고, 정확히 target과 일치하는 봉만 저장한다.
     """
     attempts = []
-
-    # 모두 목표봉보다 뒤의 경계다. 잘못된 before=target 방식으로 되돌아가지 않는다.
-    boundaries = [
-        target + timedelta(minutes=1),
-        target + timedelta(minutes=1, seconds=1),
-        target + timedelta(minutes=2),
-    ]
-
     for attempt in range(1, KR_TARGETED_BACKFILL_RETRIES + 1):
-        boundary = boundaries[min(attempt - 1, len(boundaries) - 1)]
-        before_iso = boundary.isoformat()
-
+        before_iso = target.isoformat()
         code, data = api_get(
             "/api/v1/candles",
             params={
@@ -6419,14 +6428,9 @@ def _fetch_kr_candle_at(sym, target, cal):
             },
             timeout=12,
         )
-
         result = _result_dict(data)
         candles = result.get("candles", []) if isinstance(result, dict) else []
-        returned = [
-            str(item.get("timestamp", ""))
-            for item in candles
-            if isinstance(item, dict)
-        ]
+        returned = [str(item.get("timestamp", "")) for item in candles if isinstance(item, dict)]
         attempts.append({
             "attempt": attempt,
             "http": code,
@@ -6434,15 +6438,13 @@ def _fetch_kr_candle_at(sym, target, cal):
             "before": before_iso,
             "returned": returned,
         })
-
         if code == 200:
             for candle in candles if isinstance(candles, list) else []:
                 if not isinstance(candle, dict):
                     continue
-                candle_dt = _parse_iso(candle.get("timestamp"))
-                if candle_dt != target:
+                if _parse_iso(candle.get("timestamp")) != target:
                     continue
-                if not _completed_session_candle(
+                if not _completed_kr_trading_candle(
                     candle.get("timestamp"),
                     cal.get("date"),
                     cal.get("regular_start"),
@@ -6450,11 +6452,8 @@ def _fetch_kr_candle_at(sym, target, cal):
                 ):
                     continue
                 return _kr_candle_csv_row(sym, candle), attempts
-
-        # 429 및 순간 지연을 포함해 외부 재시도 간격을 둔다.
         time.sleep(min(0.8 * attempt, 4.0))
         _market_data_request_gap()
-
     return None, attempts
 
 def _merge_kr_candle_rows(sym, new_rows):
@@ -6471,7 +6470,7 @@ def _merge_kr_candle_rows(sym, new_rows):
     _rewrite_csv(candle_1m_path(sym), headers, [merged[k] for k in sorted(merged)])
 
 def repair_kr_first_candle_during_open():
-    """09:02~09:15에 26종목의 09:00 봉을 반복 검사하고 누락 종목만 복구한다."""
+    """09:02~09:15에 26종목의 첫 거래분봉(09:01)을 반복 검사한다."""
     state = S.setdefault("market_data_capture", {})
     cal = state.get("calendar", {})
     start = _parse_iso(cal.get("regular_start"))
@@ -6490,13 +6489,14 @@ def repair_kr_first_candle_during_open():
     failures = []
     for sym in ALL26_SYMBOLS:
         existing = {_parse_iso(x.get("timestamp")) for x in _read_csv_rows(candle_1m_path(sym))}
-        if start in existing:
+        first_trade_candle = start + timedelta(minutes=1)
+        if first_trade_candle in existing:
             continue
-        row, attempts = _fetch_kr_candle_at(sym, start, cal)
+        row, attempts = _fetch_kr_candle_at(sym, first_trade_candle, cal)
         if row:
             _merge_kr_candle_rows(sym, [row])
         else:
-            failures.append({"symbol": sym, "target": start.isoformat(), "attempts": attempts})
+            failures.append({"symbol": sym, "target": first_trade_candle.isoformat(), "attempts": attempts})
     state["first_candle_repair_last_at"] = now_text()
     state["first_candle_repair_failures"] = failures
 
@@ -6513,7 +6513,7 @@ def finalize_kr_candles_grade1():
         collected={}
         for row in _read_csv_rows(candle_1m_path(sym)):
             ts=str(row.get("timestamp", "")); dt=_parse_iso(ts)
-            if dt and start <= dt < end:
+            if dt and start < dt <= end:
                 collected[ts]={k:row.get(k, "") for k in headers}
         before=end.isoformat(); seen=set()
         for _ in range(4):
@@ -6526,7 +6526,7 @@ def finalize_kr_candles_grade1():
             page_times=[]
             for c in candles if isinstance(candles,list) else []:
                 ts=str(c.get("timestamp",""))
-                if _completed_session_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
+                if _completed_kr_trading_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
                     dt=_parse_iso(ts)
                     if dt: page_times.append(dt)
                     collected[ts]={"saved_at":now_text(),"symbol":sym,"timestamp":ts,"open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),"close":c.get("closePrice",0),"volume":c.get("volume",0),"estimated_trade_value":round(to_float(c.get("closePrice",0))*to_float(c.get("volume",0)),4),"currency":c.get("currency","KRW")}
@@ -6537,7 +6537,7 @@ def finalize_kr_candles_grade1():
             if not nxt: break
             before=str(nxt); _market_data_request_gap()
         # 페이지네이션 경계에서 빠진 봉은 공식 before(inclusive)로 직접 요청한다.
-        expected_times = [start + timedelta(minutes=i) for i in range(int((end-start).total_seconds()//60))]
+        expected_times = _kr_expected_candle_times(start, end)
         present = {_parse_iso(ts) for ts in collected}
         missing_times = [ts for ts in expected_times if ts not in present]
         targeted_failures = []
@@ -6552,7 +6552,7 @@ def finalize_kr_candles_grade1():
         rows=[collected[k] for k in sorted(collected)]
         _rewrite_csv(candle_1m_path(sym),headers,rows)
         expected=int((end-start).total_seconds()//60)
-        if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start or _parse_iso(rows[-1]["timestamp"])!=end-timedelta(minutes=1):
+        if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start+timedelta(minutes=1) or _parse_iso(rows[-1]["timestamp"])!=end:
             failures.append(f"{sym}:CANDLES_{len(rows)}")
     return not failures,failures
 
@@ -6611,10 +6611,10 @@ def audit_kr_grade1():
         rows=_read_csv_rows(candle_1m_path(sym)); times=[_parse_iso(r.get("timestamp")) for r in rows]; times=[x for x in times if x]
         gaps=sum(max(0,int((b-a).total_seconds()//60)-1) for a,b in zip(times,times[1:]))
         reverse=sum(1 for a,b in zip(times,times[1:]) if b<=a)
-        future=sum(1 for x in times if x>=end)
+        future=sum(1 for x in times if x>end)
         bad_ohlcv=sum(1 for r in rows if any(str(r.get(k,""))=="" for k in ("open","high","low","close","volume")))
         bad_amount=sum(1 for r in rows if str(r.get("estimated_trade_value",""))=="")
-        ok=len(rows)==expected and times and times[0]==start and times[-1]==end-timedelta(minutes=1) and len(times)==len(set(times)) and gaps==0 and reverse==0 and future==0 and bad_ohlcv==0 and bad_amount==0
+        ok=len(rows)==expected and times and times[0]==start+timedelta(minutes=1) and times[-1]==end and len(times)==len(set(times)) and gaps==0 and reverse==0 and future==0 and bad_ohlcv==0 and bad_amount==0
         if not os.path.isfile(orderbook_path(sym)) or not _read_csv_rows(orderbook_path(sym)): ok=False; failures.append(f"{sym}:ORDERBOOK")
         if not os.path.isfile(trades_path(sym)) or not _read_csv_rows(trades_path(sym)): ok=False; failures.append(f"{sym}:TRADES")
         snapshots=_read_csv_rows(price_snapshot_path(sym))
@@ -6639,7 +6639,7 @@ def create_backup_zip():
     finalize_all_paper_accounts()
     repair_failures=repair_kr_required_files_before_backup()
 
-    # 26종목 전부 390개가 될 때까지 복구와 검사를 반복한다.
+    # 26종목 전부 공식 거래분봉 09:01~15:30 390개가 될 때까지 반복한다.
     # 정상 API 응답이 존재하는데 한 번의 경계/순간 오류로 2등급이 되는 것을 막는다.
     backfill_ok = False
     backfill_failures = []
@@ -7072,7 +7072,7 @@ def finalize_us_candles_grade1():
                 # 미국 정규장은 KST 자정을 넘는다. cal.date는 미국 현지 거래일이므로
                 # KST 날짜와 비교하면 자정 이후 정상 봉이 전부 탈락한다. 날짜가 아니라
                 # 공식 regularMarket startTime <= ts < endTime 범위로만 판정한다.
-                if _completed_session_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
+                if _completed_kr_trading_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
                     page_times.append(_parse_iso(ts))
                     close=to_float(c.get("closePrice",0));volume=to_float(c.get("volume",0));collected[ts]={"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"timestamp":ts,"open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),"close":c.get("closePrice",0),"volume":c.get("volume",0),"estimated_trade_value":round(close*volume,4),"currency":c.get("currency","USD")}
             # 기존 CSV의 첫 봉이 아니라 이번 API 페이지의 가장 오래된 봉으로
@@ -7084,7 +7084,7 @@ def finalize_us_candles_grade1():
             before=str(nxt);_market_data_request_gap()
         rows=[collected[k] for k in sorted(collected)];_rewrite_csv(us_data_path("candles_1m",sym),headers,rows)
         expected=int((end-start).total_seconds()//60)
-        if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start or _parse_iso(rows[-1]["timestamp"])!=end-timedelta(minutes=1): failures.append(f"{sym}:CANDLES_{len(rows)}")
+        if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start+timedelta(minutes=1) or _parse_iso(rows[-1]["timestamp"])!=end: failures.append(f"{sym}:CANDLES_{len(rows)}")
     return not failures,failures
 
 def repair_us_required_files_before_backup():
