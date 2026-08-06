@@ -1,4 +1,4 @@
-# OPERATING_V4_61_TOSS_1_2_9_KR_CANDLE_CLOSE_LABEL_FIXED_DRIVE_APPEND_ONLY_PAPER_ONLY
+# OPERATING_V4_63_TOSS_1_2_9_DRIVE_STRICT_GRADE1_VERIFY_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -10,6 +10,8 @@ import time
 import uuid
 import threading
 import zipfile
+import io
+import tempfile
 import xml.etree.ElementTree as ET
 import hashlib
 import random
@@ -414,7 +416,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_61_TOSS_1_2_9_KR_CANDLE_CLOSE_LABEL_FIXED_DRIVE_APPEND_ONLY_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_63_TOSS_1_2_9_DRIVE_STRICT_GRADE1_VERIFY_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -6913,6 +6915,361 @@ def google_drive_find_file(access_token, filename):
     return files[0] if files else None
 
 
+def google_drive_find_today_backup(access_token, trade_date=None):
+    """Drive 대상 폴더에서 해당 날짜 한국시장 백업을 읽기 전용으로 찾는다."""
+    trade_date = trade_date or today()
+    exact_name = f"backup_{trade_date}.zip"
+    escaped = exact_name.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name = '{escaped}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+    r = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "q": q,
+            "fields": "files(id,name,size,md5Checksum,modifiedTime,webViewLink)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": 100,
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Drive 오늘 백업 조회 실패 HTTP {r.status_code}: {r.text[:300]}")
+    files = r.json().get("files", [])
+    if files:
+        return files[0]
+
+    # 동일 날짜 중복 업로드 파일(__시각_난수.zip)은 정확한 원본이 없을 때만 후보로 사용한다.
+    prefix = f"backup_{trade_date}__"
+    escaped_prefix = prefix.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name contains '{escaped_prefix}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+    r = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "q": q,
+            "fields": "files(id,name,size,md5Checksum,modifiedTime,webViewLink)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": 100,
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Drive 오늘 백업 후보 조회 실패 HTTP {r.status_code}: {r.text[:300]}")
+    candidates = [x for x in r.json().get("files", []) if str(x.get("name", "")).startswith(prefix) and str(x.get("name", "")).endswith(".zip")]
+    return candidates[0] if candidates else None
+
+
+def google_drive_download_file(access_token, file_meta, destination_path):
+    """Drive 파일을 읽기 전용 alt=media 방식으로 다운로드하고 크기·MD5를 검증한다."""
+    file_id = str((file_meta or {}).get("id", "")).strip()
+    if not file_id:
+        raise RuntimeError("다운로드할 Drive 파일 ID가 없습니다.")
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    h = hashlib.md5()
+    total = 0
+    with requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{quote(file_id, safe='')}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"alt": "media"},
+        stream=True,
+        timeout=120,
+    ) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"Drive 백업 다운로드 실패 HTTP {r.status_code}: {r.text[:300]}")
+        with open(destination_path, "wb") as out:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                out.write(chunk)
+                h.update(chunk)
+                total += len(chunk)
+    expected_size = int(to_float(file_meta.get("size", 0), 0))
+    expected_md5 = str(file_meta.get("md5Checksum", "") or "").lower()
+    if expected_size and total != expected_size:
+        raise RuntimeError(f"Drive 다운로드 크기 불일치 expected={expected_size} actual={total}")
+    if expected_md5 and h.hexdigest().lower() != expected_md5:
+        raise RuntimeError(f"Drive 다운로드 MD5 불일치 expected={expected_md5} actual={h.hexdigest()}")
+    return {"bytes": total, "md5": h.hexdigest()}
+
+
+def _zip_find_member(names, basename, contains=None):
+    matches = []
+    for name in names:
+        norm = name.replace("\\", "/")
+        if norm.endswith("/"):
+            continue
+        if os.path.basename(norm) != basename:
+            continue
+        if contains and contains not in norm:
+            continue
+        matches.append(name)
+    return sorted(matches, key=lambda x: (len(x), x))[0] if matches else ""
+
+
+def _zip_read_csv(z, member):
+    if not member:
+        return []
+    with z.open(member, "r") as raw:
+        text = io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="")
+        return list(csv.DictReader(text))
+
+
+def inspect_downloaded_kr_backup_zip(path, expected_date=None):
+    """Drive 다운로드 ZIP을 독립적으로 열어 한국시장 엄격 1등급 조건을 검사한다."""
+    expected_date = expected_date or today()
+    failures = []
+    details = {}
+    result = {
+        "checked_at_kst": now_text(), "file": os.path.basename(path),
+        "trade_date": expected_date, "grade": "FAILED", "failures": failures,
+        "symbol_count": 0, "paper_csv_count": 0, "paper_state_count": 0,
+        "crc_ok": False, "manifest_ok": False, "paper_only_ok": False,
+        "zip_member_count": 0, "details": details,
+    }
+    if not os.path.isfile(path):
+        failures.append("ZIP_FILE_MISSING")
+        return result
+
+    def add_failure(text):
+        if text not in failures:
+            failures.append(text)
+
+    def members_by_basename(names, basename):
+        return [n for n in names if (not n.replace("\\", "/").endswith("/")) and os.path.basename(n.replace("\\", "/")) == basename]
+
+    def one_member(names, basename, label):
+        found = members_by_basename(names, basename)
+        if len(found) == 0:
+            add_failure(f"{label}_MISSING:{basename}")
+            return ""
+        if len(found) > 1:
+            add_failure(f"{label}_DUPLICATE:{basename}:{len(found)}")
+            return ""
+        return found[0]
+
+    def nonblank(row, keys):
+        return all(str(row.get(k, "")).strip() != "" for k in keys)
+
+    def finite_number(value):
+        try:
+            v = float(str(value).replace(",", "").strip())
+            return v == v and v not in (float("inf"), float("-inf"))
+        except Exception:
+            return False
+
+    def csv_timestamp_health(rows, key):
+        parsed = [_parse_iso(r.get(key)) for r in rows]
+        valid = [(KST.localize(x) if x.tzinfo is None else x.astimezone(KST)) for x in parsed if x]
+        invalid = len(rows) - len(valid)
+        reverse = sum(1 for a, b in zip(valid, valid[1:]) if b < a)
+        duplicate = len(valid) - len(set(valid))
+        wrong_day = sum(1 for x in valid if x.date().isoformat() != expected_date)
+        return valid, invalid, reverse, duplicate, wrong_day
+
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            bad = z.testzip()
+            if bad:
+                add_failure(f"ZIP_CRC_FAILED:{bad}")
+                return result
+            result["crc_ok"] = True
+            names = [n for n in z.namelist() if not n.replace("\\", "/").endswith("/")]
+            result["zip_member_count"] = len(names)
+            if len(names) != len(set(names)):
+                add_failure("ZIP_DUPLICATE_MEMBER_NAMES")
+
+            manifest_member = one_member(names, "backup_manifest.json", "BACKUP_MANIFEST")
+            manifest = {}
+            if manifest_member:
+                try:
+                    manifest = json.loads(z.read(manifest_member).decode("utf-8-sig"))
+                    if not isinstance(manifest, dict):
+                        raise ValueError("manifest is not object")
+                except Exception as e:
+                    add_failure(f"BACKUP_MANIFEST_INVALID:{str(e)[:120]}")
+                    manifest = {}
+
+            if manifest:
+                manifest_date = str(manifest.get("kr_log_date") or manifest.get("trade_date") or "")
+                manifest_symbols = [str(x) for x in (manifest.get("kr_symbols") or [])]
+                manifest_count = int(to_float(manifest.get("kr_symbol_count", 0), 0))
+                included_files = int(to_float(manifest.get("included_files", -1), -1))
+                if manifest_date != expected_date:
+                    add_failure(f"MANIFEST_DATE_MISMATCH:{manifest_date}")
+                if manifest_count != len(ALL26_SYMBOLS):
+                    add_failure(f"MANIFEST_SYMBOL_COUNT:{manifest_count}")
+                if set(manifest_symbols) != set(ALL26_SYMBOLS) or len(manifest_symbols) != len(ALL26_SYMBOLS):
+                    add_failure("MANIFEST_SYMBOL_LIST_MISMATCH")
+                if included_files != len(names) - 1:
+                    add_failure(f"MANIFEST_INCLUDED_FILES_MISMATCH:{included_files}!={len(names)-1}")
+                if str(manifest.get("data_quality_grade", "")) != "GRADE_1":
+                    add_failure(f"MANIFEST_GRADE_NOT_1:{manifest.get('data_quality_grade')}")
+                if list(manifest.get("data_quality_failures") or []):
+                    add_failure("MANIFEST_HAS_QUALITY_FAILURES")
+                if int(to_float(manifest.get("paper_account_files", 0), 0)) != len(MULTI_AI_IDS):
+                    add_failure(f"MANIFEST_PAPER_ACCOUNT_COUNT:{manifest.get('paper_account_files')}")
+                safety_ok = (
+                    manifest.get("paper_only_mode") is True
+                    and manifest.get("real_order_enabled") is False
+                    and manifest.get("real_auto_buy") is False
+                    and manifest.get("real_auto_sell") is False
+                )
+                result["paper_only_ok"] = safety_ok
+                if not safety_ok:
+                    add_failure("MANIFEST_REAL_ORDER_SAFETY_FAILED")
+                result["manifest_ok"] = not any(x.startswith("MANIFEST_") or x.startswith("BACKUP_MANIFEST") for x in failures)
+
+            expected_times = [
+                KST.localize(datetime.strptime(expected_date + " 09:01", "%Y-%m-%d %H:%M")) + timedelta(minutes=i)
+                for i in range(390)
+            ]
+            expected_iso = [x.isoformat() for x in expected_times]
+            passed_symbols = 0
+
+            for sym in ALL26_SYMBOLS:
+                candle_member = one_member(names, os.path.basename(candle_1m_path(sym)), f"{sym}:MINUTE")
+                orderbook_member = one_member(names, os.path.basename(orderbook_path(sym)), f"{sym}:ORDERBOOK")
+                trades_member = one_member(names, os.path.basename(trades_path(sym)), f"{sym}:TRADES")
+                snapshot_member = one_member(names, os.path.basename(price_snapshot_path(sym)), f"{sym}:SNAPSHOT")
+                daily_member = one_member(names, os.path.basename(candle_daily_path(sym)), f"{sym}:DAILY")
+                metadata_member = one_member(names, os.path.basename(stock_metadata_path(sym)), f"{sym}:METADATA")
+
+                rows = _zip_read_csv(z, candle_member)
+                times, ts_invalid, reverse, duplicate, wrong_day = csv_timestamp_health(rows, "timestamp")
+                actual_iso = [x.isoformat() for x in times]
+                bad_ohlcv = 0
+                bad_symbol = 0
+                bad_price_relation = 0
+                for r in rows:
+                    if str(r.get("symbol", "")) != sym:
+                        bad_symbol += 1
+                    if not nonblank(r, ("open", "high", "low", "close", "volume")) or not all(finite_number(r.get(k)) for k in ("open", "high", "low", "close", "volume")):
+                        bad_ohlcv += 1
+                        continue
+                    o,h,l,c,v = (float(r[k]) for k in ("open","high","low","close","volume"))
+                    if h < max(o,l,c) or l > min(o,h,c) or v < 0:
+                        bad_price_relation += 1
+                minute_ok = (
+                    len(rows) == 390 and actual_iso == expected_iso and ts_invalid == 0
+                    and reverse == 0 and duplicate == 0 and wrong_day == 0
+                    and bad_ohlcv == 0 and bad_symbol == 0 and bad_price_relation == 0
+                )
+
+                orderbook_rows = _zip_read_csv(z, orderbook_member)
+                ob_times, ob_invalid, ob_reverse, _, ob_wrong_day = csv_timestamp_health(orderbook_rows, "saved_at")
+                orderbook_bad = sum(1 for r in orderbook_rows if str(r.get("symbol", "")) != sym or not nonblank(r, ("best_ask","best_bid","asks_json","bids_json")))
+                orderbook_ok = len(orderbook_rows) >= 300 and ob_invalid == 0 and ob_reverse == 0 and ob_wrong_day == 0 and orderbook_bad == 0
+
+                trade_rows = _zip_read_csv(z, trades_member)
+                tr_times, tr_invalid, tr_reverse, _, tr_wrong_day = csv_timestamp_health(trade_rows, "timestamp")
+                trade_bad = sum(1 for r in trade_rows if str(r.get("symbol", "")) != sym or not nonblank(r, ("price","volume")) or not finite_number(r.get("price")) or not finite_number(r.get("volume")))
+                trades_ok = len(trade_rows) > 0 and tr_invalid == 0 and tr_reverse == 0 and tr_wrong_day == 0 and trade_bad == 0
+
+                snapshot_rows = _zip_read_csv(z, snapshot_member)
+                sp_times, sp_invalid, sp_reverse, _, sp_wrong_day = csv_timestamp_health(snapshot_rows, "saved_at")
+                snapshot_bad = sum(1 for r in snapshot_rows if str(r.get("symbol", "")) != sym or not nonblank(r, ("last_price",)) or not finite_number(r.get("last_price")))
+                snapshot_ok = len(snapshot_rows) >= 300 and sp_invalid == 0 and sp_reverse == 0 and sp_wrong_day == 0 and snapshot_bad == 0
+
+                daily_rows = _zip_read_csv(z, daily_member)
+                daily_bad = sum(1 for r in daily_rows if str(r.get("symbol", "")) != sym or not nonblank(r, ("timestamp","open","high","low","close","volume")))
+                daily_ok = len(daily_rows) > 0 and daily_bad == 0
+
+                metadata_rows = _zip_read_csv(z, metadata_member)
+                metadata_http_ok = bool(metadata_rows) and all(str(metadata_rows[-1].get(k, "")) == "200" for k in ("stock_http","warning_http","limits_http"))
+                metadata_ok = metadata_http_ok and str(metadata_rows[-1].get("symbol", "")) == sym
+
+                sym_ok = minute_ok and orderbook_ok and trades_ok and snapshot_ok and daily_ok and metadata_ok
+                if sym_ok:
+                    passed_symbols += 1
+                else:
+                    if not minute_ok: add_failure(f"{sym}:MINUTE_INVALID rows={len(rows)} ts_invalid={ts_invalid} reverse={reverse} duplicate={duplicate} wrong_day={wrong_day} ohlcv={bad_ohlcv} symbol={bad_symbol} relation={bad_price_relation}")
+                    if not orderbook_ok: add_failure(f"{sym}:ORDERBOOK_INVALID rows={len(orderbook_rows)} invalid_ts={ob_invalid} reverse={ob_reverse} wrong_day={ob_wrong_day} bad={orderbook_bad}")
+                    if not trades_ok: add_failure(f"{sym}:TRADES_INVALID rows={len(trade_rows)} invalid_ts={tr_invalid} reverse={tr_reverse} wrong_day={tr_wrong_day} bad={trade_bad}")
+                    if not snapshot_ok: add_failure(f"{sym}:SNAPSHOT_INVALID rows={len(snapshot_rows)} invalid_ts={sp_invalid} reverse={sp_reverse} wrong_day={sp_wrong_day} bad={snapshot_bad}")
+                    if not daily_ok: add_failure(f"{sym}:DAILY_INVALID rows={len(daily_rows)} bad={daily_bad}")
+                    if not metadata_ok: add_failure(f"{sym}:METADATA_INVALID rows={len(metadata_rows)} http_ok={metadata_http_ok}")
+                details[sym] = {
+                    "ok": sym_ok, "minute_rows": len(rows),
+                    "first": actual_iso[0] if actual_iso else "", "last": actual_iso[-1] if actual_iso else "",
+                    "minute_invalid_timestamp": ts_invalid, "minute_reverse": reverse,
+                    "minute_duplicate": duplicate, "minute_wrong_day": wrong_day,
+                    "ohlcv_invalid": bad_ohlcv, "symbol_mismatch": bad_symbol,
+                    "ohlc_relation_invalid": bad_price_relation,
+                    "orderbook_rows": len(orderbook_rows), "orderbook_ok": orderbook_ok,
+                    "trade_rows": len(trade_rows), "trades_ok": trades_ok,
+                    "snapshot_rows": len(snapshot_rows), "snapshot_ok": snapshot_ok,
+                    "daily_rows": len(daily_rows), "daily_ok": daily_ok,
+                    "metadata_http_ok": metadata_http_ok,
+                }
+            result["symbol_count"] = passed_symbols
+
+            paper_csv_count = 0
+            paper_state_count = 0
+            for account_id in MULTI_AI_IDS:
+                csv_member = one_member(names, os.path.basename(multi_ai_path(account_id)), f"PAPER_CSV:{account_id}")
+                state_member = one_member(names, os.path.basename(multi_ai_state_path(account_id)), f"PAPER_STATE:{account_id}")
+                csv_rows = _zip_read_csv(z, csv_member)
+                if csv_member and csv_rows:
+                    paper_csv_count += 1
+                else:
+                    add_failure(f"PAPER_CSV_INVALID:{account_id}")
+                if state_member:
+                    try:
+                        state_obj = json.loads(z.read(state_member).decode("utf-8-sig"))
+                        if isinstance(state_obj, dict):
+                            paper_state_count += 1
+                        else:
+                            add_failure(f"PAPER_STATE_INVALID:{account_id}")
+                    except Exception:
+                        add_failure(f"PAPER_STATE_INVALID:{account_id}")
+            result["paper_csv_count"] = paper_csv_count
+            result["paper_state_count"] = paper_state_count
+            if paper_csv_count != len(MULTI_AI_IDS) or paper_state_count != len(MULTI_AI_IDS):
+                add_failure(f"PAPER_ACCOUNT_COUNT csv={paper_csv_count} state={paper_state_count} expected={len(MULTI_AI_IDS)}")
+    except zipfile.BadZipFile:
+        add_failure("ZIP_OPEN_FAILED:BAD_ZIP")
+    except Exception as e:
+        add_failure(f"ZIP_INSPECTION_ERROR:{str(e)[:300]}")
+
+    result["grade"] = "GRADE_1" if not failures else "FAILED"
+    return result
+
+def verify_today_backup_from_google_drive(trade_date=None):
+    """오늘 Drive 백업을 직접 찾아 다운로드·CRC·내부 1등급 검사를 수행한다."""
+    trade_date = trade_date or today()
+    access_token = google_drive_access_token()
+    meta = google_drive_find_today_backup(access_token, trade_date)
+    if not meta:
+        return False, {
+            "grade": "FAILED",
+            "trade_date": trade_date,
+            "failures": [f"DRIVE_FILE_NOT_FOUND:backup_{trade_date}.zip"],
+        }
+    verify_dir = os.path.join(LOG_ROOT, trade_date, "drive_verify")
+    local_path = os.path.join(verify_dir, str(meta.get("name") or f"backup_{trade_date}.zip"))
+    download_meta = google_drive_download_file(access_token, meta, local_path)
+    report = inspect_downloaded_kr_backup_zip(local_path, trade_date)
+    report["drive_file_id"] = str(meta.get("id", ""))
+    report["drive_file_name"] = str(meta.get("name", ""))
+    report["drive_file_size"] = int(to_float(meta.get("size", 0), 0))
+    report["drive_md5"] = str(meta.get("md5Checksum", ""))
+    report["downloaded_bytes"] = download_meta.get("bytes", 0)
+    report["downloaded_md5"] = download_meta.get("md5", "")
+    os.makedirs(verify_dir, exist_ok=True)
+    report_path = os.path.join(verify_dir, f"drive_grade1_report_{trade_date}.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    with LOCK:
+        S["google_drive"].update({
+            "verify_status": "GRADE_1" if report.get("grade") == "GRADE_1" else "FAILED",
+            "verify_checked_at": now_text(),
+            "verify_file_name": report.get("drive_file_name", ""),
+            "verify_report_path": report_path,
+            "verify_failures": report.get("failures", [])[:100],
+        })
+    return report.get("grade") == "GRADE_1", report
+
+
 def google_drive_resumable_upload(path):
     """기존 Drive 파일을 절대 건드리지 않고 새 ZIP만 추가한다."""
     if not GOOGLE_DRIVE_APPEND_ONLY:
@@ -7248,16 +7605,30 @@ def maybe_send_daily_backup():
         if drive_ok:
             size_mb = int(result.get("size", 0)) / (1024 * 1024)
             drive_link = str(result.get("webViewLink", ""))
-            msg = (
-                caption
-                + f"\n✅ Google Drive 업로드 성공"
-                + f"\n파일 크기: {size_mb:.1f} MB"
-                + f"\nDrive 파일 ID: {result.get('id', '')}"
-            )
-            buttons = [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else []
-            send_telegram(msg, buttons, force=True)
-            with LOCK:
-                S["last_alert"][key] = time.time()
+            verify_ok, verify_report = verify_today_backup_from_google_drive(today())
+            if verify_ok:
+                msg = (
+                    caption
+                    + f"\n✅ Google Drive 업로드 성공"
+                    + f"\n✅ Drive 재다운로드·CRC·26종목 390봉·호가·체결·90계좌·메타데이터 GRADE_1"
+                    + f"\n파일 크기: {size_mb:.1f} MB"
+                    + f"\nDrive 파일 ID: {result.get('id', '')}"
+                )
+                buttons = [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else []
+                send_telegram(msg, buttons, force=True)
+                with LOCK:
+                    S["last_alert"][key] = time.time()
+            else:
+                failed = verify_report.get("failures", [])
+                send_telegram(
+                    caption
+                    + "\n❌ Drive 업로드 후 재검증 실패"
+                    + f"\n파일: {verify_report.get('drive_file_name', result.get('name', ''))}"
+                    + f"\n실패 항목: {' | '.join(failed[:12])[:1200]}"
+                    + "\n성공 처리하지 않으며 10분 뒤 다시 시도합니다.",
+                    [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else [],
+                    force=True,
+                )
         else:
             send_telegram(
                 caption
