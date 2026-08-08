@@ -1,4 +1,4 @@
-# OPERATING_V4_63_TOSS_1_2_9_DRIVE_STRICT_GRADE1_VERIFY_PAPER_ONLY
+# OPERATING_V4_64_US_WEEKEND_BACKUP_SOURCE_GAP_FINAL_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -416,7 +416,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_63_TOSS_1_2_9_DRIVE_STRICT_GRADE1_VERIFY_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_64_US_WEEKEND_BACKUP_SOURCE_GAP_FINAL_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -6649,7 +6649,7 @@ def create_backup_zip():
     for grade1_pass in range(1, 6):
         pass_ok, pass_failures = finalize_kr_candles_grade1()
         quality = audit_kr_grade1()
-        backfill_ok = pass_ok and quality.get("grade") == "GRADE_1"
+        backfill_ok = pass_ok and quality.get("grade") in {"GRADE_1","GRADE_1_WITH_VERIFIED_SOURCE_GAPS"}
         backfill_failures.extend(
             [f"PASS_{grade1_pass}:{x}" for x in pass_failures]
         )
@@ -7404,44 +7404,95 @@ def upload_backup_to_google_drive(path):
     save_state()
     return False, {"error": last_error}
 
+def _us_expected_candle_times(start, end):
+    count = int((end - start).total_seconds() // 60)
+    return [start + timedelta(minutes=i) for i in range(count)]
+
+def _us_candle_row_from_api(sym, c, req, rec, latency):
+    ts = str(c.get("timestamp", ""))
+    close = to_float(c.get("closePrice", 0)); volume = to_float(c.get("volume", 0))
+    return {
+        "requested_at": req.isoformat(), "received_at": rec.isoformat(), "saved_at": now_text(),
+        "latency_ms": latency, "symbol": sym, "timestamp": ts,
+        "open": c.get("openPrice", 0), "high": c.get("highPrice", 0),
+        "low": c.get("lowPrice", 0), "close": c.get("closePrice", 0),
+        "volume": c.get("volume", 0), "estimated_trade_value": round(close * volume, 4),
+        "currency": c.get("currency", "USD"),
+    }
+
+def _verify_us_source_gap(sym, target, cal, retries=3):
+    """정확한 1분봉이 과거 API에도 없는지 검증한다. 가짜 봉은 절대 생성하지 않는다."""
+    evidence=[]
+    wanted = target.replace(second=0, microsecond=0)
+    before = (wanted + timedelta(minutes=2)).isoformat()
+    for attempt in range(max(1, retries)):
+        req=now_kst(); t0=time.time()
+        code,data=api_get("/api/v1/candles",params={"symbol":sym,"interval":"1m","count":10,"before":before,"adjusted":True},timeout=12)
+        rec=now_kst(); latency=round((time.time()-t0)*1000,3)
+        result=_result_dict(data); candles=result.get("candles",[]) if code==200 and isinstance(result,dict) else []
+        seen=[]; exact=None
+        for c in candles if isinstance(candles,list) else []:
+            dt=_parse_iso(c.get("timestamp"))
+            if not dt: continue
+            minute=dt.replace(second=0,microsecond=0)
+            seen.append(minute.isoformat())
+            if minute == wanted:
+                exact=_us_candle_row_from_api(sym,c,req,rec,latency); break
+        evidence.append({"attempt":attempt+1,"http":code,"seen":seen})
+        if exact: return exact,False,evidence
+        if attempt < retries-1: time.sleep(min(1+attempt,2))
+    prev=(wanted-timedelta(minutes=1)).isoformat(); nxt=(wanted+timedelta(minutes=1)).isoformat()
+    verified = all(e.get("http")==200 and prev in e.get("seen",[]) and nxt in e.get("seen",[]) and wanted.isoformat() not in e.get("seen",[]) for e in evidence)
+    return None,verified,evidence
+
 def finalize_us_candles_grade1():
     state=S.setdefault("us_market_data_capture",{}); cal=state.get("calendar",{}); start=_parse_iso(cal.get("regular_start")); end=_parse_iso(cal.get("regular_end")); failures=[]
     if not start or not end: return False,["US_CALENDAR_INVALID"]
     headers=["requested_at","received_at","saved_at","latency_ms","symbol","timestamp","open","high","low","close","volume","estimated_trade_value","currency"]
+    verified_gaps={}
     for sym in US_SYMBOLS:
-        # 장중에 이미 저장된 정상 봉을 먼저 읽는다. 백필 API가 일부 실패해도
-        # 기존 데이터를 줄이거나 지우지 않고 timestamp 기준으로 병합한다.
         collected={}
         for old in _read_csv_rows(us_data_path("candles_1m",sym)):
             ts=str(old.get("timestamp","")); dt=_parse_iso(ts)
-            if dt and start <= dt < end:
-                collected[ts]={h:old.get(h,"") for h in headers}
+            if dt and start <= dt < end: collected[ts]={h:old.get(h,"") for h in headers}
         before=end.isoformat(); seen=set()
         for _ in range(4):
             if before in seen: break
             seen.add(before); req=now_kst();t0=time.time()
             code,data=api_get("/api/v1/candles",params={"symbol":sym,"interval":"1m","count":200,"before":before,"adjusted":True},timeout=12);rec=now_kst();latency=round((time.time()-t0)*1000,3)
             if code!=200: failures.append(f"{sym}:HTTP_{code}");break
-            result=_result_dict(data); candles=result.get("candles",[]) if isinstance(result,dict) else []
-            page_times=[]
+            result=_result_dict(data); candles=result.get("candles",[]) if isinstance(result,dict) else []; page_times=[]
             for c in candles if isinstance(candles,list) else []:
                 ts=str(c.get("timestamp",""))
-                # 미국 정규장은 KST 자정을 넘는다. cal.date는 미국 현지 거래일이므로
-                # KST 날짜와 비교하면 자정 이후 정상 봉이 전부 탈락한다. 날짜가 아니라
-                # 공식 regularMarket startTime <= ts < endTime 범위로만 판정한다.
-                if _completed_kr_trading_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
-                    page_times.append(_parse_iso(ts))
-                    close=to_float(c.get("closePrice",0));volume=to_float(c.get("volume",0));collected[ts]={"requested_at":req.isoformat(),"received_at":rec.isoformat(),"saved_at":now_text(),"latency_ms":latency,"symbol":sym,"timestamp":ts,"open":c.get("openPrice",0),"high":c.get("highPrice",0),"low":c.get("lowPrice",0),"close":c.get("closePrice",0),"volume":c.get("volume",0),"estimated_trade_value":round(close*volume,4),"currency":c.get("currency","USD")}
-            # 기존 CSV의 첫 봉이 아니라 이번 API 페이지의 가장 오래된 봉으로
-            # 페이지 종료 여부를 판단해야 중간 구간을 건너뛰지 않는다.
+                if _completed_session_candle(ts,None,cal.get("regular_start"),cal.get("regular_end")):
+                    dt=_parse_iso(ts); page_times.append(dt); collected[ts]=_us_candle_row_from_api(sym,c,req,rec,latency)
             oldest=min((x for x in page_times if x),default=None)
             if oldest and oldest<=start: break
             nxt=result.get("nextBefore") if isinstance(result,dict) else None
             if not nxt: break
             before=str(nxt);_market_data_request_gap()
-        rows=[collected[k] for k in sorted(collected)];_rewrite_csv(us_data_path("candles_1m",sym),headers,rows)
-        expected=int((end-start).total_seconds()//60)
-        if len(rows)!=expected or not rows or _parse_iso(rows[0]["timestamp"])!=start+timedelta(minutes=1) or _parse_iso(rows[-1]["timestamp"])!=end: failures.append(f"{sym}:CANDLES_{len(rows)}")
+        by_minute={}
+        for ts,row in collected.items():
+            dt=_parse_iso(ts)
+            if dt: by_minute[dt.replace(second=0,microsecond=0)]=row
+        missing=[t for t in _us_expected_candle_times(start,end) if t not in by_minute]
+        for target in missing:
+            row,is_source_gap,evidence=_verify_us_source_gap(sym,target,cal)
+            if row:
+                dt=_parse_iso(row.get("timestamp")); by_minute[dt.replace(second=0,microsecond=0)]=row
+            elif is_source_gap:
+                verified_gaps.setdefault(sym,[]).append({"timestamp":target.isoformat(),"evidence":evidence})
+            else:
+                failures.append(f"{sym}:TARGETED_BACKFILL_FAILED:{target.isoformat()}")
+        rows=[by_minute[k] for k in sorted(by_minute) if start <= k < end]
+        _rewrite_csv(us_data_path("candles_1m",sym),headers,rows)
+        allowed={_parse_iso(x["timestamp"]).replace(second=0,microsecond=0) for x in verified_gaps.get(sym,[]) if _parse_iso(x.get("timestamp"))}
+        residual=[t for t in _us_expected_candle_times(start,end) if t not in by_minute and t not in allowed]
+        if residual or not rows or _parse_iso(rows[0]["timestamp"]).replace(second=0,microsecond=0)!=start or _parse_iso(rows[-1]["timestamp"]).replace(second=0,microsecond=0)!=end-timedelta(minutes=1):
+            failures.append(f"{sym}:CANDLES_{len(rows)}:RESIDUAL_{len(residual)}")
+    state["verified_source_gaps"] = verified_gaps
+    gap_path=os.path.join(us_market_data_dir(),f"verified_source_gaps_{us_trade_date_from_calendar()}.json")
+    with open(gap_path,"w",encoding="utf-8") as f: json.dump({"trade_date":us_trade_date_from_calendar(),"verified_source_gaps":verified_gaps},f,ensure_ascii=False,indent=2)
     return not failures,failures
 
 def repair_us_required_files_before_backup():
@@ -7493,19 +7544,26 @@ def repair_us_required_files_before_backup():
 def audit_us_grade1():
     cal=S.setdefault("us_market_data_capture",{}).get("calendar",{});start=_parse_iso(cal.get("regular_start"));end=_parse_iso(cal.get("regular_end"));failures=[];details={}
     if not start or not end:return {"grade":"FAILED","failures":["US_CALENDAR_INVALID"],"details":{}}
-    expected=int((end-start).total_seconds()//60)
+    verified=S.setdefault("us_market_data_capture",{}).get("verified_source_gaps",{}) or {}
+    total_verified=0
     for sym in US_SYMBOLS:
-        rows=_read_csv_rows(us_data_path("candles_1m",sym));times=[_parse_iso(x.get("timestamp")) for x in rows];times=[x for x in times if x];gaps=sum(max(0,int((b-a).total_seconds()//60)-1) for a,b in zip(times,times[1:]));reverse=sum(1 for a,b in zip(times,times[1:]) if b<=a);future=sum(1 for x in times if x>=end);bad=sum(1 for x in rows if any(str(x.get(k,""))=="" for k in ("open","high","low","close","volume","estimated_trade_value")))
+        rows=_read_csv_rows(us_data_path("candles_1m",sym));times=[_parse_iso(x.get("timestamp")) for x in rows];times=[x.replace(second=0,microsecond=0) for x in times if x]
+        duplicate=len(times)-len(set(times)); reverse=sum(1 for a,b in zip(times,times[1:]) if b<=a); future=sum(1 for x in times if x>=end); bad=sum(1 for x in rows if any(str(x.get(k,""))=="" for k in ("open","high","low","close","volume","estimated_trade_value")))
+        expected_times=_us_expected_candle_times(start,end); have=set(times); missing_times=[t for t in expected_times if t not in have]
+        allowed={_parse_iso(x.get("timestamp")).replace(second=0,microsecond=0) for x in verified.get(sym,[]) if _parse_iso(x.get("timestamp"))}
+        source_gap_ok=set(missing_times)==allowed
+        total_verified += len(allowed)
         required={"prices":_read_csv_rows(us_data_path("prices",sym)),"daily":_read_csv_rows(us_data_path("candles_1d",sym)),"orderbook":_read_csv_rows(us_data_path("orderbook",sym)),"trades":_read_csv_rows(us_data_path("trades",sym)),"metadata":_read_csv_rows(us_data_path("metadata",sym))}
-        missing=[k for k,v in required.items() if not v]
-        meta_ok=bool(required["metadata"]) and all(str(required["metadata"][-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http"))
+        missing=[k for k,v in required.items() if not v]; meta_ok=bool(required["metadata"]) and all(str(required["metadata"][-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http"))
         if not meta_ok and "metadata_http" not in missing: missing.append("metadata_http")
-        ok=len(rows)==expected and times and times[0]==start and times[-1]==end-timedelta(minutes=1) and len(times)==len(set(times)) and gaps==0 and reverse==0 and future==0 and bad==0 and not missing
-        if not ok: failures.append(f"{sym}:rows={len(rows)},gaps={gaps},missing_ohlcv={bad},missing_types={','.join(missing)}")
-        details[sym]={"rows":len(rows),"first":times[0].isoformat() if times else "","last":times[-1].isoformat() if times else "","gaps":gaps,"duplicate":len(times)-len(set(times)),"reverse":reverse,"future":future,"ok":ok}
+        boundary_ok=bool(times) and times[0]==start and times[-1]==end-timedelta(minutes=1)
+        ok=boundary_ok and duplicate==0 and reverse==0 and future==0 and bad==0 and not missing and source_gap_ok
+        if not ok: failures.append(f"{sym}:rows={len(rows)},missing_minutes={len(missing_times)},verified_source_gaps={len(allowed)},missing_ohlcv={bad},missing_types={','.join(missing)}")
+        details[sym]={"rows":len(rows),"first":times[0].isoformat() if times else "","last":times[-1].isoformat() if times else "","missing_minutes":[x.isoformat() for x in missing_times],"verified_source_gaps":[x.isoformat() for x in sorted(allowed)],"duplicate":duplicate,"reverse":reverse,"future":future,"ok":ok}
     raw_path=os.path.join(raw_market_dir("US"),f"api_{us_trade_date_from_calendar()}.jsonl")
     if not os.path.isfile(raw_path) or os.path.getsize(raw_path)==0: failures.append("RAW_API_RESPONSES_MISSING")
-    return {"grade":"GRADE_1" if not failures else "GRADE_2_PARTIAL","failures":failures,"details":details}
+    grade="GRADE_2_PARTIAL" if failures else ("GRADE_1_WITH_VERIFIED_SOURCE_GAPS" if total_verified else "GRADE_1")
+    return {"grade":grade,"failures":failures,"details":details,"verified_source_gap_count":total_verified,"verified_source_gaps":verified}
 
 def create_us_backup_zip():
     repair_failures = repair_us_required_files_before_backup()
@@ -7533,7 +7591,7 @@ def create_us_backup_zip():
                 fp=os.path.join(root,fn)
                 if os.path.abspath(fp)==os.path.abspath(path):continue
                 z.write(fp,os.path.relpath(fp,base));count+=1;size+=os.path.getsize(fp)
-        z.writestr("backup_manifest.json",json.dumps({"created_at_kst":now_text(),"version":OPERATING_VERSION,"toss_openapi_spec_version":TOSS_OPENAPI_SPEC_VERSION,"market":"US","session":"REGULAR_ONLY","trade_date":us_trade_date_from_calendar(),"symbols":US_SYMBOLS,"included_files":count,"uncompressed_bytes":size,"data_quality_grade":quality.get("grade"),"data_quality_failures":quality.get("failures",[]),"paper_only_mode":True,"real_order_enabled":False},ensure_ascii=False,indent=2))
+        z.writestr("backup_manifest.json",json.dumps({"created_at_kst":now_text(),"version":OPERATING_VERSION,"toss_openapi_spec_version":TOSS_OPENAPI_SPEC_VERSION,"market":"US","session":"REGULAR_ONLY","trade_date":us_trade_date_from_calendar(),"symbols":US_SYMBOLS,"included_files":count,"uncompressed_bytes":size,"data_quality_grade":quality.get("grade"),"data_quality_failures":quality.get("failures",[]),"verified_source_gap_count":quality.get("verified_source_gap_count",0),"verified_source_gaps":quality.get("verified_source_gaps",{}),"paper_only_mode":True,"real_order_enabled":False,"real_auto_buy":False,"real_auto_sell":False},ensure_ascii=False,indent=2))
     return path,quality
 
 def maybe_send_us_backup():
@@ -7664,8 +7722,15 @@ def loop():
                     us_open_weekend, _ = us_regular_market_open_now()
                 except Exception:
                     us_open_weekend = False
+            # 미국 금요일 정규장은 한국 토요일 새벽에 끝난다.
+            # 한국 주말 pause보다 미국 장 종료 백업을 먼저 실행해야 Drive 백업이 누락되지 않는다.
+            if is_weekend_kst() and ENABLE_US_MARKET_DATA_CAPTURE:
+                try:
+                    maybe_send_us_backup()
+                except Exception as e:
+                    set_error(f"주말 미국 백업 오류: {e}")
             if is_weekend_kst() and not us_open_weekend:
-                set_status_once("WEEKEND_PAUSE", "주말 휴무: 매매·알림·데이터수집 중지", 1800)
+                set_status_once("WEEKEND_PAUSE", "한국 주말 휴무: 한국 수집·가상매매 중지 / 미국 종료백업 우선 처리", 1800)
                 time.sleep(max(60, REFRESH_SEC))
                 continue
 
@@ -8057,6 +8122,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/download_backup":
             path_zip = create_backup_zip()
             return self.download_file(path_zip, os.path.basename(path_zip), content_type="application/zip")
+        if path == "/download_us_backup":
+            # 수동 복구/점검용. 실주문과 무관하며 현재 US 캘린더 거래일만 대상으로 한다.
+            refresh_us_market_calendar(force=True)
+            path_zip, quality = create_us_backup_zip()
+            return self.download_file(path_zip, os.path.basename(path_zip), content_type="application/zip")
         if path == "/symbols_csv":
             return self.symbols_page()
         if path.startswith("/download_symbol/"):
@@ -8304,7 +8374,7 @@ function showAiGroup(g,btn){{document.querySelectorAll('.ai-group').forEach(x=>x
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/ipcheck'">외부 IP 확인</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/ipcheck'">외부 IP 확인</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button><button class="gold" onclick="location.href='/download_us_backup'">미국 백업 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
