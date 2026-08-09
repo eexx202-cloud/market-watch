@@ -1,4 +1,4 @@
-# OPERATING_V4_64_US_WEEKEND_BACKUP_SOURCE_GAP_FINAL_PAPER_ONLY
+# OPERATING_V4_66_US_DRIVE_REVERIFY_FINAL_PAPER_ONLY
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
@@ -416,7 +416,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_64_US_WEEKEND_BACKUP_SOURCE_GAP_FINAL_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_66_US_DRIVE_REVERIFY_FINAL_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -657,6 +657,7 @@ S = {
     "sellable_cache": {},
     "alerts": [],
     "last_alert": {},
+    "us_backup_completed": {},
     "orders": [],
     "pending_orders": {},
     "google_drive": {
@@ -1392,6 +1393,7 @@ def save_state():
                 "shadow_fixed": S.get("shadow_fixed", {}),
                 "real_watch": S.get("real_watch", {}),
                 "google_drive": S.get("google_drive", {}),
+                "us_backup_completed": S.get("us_backup_completed", {}),
             }
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1424,6 +1426,9 @@ def load_state():
             drive_state = data.get("google_drive")
             if isinstance(drive_state, dict):
                 S["google_drive"].update(drive_state)
+            us_done = data.get("us_backup_completed")
+            if isinstance(us_done, dict):
+                S["us_backup_completed"] = us_done
             if S["paper"].get("start_cash", 0) <= 0:
                 S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
     except Exception as e:
@@ -7270,6 +7275,229 @@ def verify_today_backup_from_google_drive(trade_date=None):
     return report.get("grade") == "GRADE_1", report
 
 
+
+def google_drive_find_us_backups(access_token, trade_date):
+    """해당 미국 거래일의 기존 백업 후보를 최신순으로 읽기 전용 조회한다."""
+    prefix = f"backup_US_{trade_date}"
+    escaped = prefix.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name contains '{escaped}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+    r = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "q": q,
+            "fields": "files(id,name,size,md5Checksum,modifiedTime,webViewLink)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": 100,
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Drive 미국 백업 조회 실패 HTTP {r.status_code}: {r.text[:300]}")
+    out = []
+    for x in r.json().get("files", []):
+        name = str(x.get("name", ""))
+        if name.startswith(prefix) and name.endswith(".zip"):
+            out.append(x)
+    return out
+
+
+def inspect_downloaded_us_backup_zip(path, expected_date):
+    """Drive에서 다시 받은 미국 ZIP을 CRC·14종목·필수자료·원천결측까지 독립 검사한다."""
+    failures = []
+    result = {
+        "checked_at_kst": now_text(),
+        "file": os.path.basename(path),
+        "trade_date": expected_date,
+        "grade": "FAILED",
+        "failures": failures,
+        "crc_ok": False,
+        "manifest_ok": False,
+        "symbol_count": 0,
+        "verified_source_gap_count": 0,
+        "details": {},
+    }
+    if not os.path.isfile(path):
+        failures.append("ZIP_FILE_MISSING")
+        return result
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            bad = z.testzip()
+            if bad:
+                failures.append(f"ZIP_CRC_BAD:{bad}")
+                return result
+            result["crc_ok"] = True
+            names = [n for n in z.namelist() if not n.replace("\\", "/").endswith("/")]
+            if len(names) != len(set(names)):
+                failures.append("ZIP_DUPLICATE_MEMBER_NAMES")
+
+            manifest_names = [n for n in names if os.path.basename(n.replace("\\", "/")) == "backup_manifest.json"]
+            if len(manifest_names) != 1:
+                failures.append(f"BACKUP_MANIFEST_COUNT:{len(manifest_names)}")
+                return result
+            try:
+                manifest = json.loads(z.read(manifest_names[0]).decode("utf-8-sig"))
+            except Exception as e:
+                failures.append(f"BACKUP_MANIFEST_PARSE:{e}")
+                return result
+
+            expected_symbols = [str(x).upper() for x in US_SYMBOLS]
+            manifest_symbols = [str(x).upper() for x in manifest.get("symbols", [])] if isinstance(manifest.get("symbols"), list) else []
+            if str(manifest.get("market", "")).upper() != "US":
+                failures.append("MANIFEST_MARKET_NOT_US")
+            if str(manifest.get("trade_date", "")) != str(expected_date):
+                failures.append("MANIFEST_TRADE_DATE_MISMATCH")
+            if manifest_symbols != expected_symbols:
+                failures.append("MANIFEST_SYMBOLS_MISMATCH")
+            if manifest.get("paper_only_mode") is not True:
+                failures.append("MANIFEST_PAPER_ONLY_FALSE")
+            if manifest.get("real_order_enabled") is not False or manifest.get("real_auto_buy") is not False or manifest.get("real_auto_sell") is not False:
+                failures.append("MANIFEST_REAL_ORDER_GUARD_FAIL")
+
+            start = _parse_iso(manifest.get("regular_start"))
+            end = _parse_iso(manifest.get("regular_end"))
+            if not start or not end or int((end-start).total_seconds()//60) != 390:
+                failures.append("MANIFEST_US_SESSION_BOUNDARY_INVALID")
+            result["manifest_ok"] = not any(x.startswith("MANIFEST_") for x in failures)
+
+            verified_raw = manifest.get("verified_source_gaps", {}) or {}
+            verified_map = {}
+            if isinstance(verified_raw, dict):
+                for sym, entries in verified_raw.items():
+                    vals = set()
+                    for item in entries if isinstance(entries, list) else []:
+                        ts = item.get("timestamp") if isinstance(item, dict) else item
+                        dt = _parse_iso(ts)
+                        if dt:
+                            vals.add(dt.replace(second=0, microsecond=0))
+                    verified_map[str(sym).upper()] = vals
+
+            def members_for_basename(base):
+                return [n for n in names if os.path.basename(n.replace("\\", "/")) == base]
+
+            for sym in expected_symbols:
+                detail = {}
+                required = {
+                    "candles": f"candles_1m_{sym}_{expected_date}.csv",
+                    "prices": f"prices_{sym}_{expected_date}.csv",
+                    "daily": f"candles_1d_{sym}_{expected_date}.csv",
+                    "orderbook": f"orderbook_{sym}_{expected_date}.csv",
+                    "trades": f"trades_{sym}_{expected_date}.csv",
+                    "metadata": f"metadata_{sym}_{expected_date}.csv",
+                }
+                members = {}
+                for kind, base in required.items():
+                    hits = members_for_basename(base)
+                    if len(hits) != 1:
+                        failures.append(f"{sym}:{kind.upper()}_MEMBER_COUNT_{len(hits)}")
+                        members[kind] = ""
+                    else:
+                        members[kind] = hits[0]
+                if not members.get("candles"):
+                    result["details"][sym] = detail
+                    continue
+
+                rows = _zip_read_csv(z, members["candles"])
+                times = []
+                bad_ohlcv = 0
+                for row in rows:
+                    dt = _parse_iso(row.get("timestamp"))
+                    if dt:
+                        times.append(dt.replace(second=0, microsecond=0))
+                    if any(str(row.get(k, "")).strip() == "" for k in ("open","high","low","close","volume","estimated_trade_value")):
+                        bad_ohlcv += 1
+                duplicate = len(times) - len(set(times))
+                reverse = sum(1 for a,b in zip(times,times[1:]) if b <= a)
+                allowed = verified_map.get(sym, set())
+                missing = []
+                future = 0
+                if start and end:
+                    expected_times = [start + timedelta(minutes=i) for i in range(390)]
+                    have = set(times)
+                    missing = [t for t in expected_times if t not in have]
+                    future = sum(1 for t in times if t < start or t >= end)
+                    boundary_ok = (start in have or start in allowed) and ((end-timedelta(minutes=1)) in have or (end-timedelta(minutes=1)) in allowed)
+                else:
+                    boundary_ok = False
+                source_gap_ok = set(missing) == allowed
+                expected_rows = 390 - len(allowed)
+                if len(rows) != expected_rows or duplicate or reverse or future or bad_ohlcv or not boundary_ok or not source_gap_ok:
+                    failures.append(
+                        f"{sym}:CANDLES rows={len(rows)}/{expected_rows},missing={len(missing)},allowed={len(allowed)},dup={duplicate},reverse={reverse},outside={future},bad={bad_ohlcv}"
+                    )
+
+                for kind in ("prices","daily","orderbook","trades","metadata"):
+                    member = members.get(kind)
+                    if member and not _zip_read_csv(z, member):
+                        failures.append(f"{sym}:{kind.upper()}_EMPTY")
+
+                if members.get("metadata"):
+                    meta_rows = _zip_read_csv(z, members["metadata"])
+                    if not meta_rows or not all(str(meta_rows[-1].get(k,"")).strip() == "200" for k in ("stock_http","warning_http","limits_http")):
+                        failures.append(f"{sym}:METADATA_HTTP_INVALID")
+
+                detail.update({
+                    "rows": len(rows),
+                    "expected_rows": expected_rows,
+                    "missing_minutes": [x.isoformat() for x in missing],
+                    "verified_source_gaps": [x.isoformat() for x in sorted(allowed)],
+                    "duplicate": duplicate,
+                    "reverse": reverse,
+                    "outside_session": future,
+                    "bad_ohlcv": bad_ohlcv,
+                })
+                result["details"][sym] = detail
+
+            raw_base = f"api_{expected_date}.jsonl"
+            raw_hits = members_for_basename(raw_base)
+            if len(raw_hits) != 1:
+                failures.append(f"RAW_API_MEMBER_COUNT:{len(raw_hits)}")
+            else:
+                info = z.getinfo(raw_hits[0])
+                if info.file_size <= 0:
+                    failures.append("RAW_API_RESPONSES_EMPTY")
+
+            result["symbol_count"] = len(expected_symbols)
+            result["verified_source_gap_count"] = sum(len(v) for v in verified_map.values())
+            result["grade"] = (
+                "GRADE_1_WITH_VERIFIED_SOURCE_GAPS"
+                if not failures and result["verified_source_gap_count"] > 0
+                else ("GRADE_1" if not failures else "FAILED")
+            )
+            return result
+    except zipfile.BadZipFile:
+        failures.append("ZIP_OPEN_FAILED")
+    except Exception as e:
+        failures.append(f"US_ZIP_INSPECTION_ERROR:{e}")
+    return result
+
+
+def verify_us_backup_file_from_google_drive(file_meta, trade_date):
+    """지정된 Drive 미국 ZIP을 재다운로드해 실제 내부자료까지 검증한다."""
+    access_token = google_drive_access_token()
+    with tempfile.TemporaryDirectory(prefix="us_drive_verify_") as td:
+        path = os.path.join(td, str((file_meta or {}).get("name") or f"backup_US_{trade_date}.zip"))
+        google_drive_download_file(access_token, file_meta, path)
+        report = inspect_downloaded_us_backup_zip(path, trade_date)
+    return report.get("grade") in {"GRADE_1", "GRADE_1_WITH_VERIFIED_SOURCE_GAPS"}, report
+
+
+def find_verified_existing_us_backup_on_drive(trade_date):
+    """로컬 state가 사라져도 Drive의 기존 정상 미국백업을 찾아 중복생성을 막는다."""
+    access_token = google_drive_access_token()
+    candidates = google_drive_find_us_backups(access_token, trade_date)
+    checked = []
+    for meta in candidates:
+        try:
+            ok, report = verify_us_backup_file_from_google_drive(meta, trade_date)
+            checked.append({"id": meta.get("id",""), "name": meta.get("name",""), "ok": ok, "failures": report.get("failures",[])[:10]})
+            if ok:
+                return meta, report, checked
+        except Exception as e:
+            checked.append({"id": meta.get("id",""), "name": meta.get("name",""), "ok": False, "failures": [str(e)[:300]]})
+    return None, None, checked
+
+
 def google_drive_resumable_upload(path):
     """기존 Drive 파일을 절대 건드리지 않고 새 ZIP만 추가한다."""
     if not GOOGLE_DRIVE_APPEND_ONLY:
@@ -7442,7 +7670,19 @@ def _verify_us_source_gap(sym, target, cal, retries=3):
         if exact: return exact,False,evidence
         if attempt < retries-1: time.sleep(min(1+attempt,2))
     prev=(wanted-timedelta(minutes=1)).isoformat(); nxt=(wanted+timedelta(minutes=1)).isoformat()
-    verified = all(e.get("http")==200 and prev in e.get("seen",[]) and nxt in e.get("seen",[]) and wanted.isoformat() not in e.get("seen",[]) for e in evidence)
+    start = _parse_iso(cal.get("regular_start"))
+    end = _parse_iso(cal.get("regular_end"))
+    def _gap_evidence_ok(e):
+        if e.get("http") != 200 or wanted.isoformat() in e.get("seen", []):
+            return False
+        seen_times = e.get("seen", [])
+        # 정규장 첫 봉은 다음 봉, 마지막 봉은 이전 봉만으로 원천결측을 검증한다.
+        if start and wanted == start.replace(second=0, microsecond=0):
+            return nxt in seen_times
+        if end and wanted == (end - timedelta(minutes=1)).replace(second=0, microsecond=0):
+            return prev in seen_times
+        return prev in seen_times and nxt in seen_times
+    verified = all(_gap_evidence_ok(e) for e in evidence)
     return None,verified,evidence
 
 def finalize_us_candles_grade1():
@@ -7488,8 +7728,9 @@ def finalize_us_candles_grade1():
         _rewrite_csv(us_data_path("candles_1m",sym),headers,rows)
         allowed={_parse_iso(x["timestamp"]).replace(second=0,microsecond=0) for x in verified_gaps.get(sym,[]) if _parse_iso(x.get("timestamp"))}
         residual=[t for t in _us_expected_candle_times(start,end) if t not in by_minute and t not in allowed]
-        if residual or not rows or _parse_iso(rows[0]["timestamp"]).replace(second=0,microsecond=0)!=start or _parse_iso(rows[-1]["timestamp"]).replace(second=0,microsecond=0)!=end-timedelta(minutes=1):
-            failures.append(f"{sym}:CANDLES_{len(rows)}:RESIDUAL_{len(residual)}")
+        boundary_ok = (start in by_minute or start in allowed) and ((end-timedelta(minutes=1)) in by_minute or (end-timedelta(minutes=1)) in allowed)
+        if residual or not rows or not boundary_ok:
+            failures.append(f"{sym}:CANDLES_{len(rows)}:RESIDUAL_{len(residual)}:BOUNDARY_{boundary_ok}")
     state["verified_source_gaps"] = verified_gaps
     gap_path=os.path.join(us_market_data_dir(),f"verified_source_gaps_{us_trade_date_from_calendar()}.json")
     with open(gap_path,"w",encoding="utf-8") as f: json.dump({"trade_date":us_trade_date_from_calendar(),"verified_source_gaps":verified_gaps},f,ensure_ascii=False,indent=2)
@@ -7556,7 +7797,7 @@ def audit_us_grade1():
         required={"prices":_read_csv_rows(us_data_path("prices",sym)),"daily":_read_csv_rows(us_data_path("candles_1d",sym)),"orderbook":_read_csv_rows(us_data_path("orderbook",sym)),"trades":_read_csv_rows(us_data_path("trades",sym)),"metadata":_read_csv_rows(us_data_path("metadata",sym))}
         missing=[k for k,v in required.items() if not v]; meta_ok=bool(required["metadata"]) and all(str(required["metadata"][-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http"))
         if not meta_ok and "metadata_http" not in missing: missing.append("metadata_http")
-        boundary_ok=bool(times) and times[0]==start and times[-1]==end-timedelta(minutes=1)
+        boundary_ok=(start in have or start in allowed) and ((end-timedelta(minutes=1)) in have or (end-timedelta(minutes=1)) in allowed)
         ok=boundary_ok and duplicate==0 and reverse==0 and future==0 and bad==0 and not missing and source_gap_ok
         if not ok: failures.append(f"{sym}:rows={len(rows)},missing_minutes={len(missing_times)},verified_source_gaps={len(allowed)},missing_ohlcv={bad},missing_types={','.join(missing)}")
         details[sym]={"rows":len(rows),"first":times[0].isoformat() if times else "","last":times[-1].isoformat() if times else "","missing_minutes":[x.isoformat() for x in missing_times],"verified_source_gaps":[x.isoformat() for x in sorted(allowed)],"duplicate":duplicate,"reverse":reverse,"future":future,"ok":ok}
@@ -7573,7 +7814,10 @@ def create_us_backup_zip():
     for grade1_pass in range(1, 4):
         pass_ok, pass_failures = finalize_us_candles_grade1()
         quality = audit_us_grade1()
-        ok = pass_ok and quality.get("grade") == "GRADE_1"
+        ok = pass_ok and quality.get("grade") in {
+            "GRADE_1",
+            "GRADE_1_WITH_VERIFIED_SOURCE_GAPS",
+        }
         backfill_failures.extend(
             [f"PASS_{grade1_pass}:{x}" for x in pass_failures]
         )
@@ -7591,31 +7835,118 @@ def create_us_backup_zip():
                 fp=os.path.join(root,fn)
                 if os.path.abspath(fp)==os.path.abspath(path):continue
                 z.write(fp,os.path.relpath(fp,base));count+=1;size+=os.path.getsize(fp)
-        z.writestr("backup_manifest.json",json.dumps({"created_at_kst":now_text(),"version":OPERATING_VERSION,"toss_openapi_spec_version":TOSS_OPENAPI_SPEC_VERSION,"market":"US","session":"REGULAR_ONLY","trade_date":us_trade_date_from_calendar(),"symbols":US_SYMBOLS,"included_files":count,"uncompressed_bytes":size,"data_quality_grade":quality.get("grade"),"data_quality_failures":quality.get("failures",[]),"verified_source_gap_count":quality.get("verified_source_gap_count",0),"verified_source_gaps":quality.get("verified_source_gaps",{}),"paper_only_mode":True,"real_order_enabled":False,"real_auto_buy":False,"real_auto_sell":False},ensure_ascii=False,indent=2))
+        z.writestr("backup_manifest.json",json.dumps({"created_at_kst":now_text(),"version":OPERATING_VERSION,"toss_openapi_spec_version":TOSS_OPENAPI_SPEC_VERSION,"market":"US","session":"REGULAR_ONLY","trade_date":us_trade_date_from_calendar(),"regular_start":str(S.setdefault("us_market_data_capture",{}).get("calendar",{}).get("regular_start","")),"regular_end":str(S.setdefault("us_market_data_capture",{}).get("calendar",{}).get("regular_end","")),"symbols":US_SYMBOLS,"included_files":count,"uncompressed_bytes":size,"data_quality_grade":quality.get("grade"),"data_quality_failures":quality.get("failures",[]),"verified_source_gap_count":quality.get("verified_source_gap_count",0),"verified_source_gaps":quality.get("verified_source_gaps",{}),"paper_only_mode":True,"real_order_enabled":False,"real_auto_buy":False,"real_auto_sell":False},ensure_ascii=False,indent=2))
     return path,quality
 
 def maybe_send_us_backup():
-    if not ENABLE_US_MARKET_DATA_CAPTURE:return
-    state=S.setdefault("us_market_data_capture",{});cal=state.get("calendar",{});end=_parse_iso(cal.get("regular_end"))
-    if not end:return
-    nowv=now_kst();key=f"US_BACKUP_SENT_{cal.get('date','')}"
-    # 종료 직후 10분 창을 놓쳐도 서버가 살아나는 즉시 해당 거래일 백업을 만든다.
-    if not (end+timedelta(minutes=US_BACKUP_DELAY_MIN)<=nowv<=end+timedelta(hours=12)):return
-    attempt_key=key+"_ATTEMPT"
+    if not ENABLE_US_MARKET_DATA_CAPTURE:
+        return
+    state = S.setdefault("us_market_data_capture", {})
+    cal = state.get("calendar", {})
+    trade_date = str(cal.get("date", ""))
+    end = _parse_iso(cal.get("regular_end"))
+    if not trade_date or not end:
+        return
+    nowv = now_kst()
+    # 장 종료 뒤 지정 지연시간 이후부터 12시간 동안 자동 마감/백업을 시도한다.
+    if not (end + timedelta(minutes=US_BACKUP_DELAY_MIN) <= nowv <= end + timedelta(hours=12)):
+        return
+
+    completed_map = S.setdefault("us_backup_completed", {})
+    if completed_map.get(trade_date):
+        return
+
+    attempt_key = f"US_BACKUP_ATTEMPT_{trade_date}"
     with LOCK:
-        if S["last_alert"].get(key):return
-        last_attempt=to_float(S["last_alert"].get(attempt_key,0))
-        if time.time()-last_attempt<600:return
-        S["last_alert"][attempt_key]=time.time()
-    path,quality=create_us_backup_zip();grade=quality.get("grade","FAILED");msg=f"🇺🇸 미국 정규장 백업 {grade}\n거래일: {cal.get('date','')}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단"
-    completed=not GOOGLE_DRIVE_UPLOAD_ENABLED
+        last_attempt = to_float(S["last_alert"].get(attempt_key, 0))
+        if time.time() - last_attempt < 600:
+            return
+        S["last_alert"][attempt_key] = time.time()
+
+    # 재배포 등으로 로컬 state가 사라져도, Drive에 이미 정상백업이 있으면
+    # 재다운로드·내부검증 후 완료상태를 복원하고 새 ZIP을 중복 업로드하지 않는다.
     if GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
-        drive_ok,result=upload_backup_to_google_drive(path);completed=drive_ok;msg += "\n✅ Drive 업로드 성공" if drive_ok else "\n❌ Drive 업로드 실패: "+str(result.get("error",""))[:300]
+        try:
+            existing, existing_report, checked = find_verified_existing_us_backup_on_drive(trade_date)
+            if existing:
+                with LOCK:
+                    completed_map[trade_date] = {
+                        "completed_at": now_text(),
+                        "grade": existing_report.get("grade", "GRADE_1"),
+                        "file_name": str(existing.get("name", "")),
+                        "file_id": str(existing.get("id", "")),
+                        "restored_from_drive": True,
+                    }
+                save_state()
+                send_telegram(
+                    f"🇺🇸 미국 정규장 백업 {existing_report.get('grade','GRADE_1')}\n"
+                    f"거래일: {trade_date}\n"
+                    f"✅ Drive 기존 정상백업 재다운로드·내부검증 완료\n"
+                    f"중복 업로드 없음\n실주문: 차단",
+                    force=True,
+                )
+                return
+        except Exception as e:
+            # 기존백업 조회 실패만으로 신규 백업을 포기하지는 않는다.
+            set_error(f"미국 Drive 기존백업 사전검증 오류: {e}")
+
+    path, quality = create_us_backup_zip()
+    grade = quality.get("grade", "FAILED")
+    acceptable = bool(quality.get("backfill_ok")) and grade in {
+        "GRADE_1",
+        "GRADE_1_WITH_VERIFIED_SOURCE_GAPS",
+    }
+    msg = f"🇺🇸 미국 정규장 백업 {grade}\n거래일: {trade_date}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단"
+
+    # 품질 검사를 통과하지 못한 ZIP은 Drive에 성공본처럼 올리지 않는다.
+    if not acceptable:
+        failures = quality.get("failures", []) or quality.get("backfill_failures", [])
+        msg += "\n❌ 품질검사 미통과 - Drive 업로드 보류"
+        if failures:
+            msg += "\n실패: " + " | ".join(map(str, failures[:8]))[:800]
+        msg += "\n10분 뒤 자동 재시도"
+        send_telegram(msg, force=True)
+        return
+
+    completed = not GOOGLE_DRIVE_UPLOAD_ENABLED
+    result = {}
+    if GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
+        drive_ok, result = upload_backup_to_google_drive(path)
+        if drive_ok:
+            try:
+                verify_ok, verify_report = verify_us_backup_file_from_google_drive(result, trade_date)
+            except Exception as e:
+                verify_ok, verify_report = False, {"grade": "FAILED", "failures": [str(e)]}
+            completed = verify_ok
+            if verify_ok:
+                msg += (
+                    "\n✅ Drive 업로드 성공"
+                    "\n✅ Drive 재다운로드·CRC·14종목 1분봉·호가·체결·메타데이터 재검증 성공"
+                )
+            else:
+                msg += (
+                    "\n❌ Drive 업로드 후 재검증 실패"
+                    "\n성공 처리하지 않음 / 10분 뒤 기존 Drive 파일부터 재검증"
+                    "\n실패: " + " | ".join(map(str, verify_report.get("failures", [])[:8]))[:800]
+                )
+        else:
+            completed = False
+            msg += "\n❌ Drive 업로드 실패: " + str(result.get("error", ""))[:300]
     elif GOOGLE_DRIVE_UPLOAD_ENABLED:
+        completed = False
         msg += "\n❌ Drive 설정 미완료"
+
     if completed:
-        with LOCK:S["last_alert"][key]=time.time()
-    send_telegram(msg,force=True)
+        with LOCK:
+            completed_map[trade_date] = {
+                "completed_at": now_text(),
+                "grade": grade,
+                "file_name": str(result.get("name", os.path.basename(path))) if isinstance(result, dict) else os.path.basename(path),
+                "file_id": str(result.get("id", "")) if isinstance(result, dict) else "",
+                "drive_reverified": bool(GOOGLE_DRIVE_UPLOAD_ENABLED),
+            }
+        save_state()
+    send_telegram(msg, force=True)
 
 
 def maybe_send_daily_backup():
