@@ -416,7 +416,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_68_BACKUP_VERIFY_TARGET_FIX_FINAL_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_69_BACKUP_GRADE1_RETRY_NOTIFY_FIX_FINAL_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -6626,18 +6626,26 @@ def audit_kr_grade1():
         future=sum(1 for x in times if x>end)
         bad_ohlcv=sum(1 for r in rows if any(str(r.get(k,""))=="" for k in ("open","high","low","close","volume")))
         bad_amount=sum(1 for r in rows if str(r.get("estimated_trade_value",""))=="")
-        ok=len(rows)==expected and times and times[0]==start+timedelta(minutes=1) and times[-1]==end and len(times)==len(set(times)) and gaps==0 and reverse==0 and future==0 and bad_ohlcv==0 and bad_amount==0
-        if not os.path.isfile(orderbook_path(sym)) or not _read_csv_rows(orderbook_path(sym)): ok=False; failures.append(f"{sym}:ORDERBOOK")
-        if not os.path.isfile(trades_path(sym)) or not _read_csv_rows(trades_path(sym)): ok=False; failures.append(f"{sym}:TRADES")
+        minute_ok=bool(len(rows)==expected and times and times[0]==start+timedelta(minutes=1) and times[-1]==end and len(times)==len(set(times)) and gaps==0 and reverse==0 and future==0 and bad_ohlcv==0 and bad_amount==0)
+        if not minute_ok:
+            failures.append(f"{sym}:MINUTE rows={len(rows)} gaps={gaps} duplicate={len(times)-len(set(times))} reverse={reverse} future={future} ohlcv_missing={bad_ohlcv} trade_value_missing={bad_amount}")
+        orderbook_ok=bool(os.path.isfile(orderbook_path(sym)) and _read_csv_rows(orderbook_path(sym)))
+        if not orderbook_ok: failures.append(f"{sym}:ORDERBOOK")
+        trades_ok=bool(os.path.isfile(trades_path(sym)) and _read_csv_rows(trades_path(sym)))
+        if not trades_ok: failures.append(f"{sym}:TRADES")
         snapshots=_read_csv_rows(price_snapshot_path(sym))
-        if not snapshots: ok=False; failures.append(f"{sym}:SNAPSHOT")
-        elif any(str(snapshots[-1].get(k,""))=="" for k in ("requested_at","received_at","saved_at","latency_ms","timestamp","last_price")): ok=False; failures.append(f"{sym}:SNAPSHOT_FIELDS")
-        if not os.path.isfile(candle_daily_path(sym)) or not _read_csv_rows(candle_daily_path(sym)): ok=False; failures.append(f"{sym}:DAILY")
+        snapshot_ok=bool(snapshots)
+        if not snapshots: failures.append(f"{sym}:SNAPSHOT")
+        elif any(str(snapshots[-1].get(k,""))=="" for k in ("requested_at","received_at","saved_at","latency_ms","timestamp","last_price")):
+            snapshot_ok=False; failures.append(f"{sym}:SNAPSHOT_FIELDS")
+        daily_ok=bool(os.path.isfile(candle_daily_path(sym)) and _read_csv_rows(candle_daily_path(sym)))
+        if not daily_ok: failures.append(f"{sym}:DAILY")
         metadata=_read_csv_rows(stock_metadata_path(sym)) if os.path.isfile(stock_metadata_path(sym)) else []
-        if not metadata: ok=False; failures.append(f"{sym}:METADATA")
-        elif not all(str(metadata[-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http")): ok=False; failures.append(f"{sym}:METADATA_HTTP")
-        if not ok: failures.append(f"{sym}:MINUTE rows={len(rows)} gaps={gaps} missing={bad_ohlcv}")
-        details[sym]={"rows":len(rows),"first":times[0].isoformat() if times else "","last":times[-1].isoformat() if times else "","gaps":gaps,"duplicate":len(times)-len(set(times)),"reverse":reverse,"future":future,"ohlcv_missing":bad_ohlcv,"trade_value_missing":bad_amount,"ok":ok}
+        metadata_ok=bool(metadata) and all(str(metadata[-1].get(k,""))=="200" for k in ("stock_http","warning_http","limits_http"))
+        if not metadata: failures.append(f"{sym}:METADATA")
+        elif not metadata_ok: failures.append(f"{sym}:METADATA_HTTP")
+        ok=bool(minute_ok and orderbook_ok and trades_ok and snapshot_ok and daily_ok and metadata_ok)
+        details[sym]={"rows":len(rows),"first":times[0].isoformat() if times else "","last":times[-1].isoformat() if times else "","gaps":gaps,"duplicate":len(times)-len(set(times)),"reverse":reverse,"future":future,"ohlcv_missing":bad_ohlcv,"trade_value_missing":bad_amount,"minute_ok":minute_ok,"orderbook_ok":orderbook_ok,"trades_ok":trades_ok,"snapshot_ok":snapshot_ok,"daily_ok":daily_ok,"metadata_ok":metadata_ok,"ok":ok}
     raw_path=os.path.join(raw_market_dir("KR"),f"api_{today()}.jsonl")
     if not os.path.isfile(raw_path) or os.path.getsize(raw_path)==0: failures.append("RAW_API_RESPONSES_MISSING")
     if not _read_csv_rows(market_indicator_path()): failures.append("MARKET_INDICATORS_MISSING")
@@ -6691,12 +6699,16 @@ def _verify_local_kr_backup_or_raise(path, trade_date):
 def create_backup_zip():
     """한국 1등급 검사 → 원본만 ZIP → CRC/내부검증 → 원자적 교체."""
     finalize_all_paper_accounts()
-    repair_failures = repair_kr_required_files_before_backup()
+    repair_failures = []
 
     backfill_ok = False
     backfill_failures = []
     quality = {"grade": "FAILED", "failures": ["NOT_CHECKED"], "details": {}}
+    # 백업 직전 필수파일 복구도 1회로 끝내지 않는다. 순간 401/429/API 지연으로
+    # ORDERBOOK/METADATA 한두 종목이 비는 경우 최대 5회까지 다시 채운 뒤 판정한다.
     for grade1_pass in range(1, 6):
+        pass_repair_failures = repair_kr_required_files_before_backup()
+        repair_failures.extend([f"PASS_{grade1_pass}:{x}" for x in pass_repair_failures])
         pass_ok, pass_failures = finalize_kr_candles_grade1()
         quality = audit_kr_grade1()
         backfill_ok = pass_ok and quality.get("grade") == "GRADE_1"
@@ -8149,11 +8161,16 @@ def maybe_send_daily_backup():
     try:
         path = create_backup_zip()
     except Exception as e:
-        send_telegram(
-            f"🇰🇷 한국시장 백업 생성/검증 실패\n날짜: {trade_date}\n"
-            f"오류: {str(e)[:1200]}\n불완전 ZIP은 성공본으로 교체하지 않음\n10분 뒤 재시도",
-            force=True,
-        )
+        err_text = str(e)[:1200]
+        signature = "LOCAL_BACKUP_VERIFY:" + err_text[:900]
+        # 자동 재시도는 10분 간격으로 유지하되 같은 실패 텔레그램은 6시간 동안 1회만 보낸다.
+        if _kr_backup_failure_should_notify(trade_date, signature):
+            send_telegram(
+                f"🇰🇷 한국시장 백업 생성/검증 실패\n날짜: {trade_date}\n"
+                f"오류: {err_text}\n불완전 ZIP은 성공본으로 교체하지 않음\n"
+                "자동 재시도는 계속하지만 같은 실패 알림은 6시간 동안 반복하지 않습니다.",
+                force=True,
+            )
         return
 
     final_grade = S.setdefault("market_data_capture", {}).get("final_grade", "FAILED")
