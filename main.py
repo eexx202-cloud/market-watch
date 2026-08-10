@@ -416,7 +416,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_67_BACKUP_RESILIENCE_FINAL_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_68_BACKUP_VERIFY_TARGET_FIX_FINAL_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -7338,6 +7338,45 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
     result["grade"] = "GRADE_1" if not failures else "FAILED"
     return result
 
+
+def verify_kr_backup_file_from_google_drive(file_meta, trade_date=None):
+    """방금 업로드한 그 Drive 파일 ID를 직접 재다운로드해 한국 백업을 검증한다.
+    동일 날짜의 과거 exact-name 파일을 잘못 집어 검증하는 문제를 막는다.
+    """
+    trade_date = trade_date or today()
+    if not isinstance(file_meta, dict) or not str(file_meta.get("id", "")).strip():
+        return False, {
+            "grade": "FAILED",
+            "trade_date": trade_date,
+            "failures": ["DRIVE_UPLOADED_FILE_META_INVALID"],
+        }
+    access_token = google_drive_access_token()
+    verify_dir = os.path.join(LOG_ROOT, trade_date, "drive_verify")
+    os.makedirs(verify_dir, exist_ok=True)
+    safe_name = os.path.basename(str(file_meta.get("name") or f"backup_{trade_date}.zip"))
+    local_path = os.path.join(verify_dir, f"uploaded_{str(file_meta.get('id',''))}_{safe_name}")
+    download_meta = google_drive_download_file(access_token, file_meta, local_path)
+    report = inspect_downloaded_kr_backup_zip(local_path, trade_date)
+    report["drive_file_id"] = str(file_meta.get("id", ""))
+    report["drive_file_name"] = str(file_meta.get("name", ""))
+    report["drive_file_size"] = int(to_float(file_meta.get("size", 0), 0))
+    report["drive_md5"] = str(file_meta.get("md5Checksum", ""))
+    report["downloaded_bytes"] = download_meta.get("bytes", 0)
+    report["downloaded_md5"] = download_meta.get("md5", "")
+    report_path = os.path.join(verify_dir, f"drive_uploaded_grade1_report_{trade_date}.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    with LOCK:
+        S["google_drive"].update({
+            "verify_status": "GRADE_1" if report.get("grade") == "GRADE_1" else "FAILED",
+            "verify_checked_at": now_text(),
+            "verify_file_name": report.get("drive_file_name", ""),
+            "verify_file_id": report.get("drive_file_id", ""),
+            "verify_report_path": report_path,
+            "verify_failures": report.get("failures", [])[:100],
+        })
+    return report.get("grade") == "GRADE_1", report
+
 def verify_today_backup_from_google_drive(trade_date=None):
     """오늘 Drive 백업을 직접 찾아 다운로드·CRC·내부 1등급 검사를 수행한다."""
     trade_date = trade_date or today()
@@ -8048,6 +8087,39 @@ def maybe_send_us_backup():
     send_telegram(msg, force=True)
 
 
+
+def _kr_backup_failure_should_notify(trade_date, signature, cooldown_sec=21600):
+    """같은 한국 백업 실패 알림은 기본 6시간에 한 번만 보낸다. 재시도 자체는 계속 가능하다."""
+    completed_map = S.setdefault("kr_backup_completed", {})
+    with LOCK:
+        item = completed_map.get(trade_date, {})
+        if not isinstance(item, dict):
+            item = {}
+        now_ts = time.time()
+        last_sig = str(item.get("last_failure_signature", ""))
+        last_ts = to_float(item.get("last_failure_notified_at", 0))
+        should = (last_sig != signature) or (now_ts - last_ts >= cooldown_sec)
+        item["last_failure_signature"] = signature
+        item["last_failure_seen_at"] = now_text()
+        if should:
+            item["last_failure_notified_at"] = now_ts
+            item["last_failure_notified_text"] = now_text()
+        completed_map[trade_date] = item
+    save_state()
+    return should
+
+
+def _kr_backup_mark_success_clear_failure(trade_date):
+    completed_map = S.setdefault("kr_backup_completed", {})
+    with LOCK:
+        item = completed_map.get(trade_date, {})
+        if not isinstance(item, dict):
+            item = {}
+        for k in ("last_failure_signature","last_failure_seen_at","last_failure_notified_at","last_failure_notified_text"):
+            item.pop(k, None)
+        completed_map[trade_date] = item
+    save_state()
+
 def maybe_send_daily_backup():
     if not ENABLE_DAILY_BACKUP_ALERT:
         return
@@ -8133,7 +8205,7 @@ def maybe_send_daily_backup():
             size_mb = int(result.get("size", 0)) / (1024 * 1024)
             drive_link = str(result.get("webViewLink", ""))
             try:
-                verify_ok, verify_report = verify_today_backup_from_google_drive(trade_date)
+                verify_ok, verify_report = verify_kr_backup_file_from_google_drive(result, trade_date)
             except Exception as e:
                 verify_ok, verify_report = False, {"failures": [str(e)]}
 
@@ -8159,47 +8231,56 @@ def maybe_send_daily_backup():
                         "file_id": str(result.get("id", "")),
                         "file_name": str(result.get("name", os.path.basename(path))),
                     }
-                save_state()
+                _kr_backup_mark_success_clear_failure(trade_date)
             else:
                 failed = verify_report.get("failures", [])
-                tg_ok, tg_msg = send_telegram_file(
-                    path,
-                    caption + "\n⚠️ Drive 업로드 후 재검증 실패 / 로컬 GRADE_1 사본",
-                    force=True,
-                )
-                send_telegram(
-                    caption
-                    + "\n❌ Drive 업로드 후 재검증 실패"
-                    + f"\n파일: {verify_report.get('drive_file_name', result.get('name', ''))}"
-                    + f"\n실패 항목: {' | '.join(failed[:12])[:1200]}"
-                    + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}")
-                    + "\n성공 처리하지 않으며 10분 뒤 다시 시도합니다.",
-                    [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else [],
-                    force=True,
-                )
+                signature = "DRIVE_REVERIFY:" + "|".join(map(str, failed[:12]))[:900]
+                if _kr_backup_failure_should_notify(trade_date, signature):
+                    tg_ok, tg_msg = send_telegram_file(
+                        path,
+                        caption + "\n⚠️ Drive 업로드 후 재검증 실패 / 로컬 GRADE_1 사본",
+                        force=True,
+                    )
+                    send_telegram(
+                        caption
+                        + "\n❌ Drive 업로드 후 재검증 실패"
+                        + f"\n검증 대상 파일 ID: {result.get('id', '')}"
+                        + f"\n파일: {verify_report.get('drive_file_name', result.get('name', ''))}"
+                        + f"\n실패 항목: {' | '.join(failed[:12])[:1200]}"
+                        + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}")
+                        + "\n자동 재시도는 계속하지만 같은 실패 알림은 6시간 동안 반복하지 않습니다.",
+                        [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else [],
+                        force=True,
+                    )
         else:
             err = str(result.get("error", ""))
             auth_required = "재승인 필요" in err or "invalid_grant" in err.lower() or "expired" in err.lower() or "revoked" in err.lower()
 
-            # 오늘처럼 Drive 인증이 죽어도 검증된 ZIP을 Telegram으로 즉시 외부 반출한다.
-            tg_ok, tg_msg = send_telegram_file(
-                path,
-                caption + "\n❌ Google Drive 업로드 실패 / ✅ 로컬 GRADE_1 복구 사본",
-                force=True,
-            )
+            # 인증/업로드 실패 시 같은 ZIP을 10분마다 반복 전송하지 않는다.
+            signature = ("DRIVE_AUTH:" if auth_required else "DRIVE_UPLOAD:") + err[:900]
+            should_notify = _kr_backup_failure_should_notify(trade_date, signature)
+            tg_ok, tg_msg = (False, "반복 알림 억제")
+            if should_notify:
+                tg_ok, tg_msg = send_telegram_file(
+                    path,
+                    caption + "\n❌ Google Drive 업로드 실패 / ✅ 로컬 GRADE_1 복구 사본",
+                    force=True,
+                )
             buttons = []
             if auth_required:
                 buttons.append([telegram_button("Google Drive 재승인", oauth_url)])
             buttons.append([telegram_button("백업 다운로드", url)])
-            send_telegram(
-                caption
-                + "\n❌ Google Drive 업로드 실패"
-                + f"\n오류: {err[:700]}"
-                + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}")
-                + "\n서버의 검증된 ZIP은 유지됩니다.",
-                buttons,
-                force=True,
-            )
+            if should_notify:
+                send_telegram(
+                    caption
+                    + "\n❌ Google Drive 업로드 실패"
+                    + f"\n오류: {err[:700]}"
+                    + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}")
+                    + ("\nGoogle Drive 재승인 전까지 같은 인증 실패 알림은 반복하지 않습니다." if auth_required else "\n같은 업로드 실패 알림은 6시간 동안 반복하지 않습니다.")
+                    + "\n서버의 검증된 ZIP은 유지됩니다.",
+                    buttons,
+                    force=True,
+                )
     else:
         ok, msg = send_telegram_file(path, caption, force=True)
         if not ok:
