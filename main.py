@@ -416,7 +416,7 @@ ALERT_SYMBOLS = REAL_TARGET_SYMBOLS
 # - 실계좌: 반자동. 사용자가 버튼을 눌러야 주문.
 # - AI 가상계좌: ENABLE_PAPER_AUTO=true 이면 2천만원 기준 자동운영.
 # ============================================================
-OPERATING_VERSION = "OPERATING_V4_66_US_DRIVE_REVERIFY_FINAL_PAPER_ONLY"
+OPERATING_VERSION = "OPERATING_V4_67_BACKUP_RESILIENCE_FINAL_PAPER_ONLY"
 
 # 실전 실행 후보는 감시 26개 중 일부로 제한한다.
 SEMI_LONG_SYMBOLS = [LEV, HYNIX, "494310", "488080", "469150", "122630", "069500", "0193W0", "005930"]
@@ -658,6 +658,7 @@ S = {
     "alerts": [],
     "last_alert": {},
     "us_backup_completed": {},
+    "kr_backup_completed": {},
     "orders": [],
     "pending_orders": {},
     "google_drive": {
@@ -1394,6 +1395,7 @@ def save_state():
                 "real_watch": S.get("real_watch", {}),
                 "google_drive": S.get("google_drive", {}),
                 "us_backup_completed": S.get("us_backup_completed", {}),
+                "kr_backup_completed": S.get("kr_backup_completed", {}),
             }
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1429,6 +1431,9 @@ def load_state():
             us_done = data.get("us_backup_completed")
             if isinstance(us_done, dict):
                 S["us_backup_completed"] = us_done
+            kr_done = data.get("kr_backup_completed")
+            if isinstance(kr_done, dict):
+                S["kr_backup_completed"] = kr_done
             if S["paper"].get("start_cash", 0) <= 0:
                 S["paper"] = {"start_cash": VIRTUAL_BASE_CASH, "cash": VIRTUAL_BASE_CASH, "positions": {}, "trades": [], "realized_pl": 0, "asset": VIRTUAL_BASE_CASH, "profit_rate": 0, "last_action": "초기 2천만원"}
     except Exception as e:
@@ -6641,78 +6646,148 @@ def audit_kr_grade1():
     if missing_accounts: failures.append("PAPER_ACCOUNTS_MISSING:"+",".join(missing_accounts))
     return {"grade":"GRADE_1" if not failures else "GRADE_2_PARTIAL","failures":failures,"details":details,"paper_account_files":len(MULTI_AI_IDS)-len(missing_accounts)}
 
-def create_backup_zip():
-    """한국 1등급 검사를 수행하고 결과를 포함해 압축한다."""
-    finalize_all_paper_accounts()
-    repair_failures=repair_kr_required_files_before_backup()
+def _kr_backup_source_files(base):
+    """한국 당일 원본만 백업 대상으로 고정한다.
+    이전/복구/검증 ZIP과 drive_verify 다운로드본은 절대 다시 ZIP 안에 넣지 않는다.
+    """
+    out = []
+    base_abs = os.path.abspath(base)
+    for root, dirs, files in os.walk(base):
+        # Drive 재다운로드 검증 산출물은 원본이 아니므로 백업 소스에서 제외한다.
+        dirs[:] = [d for d in dirs if d != "drive_verify"]
+        for fn in files:
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, base)
+            rel_norm = rel.replace(os.sep, "/")
+            if rel_norm.startswith(("raw/US/", "normalized/US/", "us_trade_dates/", "drive_verify/")):
+                continue
+            # 오늘 사고 원인: backup/recovery ZIP을 다시 ZIP에 넣어 중첩시키지 않는다.
+            if fn.lower().endswith(".zip"):
+                continue
+            if ".BEFORE_RECOVERY" in fn or fn.endswith(".tmp"):
+                continue
+            if not os.path.isfile(fp):
+                continue
+            # 혹시 base 밖으로 빠지는 심볼릭 경로가 생겨도 제외한다.
+            if not os.path.abspath(fp).startswith(base_abs + os.sep):
+                continue
+            out.append((rel_norm, fp))
+    out.sort(key=lambda x: x[0])
+    return out
 
-    # 26종목 전부 공식 거래분봉 09:01~15:30 390개가 될 때까지 반복한다.
-    # 정상 API 응답이 존재하는데 한 번의 경계/순간 오류로 2등급이 되는 것을 막는다.
+
+def _verify_local_kr_backup_or_raise(path, trade_date):
+    """로컬 ZIP을 실제로 다시 열어 GRADE_1이 아니면 성공본으로 교체하지 않는다."""
+    report = inspect_downloaded_kr_backup_zip(path, trade_date)
+    if report.get("grade") != "GRADE_1":
+        failures = report.get("failures", [])
+        raise RuntimeError(
+            "로컬 백업 재검증 실패: "
+            + " | ".join(map(str, failures[:12]))[:1400]
+        )
+    return report
+
+
+def create_backup_zip():
+    """한국 1등급 검사 → 원본만 ZIP → CRC/내부검증 → 원자적 교체."""
+    finalize_all_paper_accounts()
+    repair_failures = repair_kr_required_files_before_backup()
+
     backfill_ok = False
     backfill_failures = []
     quality = {"grade": "FAILED", "failures": ["NOT_CHECKED"], "details": {}}
     for grade1_pass in range(1, 6):
         pass_ok, pass_failures = finalize_kr_candles_grade1()
         quality = audit_kr_grade1()
-        backfill_ok = pass_ok and quality.get("grade") in {"GRADE_1","GRADE_1_WITH_VERIFIED_SOURCE_GAPS"}
+        backfill_ok = pass_ok and quality.get("grade") == "GRADE_1"
         backfill_failures.extend(
             [f"PASS_{grade1_pass}:{x}" for x in pass_failures]
         )
         if backfill_ok:
             break
         time.sleep(min(grade1_pass * 2, 5))
-    quality["repair_failures"]=repair_failures
-    quality["backfill_ok"]=backfill_ok; quality["backfill_failures"]=backfill_failures
+
+    quality["repair_failures"] = repair_failures
+    quality["backfill_ok"] = backfill_ok
+    quality["backfill_failures"] = backfill_failures
     S.setdefault("market_data_capture", {})["final_grade"] = quality.get("grade")
     S.setdefault("market_data_capture", {})["final_grade_failures"] = quality.get("failures", [])
-    quality_path=os.path.join(market_data_dir(),f"grade1_report_{today()}.json")
-    with open(quality_path,"w",encoding="utf-8") as f: json.dump(quality,f,ensure_ascii=False,indent=2)
-    path = backup_zip_path()
-    base = day_dir()
-    included_files = 0
-    included_bytes = 0
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        # 당일 한국 날짜 기준 로그
-        for root, dirs, files in os.walk(base):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                if os.path.abspath(fp) == os.path.abspath(path):
-                    continue
-                arc = os.path.relpath(fp, base)
-                arc_norm = arc.replace(os.sep, "/")
-                if arc_norm.startswith(("raw/US/", "normalized/US/", "us_trade_dates/")):
-                    continue
-                z.write(fp, arc)
-                included_files += 1
-                included_bytes += os.path.getsize(fp)
+    quality_path = os.path.join(market_data_dir(), f"grade1_report_{today()}.json")
+    with open(quality_path, "w", encoding="utf-8") as f:
+        json.dump(quality, f, ensure_ascii=False, indent=2)
 
-        manifest = {
-            "created_at_kst": now_text(),
-            "version": OPERATING_VERSION,
-            "toss_openapi_spec_version": TOSS_OPENAPI_SPEC_VERSION,
-            "toss_openapi_spec_url": TOSS_OPENAPI_SPEC_URL,
-            "kr_log_date": today(),
-            "included_files": included_files,
-            "uncompressed_bytes": included_bytes,
-            "market_mode": MARKET_MODE,
-            "kr_symbol_count": len(ALL26_SYMBOLS),
-            "kr_symbols": ALL26_SYMBOLS,
-            "us_data_included": False,
-            "data_quality_grade": quality.get("grade"),
-            "data_quality_failures": quality.get("failures",[])[:100],
-            "paper_account_files": quality.get("paper_account_files",0),
-            "paper_only_mode": PAPER_ONLY_MODE,
-            "real_order_enabled": ENABLE_REAL_ORDER,
-            "real_auto_buy": ENABLE_REAL_AUTO_BUY,
-            "real_auto_sell": ENABLE_REAL_AUTO_SELL,
-        }
-        z.writestr(
-            "backup_manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2),
+    # 1등급이 아니면 불완전 ZIP을 새 성공본처럼 만들지 않는다.
+    if not backfill_ok or quality.get("grade") != "GRADE_1":
+        raise RuntimeError(
+            "한국 백업 품질검사 미통과: "
+            + " | ".join(map(str, quality.get("failures", [])[:12]))[:1400]
         )
 
-    return path
+    base = day_dir()
+    source_files = _kr_backup_source_files(base)
+    path = backup_zip_path()
+    tmp_path = os.path.join(
+        tempfile.gettempdir(),
+        f".backup_{today()}_{uuid.uuid4().hex}.tmp.zip",
+    )
+
+    included_files = len(source_files)
+    included_bytes = sum(os.path.getsize(fp) for _, fp in source_files)
+
+    manifest = {
+        "created_at_kst": now_text(),
+        "version": OPERATING_VERSION,
+        "toss_openapi_spec_version": TOSS_OPENAPI_SPEC_VERSION,
+        "toss_openapi_spec_url": TOSS_OPENAPI_SPEC_URL,
+        "kr_log_date": today(),
+        "included_files": included_files,
+        "uncompressed_bytes": included_bytes,
+        "market_mode": MARKET_MODE,
+        "kr_symbol_count": len(ALL26_SYMBOLS),
+        "kr_symbols": ALL26_SYMBOLS,
+        "us_data_included": False,
+        "data_quality_grade": quality.get("grade"),
+        "data_quality_failures": quality.get("failures", [])[:100],
+        "paper_account_files": quality.get("paper_account_files", 0),
+        "paper_only_mode": PAPER_ONLY_MODE,
+        "real_order_enabled": ENABLE_REAL_ORDER,
+        "real_auto_buy": ENABLE_REAL_AUTO_BUY,
+        "real_auto_sell": ENABLE_REAL_AUTO_SELL,
+        "nested_zip_excluded": True,
+        "drive_verify_excluded": True,
+    }
+
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+            for arc, fp in source_files:
+                z.write(fp, arc)
+            z.writestr(
+                "backup_manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+
+        # CRC뿐 아니라 26종목/390봉/호가/체결/90계좌/manifest를 독립 재검증.
+        local_report = _verify_local_kr_backup_or_raise(tmp_path, today())
+
+        # 마지막까지 통과한 파일만 공식 backup_YYYY-MM-DD.zip으로 원자적 교체.
+        os.replace(tmp_path, path)
+        with LOCK:
+            S.setdefault("market_data_capture", {})["local_backup_verify"] = {
+                "checked_at": now_text(),
+                "grade": local_report.get("grade", "FAILED"),
+                "file": os.path.basename(path),
+                "size": os.path.getsize(path),
+                "included_files": included_files,
+                "uncompressed_bytes": included_bytes,
+            }
+        return path
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def assert_google_drive_append_only_source_guard():
@@ -6795,6 +6870,16 @@ def google_drive_exchange_oauth_code(qs):
     return refresh_token
 
 
+def _google_drive_auth_error_kind(status_code, body):
+    body_text = str(body or "")
+    low = body_text.lower()
+    if int(status_code or 0) == 400 and "invalid_grant" in low:
+        return "AUTH_REQUIRED"
+    if "expired or revoked" in low:
+        return "AUTH_REQUIRED"
+    return "TOKEN_REFRESH_FAILED"
+
+
 def google_drive_access_token():
     if not google_drive_credentials_ready(require_refresh=True):
         raise RuntimeError("GOOGLE_DRIVE_REFRESH_TOKEN을 포함한 Drive 환경변수가 아직 완성되지 않았습니다.")
@@ -6809,6 +6894,20 @@ def google_drive_access_token():
         timeout=30,
     )
     if r.status_code != 200:
+        kind = _google_drive_auth_error_kind(r.status_code, r.text)
+        with LOCK:
+            S.setdefault("google_drive", {}).update({
+                "status": kind,
+                "last_attempt_at": now_text(),
+                "last_error": f"HTTP {r.status_code}: {r.text[:500]}",
+                "reauth_url": f"{APP_URL}/google/oauth/start" if APP_URL else "/google/oauth/start",
+            })
+        save_state()
+        if kind == "AUTH_REQUIRED":
+            raise RuntimeError(
+                "Google Drive 인증 재승인 필요: refresh token이 만료/취소되었습니다. "
+                f"{APP_URL}/google/oauth/start"
+            )
         raise RuntimeError(f"Google access token 갱신 실패 HTTP {r.status_code}: {r.text[:300]}")
     token = str(r.json().get("access_token", "")).strip()
     if not token:
@@ -7953,53 +8052,96 @@ def maybe_send_daily_backup():
     if not ENABLE_DAILY_BACKUP_ALERT:
         return
     n = now_kst()
-    # 15:35 이후 한 번 실행한다. 재시작·API 지연으로 3분 창을 놓쳐도 자동 저장한다.
     if is_weekend_kst() or (n.hour, n.minute) < (15, 35):
         return
-    key = f"BACKUP_SENT_{today()}"
+
+    trade_date = today()
+    key = f"BACKUP_SENT_{trade_date}"
     attempt_key = key + "_ATTEMPT"
+    completed_map = S.setdefault("kr_backup_completed", {})
+
+    # Drive 재검증까지 완료된 날은 재시작 후에도 중복생성/중복업로드하지 않는다.
+    done = completed_map.get(trade_date, {})
+    if isinstance(done, dict) and done.get("drive_reverified"):
+        return
+
     with LOCK:
-        if S["last_alert"].get(key):
-            return
         last_attempt = to_float(S["last_alert"].get(attempt_key, 0))
         if time.time() - last_attempt < 600:
             return
         S["last_alert"][attempt_key] = time.time()
-    path = create_backup_zip()
-    final_grade = S.setdefault("market_data_capture", {}).get("final_grade", "FAILED")
+
     url = f"{APP_URL}/download_backup" if APP_URL else "/download_backup"
+    oauth_url = f"{APP_URL}/google/oauth/start" if APP_URL else "/google/oauth/start"
+
+    try:
+        path = create_backup_zip()
+    except Exception as e:
+        send_telegram(
+            f"🇰🇷 한국시장 백업 생성/검증 실패\n날짜: {trade_date}\n"
+            f"오류: {str(e)[:1200]}\n불완전 ZIP은 성공본으로 교체하지 않음\n10분 뒤 재시도",
+            force=True,
+        )
+        return
+
+    final_grade = S.setdefault("market_data_capture", {}).get("final_grade", "FAILED")
     caption = (
         f"🇰🇷 한국시장 데이터 백업 {final_grade}\n"
-        f"날짜: {today()}\n"
+        f"날짜: {trade_date}\n"
         f"시간: {now_short()}\n"
         f"한국 동일조건 수집 종목: {len(ALL26_SYMBOLS)}개\n"
         f"미국 데이터: 미포함\n"
         f"다운로드 링크: {url}"
     )
+
+    # 로컬 ZIP은 이미 create_backup_zip 내부에서 GRADE_1 재검증을 통과했다.
+    with LOCK:
+        current = completed_map.get(trade_date, {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update({
+            "local_verified": True,
+            "local_verified_at": now_text(),
+            "local_file": os.path.basename(path),
+            "local_size": os.path.getsize(path),
+            "drive_reverified": False,
+        })
+        completed_map[trade_date] = current
+    save_state()
+
     if GOOGLE_DRIVE_UPLOAD_ENABLED:
         if not google_drive_credentials_ready(require_refresh=True):
-            with LOCK:
-                S["google_drive"].update({
-                    "status": "CONFIG_INCOMPLETE",
-                    "last_attempt_at": now_text(),
-                    "last_error": "GOOGLE_DRIVE_REFRESH_TOKEN 또는 필수 환경변수 누락",
-                })
+            # Drive가 안 돼도 외부 사본을 남기기 위해 Telegram 파일전송을 즉시 시도한다.
+            tg_ok, tg_msg = send_telegram_file(
+                path,
+                caption + "\n❌ Google Drive 설정 미완료\n✅ 로컬 GRADE_1 ZIP 보존",
+                force=True,
+            )
+            buttons = [[telegram_button("Google Drive 재승인", oauth_url)],
+                       [telegram_button("백업 다운로드", url)]]
             send_telegram(
-                caption + "\n❌ Google Drive 업로드: 설정 미완료\nRender 환경변수를 확인하세요.",
-                [[telegram_button("백업 다운로드", url)]],
+                caption
+                + "\n❌ Google Drive 업로드: 설정 미완료"
+                + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}"),
+                buttons,
                 force=True,
             )
             return
+
         drive_ok, result = upload_backup_to_google_drive(path)
         if drive_ok:
             size_mb = int(result.get("size", 0)) / (1024 * 1024)
             drive_link = str(result.get("webViewLink", ""))
-            verify_ok, verify_report = verify_today_backup_from_google_drive(today())
+            try:
+                verify_ok, verify_report = verify_today_backup_from_google_drive(trade_date)
+            except Exception as e:
+                verify_ok, verify_report = False, {"failures": [str(e)]}
+
             if verify_ok:
                 msg = (
                     caption
-                    + f"\n✅ Google Drive 업로드 성공"
-                    + f"\n✅ Drive 재다운로드·CRC·26종목 390봉·호가·체결·90계좌·메타데이터 GRADE_1"
+                    + "\n✅ Google Drive 업로드 성공"
+                    + "\n✅ Drive 재다운로드·CRC·26종목 390봉·호가·체결·90계좌·메타데이터 GRADE_1"
                     + f"\n파일 크기: {size_mb:.1f} MB"
                     + f"\nDrive 파일 ID: {result.get('id', '')}"
                 )
@@ -8007,33 +8149,78 @@ def maybe_send_daily_backup():
                 send_telegram(msg, buttons, force=True)
                 with LOCK:
                     S["last_alert"][key] = time.time()
+                    completed_map[trade_date] = {
+                        "local_verified": True,
+                        "local_verified_at": current.get("local_verified_at", now_text()),
+                        "local_file": os.path.basename(path),
+                        "local_size": os.path.getsize(path),
+                        "drive_reverified": True,
+                        "drive_verified_at": now_text(),
+                        "file_id": str(result.get("id", "")),
+                        "file_name": str(result.get("name", os.path.basename(path))),
+                    }
+                save_state()
             else:
                 failed = verify_report.get("failures", [])
+                tg_ok, tg_msg = send_telegram_file(
+                    path,
+                    caption + "\n⚠️ Drive 업로드 후 재검증 실패 / 로컬 GRADE_1 사본",
+                    force=True,
+                )
                 send_telegram(
                     caption
                     + "\n❌ Drive 업로드 후 재검증 실패"
                     + f"\n파일: {verify_report.get('drive_file_name', result.get('name', ''))}"
                     + f"\n실패 항목: {' | '.join(failed[:12])[:1200]}"
+                    + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}")
                     + "\n성공 처리하지 않으며 10분 뒤 다시 시도합니다.",
                     [[telegram_button("Google Drive에서 보기", drive_link)]] if drive_link else [],
                     force=True,
                 )
         else:
+            err = str(result.get("error", ""))
+            auth_required = "재승인 필요" in err or "invalid_grant" in err.lower() or "expired" in err.lower() or "revoked" in err.lower()
+
+            # 오늘처럼 Drive 인증이 죽어도 검증된 ZIP을 Telegram으로 즉시 외부 반출한다.
+            tg_ok, tg_msg = send_telegram_file(
+                path,
+                caption + "\n❌ Google Drive 업로드 실패 / ✅ 로컬 GRADE_1 복구 사본",
+                force=True,
+            )
+            buttons = []
+            if auth_required:
+                buttons.append([telegram_button("Google Drive 재승인", oauth_url)])
+            buttons.append([telegram_button("백업 다운로드", url)])
             send_telegram(
                 caption
                 + "\n❌ Google Drive 업로드 실패"
-                + f"\n오류: {str(result.get('error', ''))[:500]}"
-                + "\n서버 ZIP은 유지되며 다운로드 링크를 사용할 수 있습니다.",
-                [[telegram_button("백업 다운로드", url)]],
+                + f"\n오류: {err[:700]}"
+                + ("\n✅ Telegram ZIP 외부사본 전송 성공" if tg_ok else f"\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}")
+                + "\n서버의 검증된 ZIP은 유지됩니다.",
+                buttons,
                 force=True,
             )
     else:
         ok, msg = send_telegram_file(path, caption, force=True)
         if not ok:
-            send_telegram(caption + f"\n파일전송 실패: {msg}", [[telegram_button("백업 다운로드", url)]], force=True)
+            send_telegram(
+                caption + f"\n파일전송 실패: {msg}",
+                [[telegram_button("백업 다운로드", url)]],
+                force=True,
+            )
         else:
             with LOCK:
                 S["last_alert"][key] = time.time()
+                completed_map[trade_date] = {
+                    "local_verified": True,
+                    "local_verified_at": now_text(),
+                    "local_file": os.path.basename(path),
+                    "local_size": os.path.getsize(path),
+                    "drive_reverified": False,
+                    "telegram_exported": True,
+                }
+            save_state()
+
 
 def loop():
     load_state()
@@ -8451,7 +8638,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/download_fast_scalp":
             return self.download_file(fast_scalp_path(), f"fast_scalp_signals_{today()}.csv")
         if path == "/download_backup":
-            path_zip = create_backup_zip()
+            path_zip = backup_zip_path()
+            # 이미 생성된 정상 ZIP은 그대로 내려준다. 다운로드 클릭이 백업을 다시 만들어
+            # ZIP 안에 ZIP이 중첩되거나 원본이 바뀌는 일을 막는다.
+            if os.path.isfile(path_zip):
+                try:
+                    report = inspect_downloaded_kr_backup_zip(path_zip, today())
+                    if report.get("grade") != "GRADE_1":
+                        path_zip = create_backup_zip()
+                except Exception:
+                    path_zip = create_backup_zip()
+            else:
+                path_zip = create_backup_zip()
             return self.download_file(path_zip, os.path.basename(path_zip), content_type="application/zip")
         if path == "/download_us_backup":
             # 수동 복구/점검용. 실주문과 무관하며 현재 US 캘린더 거래일만 대상으로 한다.
@@ -8705,7 +8903,7 @@ function showAiGroup(g,btn){{document.querySelectorAll('.ai-group').forEach(x=>x
         return f"<div class='card'><h2>뉴스 키워드</h2><div class='mid yellow'>{safe(news.get('label','뉴스 대기'))}</div><div class='small'>뉴스 점수 {news.get('score',0)} / 업데이트 {safe(news.get('updated','없음'))}</div><br><table><tr><th>구분</th><th>제목</th></tr>{rows}</table></div>"
 
     def test_card(self):
-        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/ipcheck'">외부 IP 확인</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button><button class="gold" onclick="location.href='/download_us_backup'">미국 백업 ZIP</button></div>"""
+        return """<div class="card"><h2>테스트</h2><button class="graybtn" onclick="location.href='/refresh'">새로고침</button><button class="graybtn" onclick="location.href='/selfcheck'">SELF CHECK</button><button class="graybtn" onclick="location.href='/ipcheck'">외부 IP 확인</button><button class="graybtn" onclick="location.href='/configcheck'">CONFIG CHECK</button><button class="graybtn" onclick="location.href='/google/oauth/start'">Drive 재승인</button><button class="graybtn" onclick="location.href='/check_kakao'">카카오 토큰</button><button class="graybtn" onclick="location.href='/test_kakao'">카카오/텔레 테스트</button><button class="graybtn" onclick="location.href='/check_telegram'">텔레그램 확인</button><button class="graybtn" onclick="location.href='/test_telegram'">텔레그램 테스트</button><button class="buy" onclick="location.href='/test_entry'">진입 알림 테스트</button><button class="sell" onclick="location.href='/test_sell'">매도 알림 테스트</button><button class="gold" onclick="location.href='/download_csv'">가격 CSV</button><button class="gold" onclick="location.href='/download_paper'">구 AI 가상매매 CSV</button><button class="gold" onclick="location.href='/download_shadow_signals'">고정규칙 신호 CSV</button><button class="gold" onclick="location.href='/download_shadow_trades'">고정규칙 거래 CSV</button><button class="gold" onclick="location.href='/download_shadow_summary'">고정규칙 요약 CSV</button><button class="gold" onclick="location.href='/download_orders'">주문 CSV</button><button class="gold" onclick="location.href='/download_portfolio'">포트폴리오 CSV</button><button class="gold" onclick="location.href='/download_swing'">스윙판단 CSV</button><button class="gold" onclick="location.href='/download_alert_log'">알림로그 CSV</button><button class="gold" onclick="location.href='/download_fast_scalp'">짧은단타 기록 CSV</button><button class="gold" onclick="location.href='/symbols_csv'">종목별 CSV</button><button class="gold" onclick="location.href='/download_backup'">오늘 전체 ZIP</button><button class="gold" onclick="location.href='/download_us_backup'">미국 백업 ZIP</button></div>"""
 
     def alert_card(self):
         rows = "".join(f"<tr><td class='small'>{safe(a['time'])}</td><td>{safe(a['msg']).replace(chr(10),'<br>')}</td></tr>" for a in S["alerts"][:20]) or "<tr><td colspan='2' class='gray'>없음</td></tr>"
