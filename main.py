@@ -26,7 +26,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_81_DATA_PAPER_BACKUP_CLEAN_FROZEN_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_82_DATA_PAPER_BACKUP_STORAGE_FALLBACK_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -96,6 +96,7 @@ MARKET_DATA_TRADE_COUNT = int(os.environ.get('MARKET_DATA_TRADE_COUNT', '20'))
 # /tmp는 테스트/비상용으로만 명시적으로 ALLOW_EPHEMERAL_STORAGE=true일 때 허용한다.
 REQUIRE_PERSISTENT_STORAGE = os.environ.get('REQUIRE_PERSISTENT_STORAGE', 'true').lower() == 'true'
 ALLOW_EPHEMERAL_STORAGE = os.environ.get('ALLOW_EPHEMERAL_STORAGE', 'false').lower() == 'true'
+STRICT_PERSISTENT_STORAGE = os.environ.get('STRICT_PERSISTENT_STORAGE', 'false').lower() == 'true'
 PERSISTENT_DISK_MOUNT_PATH = os.environ.get('PERSISTENT_DISK_MOUNT_PATH', '/var/data').rstrip('/') or '/var/data'
 
 def _default_data_root():
@@ -4944,6 +4945,7 @@ def storage_selfcheck():
         'ephemeral_storage': not _path_is_under(LOG_ROOT, PERSISTENT_DISK_MOUNT_PATH),
         'require_persistent_storage': REQUIRE_PERSISTENT_STORAGE,
         'allow_ephemeral_storage': ALLOW_EPHEMERAL_STORAGE,
+        'strict_persistent_storage': STRICT_PERSISTENT_STORAGE,
         'writable': False,
         'error': '',
     }
@@ -5005,12 +5007,22 @@ def print_core_selfcheck():
     print('storage=', storage, flush=True)
     if not storage.get('writable'):
         raise RuntimeError('데이터 저장 경로 쓰기 실패: ' + storage.get('error', ''))
-    if storage.get('ephemeral_storage') and REQUIRE_PERSISTENT_STORAGE and not ALLOW_EPHEMERAL_STORAGE:
-        raise RuntimeError('영구스토리지 미연결: /tmp 실행을 차단했습니다. Render Persistent Disk를 /var/data에 연결하거나 DATA_ROOT를 영구경로로 지정하세요.')
-    if not _path_is_under(BACKUP_ROOT, PERSISTENT_DISK_MOUNT_PATH) and REQUIRE_PERSISTENT_STORAGE and not ALLOW_EPHEMERAL_STORAGE:
-        raise RuntimeError('BACKUP_ROOT가 Persistent Disk 마운트 경로 밖입니다.')
-    if not _path_is_under(STATE_PATH, PERSISTENT_DISK_MOUNT_PATH) and REQUIRE_PERSISTENT_STORAGE and not ALLOW_EPHEMERAL_STORAGE:
-        raise RuntimeError('STATE_PATH가 Persistent Disk 마운트 경로 밖입니다.')
+    persistent_issue = bool(
+        storage.get('ephemeral_storage')
+        or not _path_is_under(BACKUP_ROOT, PERSISTENT_DISK_MOUNT_PATH)
+        or not _path_is_under(STATE_PATH, PERSISTENT_DISK_MOUNT_PATH)
+    )
+    if persistent_issue and REQUIRE_PERSISTENT_STORAGE and not ALLOW_EPHEMERAL_STORAGE:
+        msg = (
+            'WARNING: Persistent Disk 미연결/미사용. 현재 저장경로를 유지하고 서버는 계속 실행합니다. '
+            f'LOG_ROOT={LOG_ROOT} BACKUP_ROOT={BACKUP_ROOT} STATE_PATH={STATE_PATH}. '
+            'Drive 백업을 계속 사용하고, 가능하면 Render Persistent Disk를 /var/data에 연결하세요.'
+        )
+        print(msg, flush=True)
+        with LOCK:
+            S['last_error'] = now_text() + ' ' + msg
+        if STRICT_PERSISTENT_STORAGE:
+            raise RuntimeError(msg)
     if not PAPER_ONLY_MODE or ENABLE_REAL_ORDER or ENABLE_REAL_AUTO_BUY or ENABLE_REAL_AUTO_SELL or US_REAL_ORDER_ENABLED:
         raise RuntimeError('실주문 안전차단 실패')
     if not DATA_PAPER_BACKUP_ONLY:
