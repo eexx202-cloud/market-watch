@@ -1,7 +1,8 @@
 # OPERATING_V4_80_DATA_PAPER_BACKUP_RAW_FIRST_FINAL_PAPER_ONLY
 # 최종 동결형: KR/US 데이터 수집 + 90 가상계좌 + 검증 + 백업/Drive 전용.
+# V4_83: Toss OpenAPI 1.2.13 / ThreadingHTTPServer health 분리 / KR·US RAW_RESCUE Drive 허용 / trades timestamp 정렬.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 from datetime import datetime, timedelta
 import os
@@ -26,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_82_DATA_PAPER_BACKUP_STORAGE_FALLBACK_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_83_TOSS_1_2_13_RESTART_RESCUE_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -135,7 +136,7 @@ US_CANDLE_SEC = max(60, int(os.environ.get('US_CANDLE_SEC', '60')))
 US_ORDERFLOW_SEC = max(30, int(os.environ.get('US_ORDERFLOW_SEC', '60')))
 US_METADATA_REFRESH_SEC = max(3600, int(os.environ.get('US_METADATA_REFRESH_SEC', '21600')))
 US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))
-TOSS_OPENAPI_SPEC_VERSION = '1.2.9'
+TOSS_OPENAPI_SPEC_VERSION = '1.2.13'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
 MARKET_MODE = 'KR_US_PAPER_ONLY'
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_START_MIN', '2')))
@@ -2755,12 +2756,20 @@ def capture_orderbook_and_trades():
         if not isinstance(result, list):
             continue
         last_seen = state.setdefault('last_trade_timestamp', {}).get(sym, '')
-        new_rows = []
-        for t in reversed(result):
+        last_seen_dt = parse_api_datetime(last_seen)
+        ordered = []
+        for t in result:
             if not isinstance(t, dict):
                 continue
             ts = str(t.get('timestamp', ''))
-            if not ts or (last_seen and ts <= last_seen):
+            dt = parse_api_datetime(ts)
+            if not ts or dt is None:
+                continue
+            ordered.append((dt, t))
+        ordered.sort(key=lambda x: x[0])
+        new_rows = []
+        for dt, t in ordered:
+            if last_seen_dt is not None and dt <= last_seen_dt:
                 continue
             new_rows.append(t)
         for t in new_rows:
@@ -2842,12 +2851,20 @@ def capture_us_market_data():
             latency = round((time.time() - t0) * 1000, 3)
             if code == 200:
                 trades = data.get('result', []) if isinstance(data, dict) else []
-                for t in reversed(trades if isinstance(trades, list) else []):
+                ordered = []
+                for t in trades if isinstance(trades, list) else []:
+                    if not isinstance(t, dict):
+                        continue
+                    ts = str(t.get('timestamp', ''))
+                    dt = parse_api_datetime(ts)
+                    if not ts or dt is None:
+                        continue
+                    ordered.append((dt, t))
+                ordered.sort(key=lambda x: x[0])
+                for _, t in ordered:
                     ts = str(t.get('timestamp', ''))
                     price = to_float(t.get('price', 0))
                     volume = to_float(t.get('volume', 0))
-                    if not ts:
-                        continue
                     write_row_unique(us_data_path('trades', sym), tr_headers, {'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': ts, 'price': t.get('price', 0), 'volume': t.get('volume', 0), 'trade_value': round(price * volume, 4), 'currency': t.get('currency', 'USD')}, ['symbol', 'timestamp', 'price', 'volume'])
             _market_data_request_gap()
         state['last_orderflow_ts'] = now_ts
@@ -3609,6 +3626,9 @@ def google_drive_access_token():
     return token
 
 def validate_backup_zip_for_drive(path):
+    """정식 백업과 RAW_RESCUE를 구분해 CRC+manifest를 검증한다.
+    RAW_RESCUE는 복구용 원본이므로 GRADE_1 manifest를 요구하지 않는다.
+    """
     if not os.path.isfile(path):
         raise RuntimeError('업로드할 ZIP 파일이 없습니다.')
     if os.path.getsize(path) <= 0:
@@ -3617,8 +3637,24 @@ def validate_backup_zip_for_drive(path):
         bad = z.testzip()
         if bad:
             raise RuntimeError(f'ZIP 무결성 검사 실패: {bad}')
-        if 'backup_manifest.json' not in z.namelist():
-            raise RuntimeError('backup_manifest.json이 ZIP에 없습니다.')
+        names = set(z.namelist())
+        if 'backup_manifest.json' in names:
+            return True
+        if 'raw_rescue_manifest.json' in names:
+            try:
+                manifest = json.loads(z.read('raw_rescue_manifest.json').decode('utf-8-sig'))
+            except Exception as e:
+                raise RuntimeError(f'RAW_RESCUE manifest 읽기 실패: {e}')
+            if str(manifest.get('recovery_mode', '')) != 'RAW_RESCUE_NO_GRADE_GATE':
+                raise RuntimeError('RAW_RESCUE recovery_mode 검증 실패')
+            if manifest.get('source_files_preserved_as_is') is not True:
+                raise RuntimeError('RAW_RESCUE 원본보존 플래그 검증 실패')
+            if manifest.get('synthetic_rows_added') is not False:
+                raise RuntimeError('RAW_RESCUE synthetic_rows_added 검증 실패')
+            if manifest.get('prices_modified') is not False:
+                raise RuntimeError('RAW_RESCUE prices_modified 검증 실패')
+            return True
+        raise RuntimeError('backup_manifest.json 또는 raw_rescue_manifest.json이 ZIP에 없습니다.')
 
 def file_md5(path):
     digest = hashlib.md5()
@@ -4447,6 +4483,67 @@ def _us_backup_source_files(base):
     out.sort(key=lambda x: x[0])
     return out
 
+def us_rescue_backup_path(trade_date=None):
+    trade_date = trade_date or us_trade_date_from_calendar()
+    os.makedirs(os.path.join(BACKUP_ROOT, 'US'), exist_ok=True)
+    return os.path.join(BACKUP_ROOT, 'US', f'backup_US_RAW_RESCUE_{trade_date}.zip')
+
+
+def create_us_raw_rescue_backup(trade_date=None):
+    """GRADE 판정과 무관하게 미국 거래일 실제 원본을 먼저 보존한다.
+    가짜 행 생성/가격 수정/CSV 재작성은 하지 않고 ZIP CRC만 확인한다.
+    """
+    trade_date = trade_date or us_trade_date_from_calendar()
+    base = os.path.join(LOG_ROOT, 'US', trade_date)
+    source_files = _us_backup_source_files(base)
+    if not source_files:
+        raise RuntimeError(f'US RAW RESCUE: {trade_date} 원본 파일이 없습니다.')
+    path = us_rescue_backup_path(trade_date)
+    tmp_path = os.path.join(os.path.dirname(path), f'.backup_US_RAW_RESCUE_{trade_date}_{uuid.uuid4().hex}.tmp.zip')
+    manifest = {
+        'created_at_kst': now_text(),
+        'version': OPERATING_VERSION,
+        'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION,
+        'market': 'US',
+        'trade_date': trade_date,
+        'recovery_mode': 'RAW_RESCUE_NO_GRADE_GATE',
+        'source_files_preserved_as_is': True,
+        'synthetic_rows_added': False,
+        'prices_modified': False,
+        'included_files': len(source_files),
+        'uncompressed_bytes': sum(os.path.getsize(fp) for _, fp in source_files),
+        'paper_only_mode': PAPER_ONLY_MODE,
+        'real_order_enabled': ENABLE_REAL_ORDER,
+    }
+    try:
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+            for arc, fp in source_files:
+                z.write(fp, arc)
+            z.writestr('raw_rescue_manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+        with zipfile.ZipFile(tmp_path, 'r') as z:
+            bad = z.testzip()
+            if bad:
+                raise RuntimeError(f'US RAW RESCUE CRC 실패: {bad}')
+        os.replace(tmp_path, path)
+        with LOCK:
+            S.setdefault('us_market_data_capture', {})['raw_rescue_backup'] = {
+                'created_at': now_text(),
+                'trade_date': trade_date,
+                'file': os.path.basename(path),
+                'size': os.path.getsize(path),
+                'included_files': len(source_files),
+                'crc_ok': True,
+            }
+        save_state()
+        return path
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 def _create_us_backup_zip_unlocked():
     """미국 품질검사 → 원본만 임시 ZIP → CRC/내부검증 → 성공본 원자적 교체."""
     repair_failures = repair_us_required_files_before_backup()
@@ -4571,7 +4668,39 @@ def maybe_send_us_backup():
                 return
         except Exception as e:
             set_error(f'미국 Drive 기존백업 사전검증 오류: {e}')
-    path, quality = create_us_backup_zip()
+    rescue_path = None
+    rescue_err = ''
+    try:
+        rescue_path = create_us_raw_rescue_backup(trade_date)
+    except Exception as e:
+        rescue_err = str(e)[:500]
+
+    # 정식 품질검사보다 RAW_RESCUE를 Drive에 먼저 보존한다.
+    if rescue_path and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
+        try:
+            rescue_drive_ok, rescue_drive_result = upload_backup_to_google_drive(rescue_path)
+            if rescue_drive_ok:
+                with LOCK:
+                    item = completed_map.get(trade_date, {})
+                    if not isinstance(item, dict):
+                        item = {}
+                    item['raw_rescue_drive_saved'] = True
+                    item['raw_rescue_file_name'] = str(rescue_drive_result.get('name', os.path.basename(rescue_path)))
+                    item['raw_rescue_file_id'] = str(rescue_drive_result.get('id', ''))
+                    item['raw_rescue_saved_at'] = now_text()
+                    completed_map[trade_date] = item
+                save_state()
+        except Exception as e:
+            set_error(f'미국 RAW_RESCUE Drive 업로드 오류: {e}')
+
+    try:
+        path, quality = create_us_backup_zip()
+    except Exception as e:
+        signature = 'US_LOCAL_BACKUP:' + str(e)[:900]
+        if _us_backup_failure_should_notify(trade_date, signature):
+            rescue_note = (f"\n✅ 미국 RAW_RESCUE 보존: {os.path.basename(rescue_path)}" if rescue_path else f"\n⚠️ 미국 RAW_RESCUE 생성 실패: {rescue_err}")
+            send_telegram(f'🇺🇸 미국시장 정식 백업 생성/검증 실패\n거래일: {trade_date}\n오류: {str(e)[:1200]}' + rescue_note + '\n정식 GRADE 성공본은 만들지 않으며 RAW 원본은 보존합니다.', force=True)
+        return
     grade = quality.get('grade', 'FAILED')
     acceptable = bool(quality.get('backfill_ok')) and grade in {'GRADE_1', 'GRADE_1_WITH_VERIFIED_SOURCE_GAPS'}
     msg = f'🇺🇸 미국 정규장 백업 {grade}\n거래일: {trade_date}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단'
@@ -4873,7 +5002,10 @@ class Handler(BaseHTTPRequestHandler):
             if not os.path.isfile(p):
                 p, _ = create_us_backup_zip()
             return self.download_file(p, os.path.basename(p), 'application/zip')
-        if path in ('/', '/health'):
+        if path == '/health':
+            # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
+        if path == '/':
             return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS)}계좌</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
@@ -5037,4 +5169,7 @@ if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
     threading.Thread(target=loop, daemon=True).start()
-    HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+    server = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+    server.daemon_threads = True
+    server.allow_reuse_address = True
+    server.serve_forever(poll_interval=0.2)
