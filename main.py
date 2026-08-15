@@ -1,6 +1,6 @@
 # OPERATING_V4_80_DATA_PAPER_BACKUP_RAW_FIRST_FINAL_PAPER_ONLY
 # 최종 동결형: KR/US 데이터 수집 + 90 가상계좌 + 검증 + 백업/Drive 전용.
-# V4_83: Toss OpenAPI 1.2.13 / ThreadingHTTPServer health 분리 / KR·US RAW_RESCUE Drive 허용 / trades timestamp 정렬.
+# V4_84: Toss OpenAPI 공식 문서 v1.2.2 기준 / 미국장 종료 가드 / RAW_RESCUE 거래일당 1회 / 수동 다운로드 조기생성 차단.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_83_TOSS_1_2_13_RESTART_RESCUE_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_84_TOSS_OFFICIAL_1_2_2_US_BACKUP_GUARD_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -136,7 +136,7 @@ US_CANDLE_SEC = max(60, int(os.environ.get('US_CANDLE_SEC', '60')))
 US_ORDERFLOW_SEC = max(30, int(os.environ.get('US_ORDERFLOW_SEC', '60')))
 US_METADATA_REFRESH_SEC = max(3600, int(os.environ.get('US_METADATA_REFRESH_SEC', '21600')))
 US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))
-TOSS_OPENAPI_SPEC_VERSION = '1.2.13'
+TOSS_OPENAPI_SPEC_VERSION = '1.2.2'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
 MARKET_MODE = 'KR_US_PAPER_ONLY'
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_START_MIN', '2')))
@@ -399,6 +399,40 @@ def us_regular_market_open_now():
     if not cal.get('is_business_day') or not start or (not end):
         return (False, 'US_MARKET_CLOSED')
     return (start <= now_kst() <= end, 'OK' if start <= now_kst() <= end else 'OUTSIDE_US_REGULAR')
+
+
+def us_backup_finalization_status(force_calendar=False):
+    """미국 정규장 백업 가능 여부를 공식 US market-calendar 기준으로 판정한다.
+
+    수동 다운로드/자동 백업 모두 이 가드를 통과해야 하며,
+    regularMarket 종료 + US_BACKUP_DELAY_MIN 이전에는 390분 품질검사를 시작하지 않는다.
+    """
+    refresh_us_market_calendar(force=force_calendar)
+    state = S.setdefault('us_market_data_capture', {})
+    cal = state.get('calendar', {}) or {}
+    trade_date = str(cal.get('date', '') or '')
+    start = _parse_iso(cal.get('regular_start'))
+    end = _parse_iso(cal.get('regular_end'))
+    nowv = now_kst()
+    reason = 'OK'
+    ready = True
+    if not trade_date or not cal.get('is_business_day') or not start or not end:
+        ready, reason = False, 'US_CALENDAR_INVALID_OR_CLOSED'
+    elif int((end - start).total_seconds() // 60) != 390:
+        ready, reason = False, 'US_REGULAR_SESSION_NOT_390_MIN'
+    elif nowv < end + timedelta(minutes=US_BACKUP_DELAY_MIN):
+        ready, reason = False, 'US_REGULAR_NOT_FINALIZED'
+    elif nowv > end + timedelta(hours=12):
+        ready, reason = False, 'US_BACKUP_WINDOW_EXPIRED'
+    state['backup_gate'] = {
+        'checked_at': now_text(), 'ready': ready, 'reason': reason,
+        'trade_date': trade_date,
+        'regular_start': start.isoformat() if start else '',
+        'regular_end': end.isoformat() if end else '',
+        'eligible_at': (end + timedelta(minutes=US_BACKUP_DELAY_MIN)).isoformat() if end else '',
+        'now': nowv.isoformat(),
+    }
+    return ready, reason, trade_date, start, end
 
 def market_safety_gate(require_orderbook_symbol=None):
     """가상/실거래 공통 차단. 휴장, 장외, 과거 가격, 오래된 호가를 거부한다."""
@@ -4545,7 +4579,10 @@ def create_us_raw_rescue_backup(trade_date=None):
 
 
 def _create_us_backup_zip_unlocked():
-    """미국 품질검사 → 원본만 임시 ZIP → CRC/내부검증 → 성공본 원자적 교체."""
+    """미국 장종료 확인 → 품질검사 → 원본 ZIP → CRC/내부검증 → 성공본 원자적 교체."""
+    ready, reason, trade_date, start, end = us_backup_finalization_status(force_calendar=True)
+    if not ready:
+        raise RuntimeError(f'US_BACKUP_NOT_READY:{reason}:trade_date={trade_date}:start={start}:end={end}:now={now_kst().isoformat()}')
     repair_failures = repair_us_required_files_before_backup()
     ok = False
     backfill_failures = []
@@ -4638,14 +4675,8 @@ def _us_backup_failure_should_notify(trade_date, signature):
 def maybe_send_us_backup():
     if not ENABLE_US_MARKET_DATA_CAPTURE:
         return
-    state = S.setdefault('us_market_data_capture', {})
-    cal = state.get('calendar', {})
-    trade_date = str(cal.get('date', ''))
-    end = _parse_iso(cal.get('regular_end'))
-    if not trade_date or not end:
-        return
-    nowv = now_kst()
-    if not end + timedelta(minutes=US_BACKUP_DELAY_MIN) <= nowv <= end + timedelta(hours=12):
+    ready, reason, trade_date, _start, _end = us_backup_finalization_status(force_calendar=False)
+    if not ready:
         return
     completed_map = S.setdefault('us_backup_completed', {})
     done = completed_map.get(trade_date, {})
@@ -4668,39 +4699,51 @@ def maybe_send_us_backup():
                 return
         except Exception as e:
             set_error(f'미국 Drive 기존백업 사전검증 오류: {e}')
-    rescue_path = None
-    rescue_err = ''
-    try:
-        rescue_path = create_us_raw_rescue_backup(trade_date)
-    except Exception as e:
-        rescue_err = str(e)[:500]
 
-    # 정식 품질검사보다 RAW_RESCUE를 Drive에 먼저 보존한다.
-    if rescue_path and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
-        try:
-            rescue_drive_ok, rescue_drive_result = upload_backup_to_google_drive(rescue_path)
-            if rescue_drive_ok:
-                with LOCK:
-                    item = completed_map.get(trade_date, {})
-                    if not isinstance(item, dict):
-                        item = {}
-                    item['raw_rescue_drive_saved'] = True
-                    item['raw_rescue_file_name'] = str(rescue_drive_result.get('name', os.path.basename(rescue_path)))
-                    item['raw_rescue_file_id'] = str(rescue_drive_result.get('id', ''))
-                    item['raw_rescue_saved_at'] = now_text()
-                    completed_map[trade_date] = item
-                save_state()
-        except Exception as e:
-            set_error(f'미국 RAW_RESCUE Drive 업로드 오류: {e}')
-
+    # 먼저 정식 백업을 시도한다. 실패한 경우에만 RAW_RESCUE를 거래일당 1회 보존한다.
     try:
         path, quality = create_us_backup_zip()
     except Exception as e:
+        rescue_path = None
+        rescue_err = ''
+        with LOCK:
+            item = completed_map.get(trade_date, {})
+            if not isinstance(item, dict):
+                item = {}
+            raw_already_saved = bool(item.get('raw_rescue_drive_saved'))
+        if not raw_already_saved:
+            try:
+                rescue_path = create_us_raw_rescue_backup(trade_date)
+                if rescue_path and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
+                    rescue_drive_ok, rescue_drive_result = upload_backup_to_google_drive(rescue_path)
+                    if rescue_drive_ok:
+                        with LOCK:
+                            item = completed_map.get(trade_date, {})
+                            if not isinstance(item, dict):
+                                item = {}
+                            item['raw_rescue_drive_saved'] = True
+                            item['raw_rescue_file_name'] = str(rescue_drive_result.get('name', os.path.basename(rescue_path)))
+                            item['raw_rescue_file_id'] = str(rescue_drive_result.get('id', ''))
+                            item['raw_rescue_saved_at'] = now_text()
+                            completed_map[trade_date] = item
+                        save_state()
+            except Exception as rescue_exc:
+                rescue_err = str(rescue_exc)[:500]
+                set_error(f'미국 RAW_RESCUE 생성/Drive 업로드 오류: {rescue_exc}')
         signature = 'US_LOCAL_BACKUP:' + str(e)[:900]
         if _us_backup_failure_should_notify(trade_date, signature):
-            rescue_note = (f"\n✅ 미국 RAW_RESCUE 보존: {os.path.basename(rescue_path)}" if rescue_path else f"\n⚠️ 미국 RAW_RESCUE 생성 실패: {rescue_err}")
+            with LOCK:
+                item = completed_map.get(trade_date, {}) if isinstance(completed_map.get(trade_date, {}), dict) else {}
+                saved_name = str(item.get('raw_rescue_file_name', ''))
+            if saved_name:
+                rescue_note = f"\n✅ 미국 RAW_RESCUE 거래일당 1회 보존: {saved_name}"
+            elif rescue_path:
+                rescue_note = f"\n✅ 미국 RAW_RESCUE 로컬 보존: {os.path.basename(rescue_path)}"
+            else:
+                rescue_note = f"\n⚠️ 미국 RAW_RESCUE 생성/업로드 실패: {rescue_err}"
             send_telegram(f'🇺🇸 미국시장 정식 백업 생성/검증 실패\n거래일: {trade_date}\n오류: {str(e)[:1200]}' + rescue_note + '\n정식 GRADE 성공본은 만들지 않으며 RAW 원본은 보존합니다.', force=True)
         return
+
     grade = quality.get('grade', 'FAILED')
     acceptable = bool(quality.get('backfill_ok')) and grade in {'GRADE_1', 'GRADE_1_WITH_VERIFIED_SOURCE_GAPS'}
     msg = f'🇺🇸 미국 정규장 백업 {grade}\n거래일: {trade_date}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단'
@@ -4744,145 +4787,6 @@ def maybe_send_us_backup():
         signature = 'US_DRIVE:' + msg[-900:]
         if _us_backup_failure_should_notify(trade_date, signature):
             send_telegram(msg, force=True)
-
-def _kr_backup_failure_should_notify(trade_date, signature, cooldown_sec=86400):
-    """한국 백업 실패는 거래일당 최초 1회만 알린다. 자동 재시도는 조용히 계속한다."""
-    completed_map = S.setdefault('kr_backup_completed', {})
-    with LOCK:
-        item = completed_map.get(trade_date, {})
-        if not isinstance(item, dict):
-            item = {}
-        item['last_failure_signature'] = str(signature)[:1200]
-        item['last_failure_seen_at'] = now_text()
-        already = bool(item.get('failure_notified_once'))
-        if not already:
-            item['failure_notified_once'] = True
-            item['last_failure_notified_at'] = time.time()
-            item['last_failure_notified_text'] = now_text()
-        completed_map[trade_date] = item
-    save_state()
-    return not already
-
-def _kr_backup_mark_success_clear_failure(trade_date):
-    completed_map = S.setdefault('kr_backup_completed', {})
-    with LOCK:
-        item = completed_map.get(trade_date, {})
-        if not isinstance(item, dict):
-            item = {}
-        for k in ('last_failure_signature', 'last_failure_seen_at', 'last_failure_notified_at', 'last_failure_notified_text', 'failure_notified_once'):
-            item.pop(k, None)
-        completed_map[trade_date] = item
-    save_state()
-
-def maybe_send_daily_backup():
-    if not ENABLE_DAILY_BACKUP_ALERT:
-        return
-    n = now_kst()
-    if is_weekend_kst() or (n.hour, n.minute) < (15, 35):
-        return
-    trade_date = today()
-    key = f'BACKUP_SENT_{trade_date}'
-    attempt_key = key + '_ATTEMPT'
-    completed_map = S.setdefault('kr_backup_completed', {})
-    done = completed_map.get(trade_date, {})
-    if isinstance(done, dict) and done.get('drive_reverified'):
-        return
-    with LOCK:
-        last_attempt = to_float(S['last_alert'].get(attempt_key, 0))
-        if time.time() - last_attempt < 600:
-            return
-        S['last_alert'][attempt_key] = time.time()
-    url = f'{APP_URL}/download_backup' if APP_URL else '/download_backup'
-    oauth_url = f'{APP_URL}/google/oauth/start' if APP_URL else '/google/oauth/start'
-    # 핵심 원칙: GRADE 검증보다 먼저 당일 실제 원본을 복구 ZIP으로 보존한다.
-    # 검증기가 오판정해도 사용자가 다시 데이터를 찾지 않도록 한다.
-    rescue_path = None
-    rescue_err = ''
-    try:
-        rescue_path = preserve_kr_raw_before_grade_check()
-    except Exception as e:
-        rescue_err = str(e)[:500]
-    try:
-        path = create_backup_zip()
-    except Exception as e:
-        err_text = str(e)[:1200]
-        signature = 'LOCAL_BACKUP_VERIFY:' + err_text[:900]
-        drive_rescue_note = ''
-        if rescue_path and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(require_refresh=True):
-            try:
-                raw_drive_ok, raw_drive_result = upload_backup_to_google_drive(rescue_path)
-                if raw_drive_ok:
-                    drive_rescue_note = f"\n✅ RAW 복구 ZIP Drive 보존 성공: {raw_drive_result.get('name', os.path.basename(rescue_path))}"
-                else:
-                    drive_rescue_note = f"\n⚠️ RAW 복구 ZIP Drive 업로드 실패: {str(raw_drive_result.get('error',''))[:250]}"
-            except Exception as de:
-                drive_rescue_note = f"\n⚠️ RAW 복구 ZIP Drive 업로드 예외: {str(de)[:250]}"
-        if _kr_backup_failure_should_notify(trade_date, signature):
-            rescue_note = (f"\n✅ 당일 실제 원본 RAW 복구 ZIP 보존: {os.path.basename(rescue_path)}" if rescue_path else f"\n⚠️ RAW 복구 ZIP 생성 실패: {rescue_err}")
-            send_telegram(f'🇰🇷 한국시장 백업 생성/검증 실패\n날짜: {trade_date}\n오류: {err_text}\nGRADE 성공본은 교체하지 않음' + rescue_note + drive_rescue_note + '\n자동 재시도는 계속하지만 같은 거래일의 실패 알림은 더 이상 반복하지 않습니다.', force=True)
-        return
-    final_grade = S.setdefault('market_data_capture', {}).get('final_grade', 'FAILED')
-    caption = f'🇰🇷 한국시장 데이터 백업 {final_grade}\n날짜: {trade_date}\n시간: {now_short()}\n한국 동일조건 수집 종목: {len(ALL26_SYMBOLS)}개\n미국 데이터: 미포함\n다운로드 링크: {url}'
-    with LOCK:
-        current = completed_map.get(trade_date, {})
-        if not isinstance(current, dict):
-            current = {}
-        current.update({'local_verified': True, 'local_verified_at': now_text(), 'local_file': os.path.basename(path), 'local_size': os.path.getsize(path), 'drive_reverified': False})
-        completed_map[trade_date] = current
-    save_state()
-    if GOOGLE_DRIVE_UPLOAD_ENABLED:
-        if not google_drive_credentials_ready(require_refresh=True):
-            signature = 'DRIVE_CONFIG_INCOMPLETE'
-            if _kr_backup_failure_should_notify(trade_date, signature):
-                tg_ok, tg_msg = send_telegram_file(path, caption + '\n❌ Google Drive 설정 미완료\n✅ 로컬 GRADE_1 ZIP 보존', force=True)
-                buttons = [[telegram_button('Google Drive 재승인', oauth_url)], [telegram_button('백업 다운로드', url)]]
-                send_telegram(caption + '\n❌ Google Drive 업로드: 설정 미완료' + ('\n✅ Telegram ZIP 외부사본 전송 성공' if tg_ok else f'\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}') + '\n같은 거래일에는 반복 알림하지 않습니다.', buttons, force=True)
-            return
-        drive_ok, result = upload_backup_to_google_drive(path)
-        if drive_ok:
-            size_mb = int(result.get('size', 0)) / (1024 * 1024)
-            drive_link = str(result.get('webViewLink', ''))
-            try:
-                verify_ok, verify_report = verify_kr_backup_file_from_google_drive(result, trade_date)
-            except Exception as e:
-                verify_ok, verify_report = (False, {'failures': [str(e)]})
-            if verify_ok:
-                msg = caption + '\n✅ Google Drive 업로드 성공' + '\n✅ Drive 재다운로드·CRC·26종목 390봉·호가·체결·90계좌·메타데이터 GRADE_1' + f'\n파일 크기: {size_mb:.1f} MB' + f"\nDrive 파일 ID: {result.get('id', '')}"
-                buttons = [[telegram_button('Google Drive에서 보기', drive_link)]] if drive_link else []
-                send_telegram(msg, buttons, force=True)
-                with LOCK:
-                    S['last_alert'][key] = time.time()
-                    completed_map[trade_date] = {'local_verified': True, 'local_verified_at': current.get('local_verified_at', now_text()), 'local_file': os.path.basename(path), 'local_size': os.path.getsize(path), 'drive_reverified': True, 'drive_verified_at': now_text(), 'file_id': str(result.get('id', '')), 'file_name': str(result.get('name', os.path.basename(path)))}
-                _kr_backup_mark_success_clear_failure(trade_date)
-            else:
-                failed = verify_report.get('failures', [])
-                signature = 'DRIVE_REVERIFY:' + '|'.join(map(str, failed[:12]))[:900]
-                if _kr_backup_failure_should_notify(trade_date, signature):
-                    tg_ok, tg_msg = send_telegram_file(path, caption + '\n⚠️ Drive 업로드 후 재검증 실패 / 로컬 GRADE_1 사본', force=True)
-                    send_telegram(caption + '\n❌ Drive 업로드 후 재검증 실패' + f"\n검증 대상 파일 ID: {result.get('id', '')}" + f"\n파일: {verify_report.get('drive_file_name', result.get('name', ''))}" + f"\n실패 항목: {' | '.join(failed[:12])[:1200]}" + ('\n✅ Telegram ZIP 외부사본 전송 성공' if tg_ok else f'\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}') + '\n자동 재시도는 계속하지만 같은 거래일의 실패 알림은 더 이상 반복하지 않습니다.', [[telegram_button('Google Drive에서 보기', drive_link)]] if drive_link else [], force=True)
-        else:
-            err = str(result.get('error', ''))
-            auth_required = '재승인 필요' in err or 'invalid_grant' in err.lower() or 'expired' in err.lower() or ('revoked' in err.lower())
-            signature = ('DRIVE_AUTH:' if auth_required else 'DRIVE_UPLOAD:') + err[:900]
-            should_notify = _kr_backup_failure_should_notify(trade_date, signature)
-            tg_ok, tg_msg = (False, '반복 알림 억제')
-            if should_notify:
-                tg_ok, tg_msg = send_telegram_file(path, caption + '\n❌ Google Drive 업로드 실패 / ✅ 로컬 GRADE_1 복구 사본', force=True)
-            buttons = []
-            if auth_required:
-                buttons.append([telegram_button('Google Drive 재승인', oauth_url)])
-            buttons.append([telegram_button('백업 다운로드', url)])
-            if should_notify:
-                send_telegram(caption + '\n❌ Google Drive 업로드 실패' + f'\n오류: {err[:700]}' + ('\n✅ Telegram ZIP 외부사본 전송 성공' if tg_ok else f'\n⚠️ Telegram ZIP 전송 실패: {tg_msg[:300]}') + ('\nGoogle Drive 재승인 전까지 같은 인증 실패 알림은 반복하지 않습니다.' if auth_required else '\n같은 업로드 실패 알림은 6시간 동안 반복하지 않습니다.') + '\n서버의 검증된 ZIP은 유지됩니다.', buttons, force=True)
-    else:
-        ok, msg = send_telegram_file(path, caption, force=True)
-        if not ok:
-            send_telegram(caption + f'\n파일전송 실패: {msg}', [[telegram_button('백업 다운로드', url)]], force=True)
-        else:
-            with LOCK:
-                S['last_alert'][key] = time.time()
-                completed_map[trade_date] = {'local_verified': True, 'local_verified_at': now_text(), 'local_file': os.path.basename(path), 'local_size': os.path.getsize(path), 'drive_reverified': False, 'telegram_exported': True}
-            save_state()
 
 def loop():
     """DATA+PAPER ONLY 핵심 루프: KR/US 데이터 수집 + 가상매매 + 원본보존/백업만 수행한다. 실주문/추천 실행 없음."""
@@ -4996,8 +4900,9 @@ class Handler(BaseHTTPRequestHandler):
                 p = create_backup_zip()
             return self.download_file(p, os.path.basename(p), 'application/zip')
         if path == '/download_us_backup':
-            refresh_us_market_calendar(force=True)
-            trade_date = us_trade_date_from_calendar()
+            ready, reason, trade_date, start, end = us_backup_finalization_status(force_calendar=True)
+            if not ready:
+                return self.json_response({'ok': False, 'error': 'US_BACKUP_NOT_READY', 'reason': reason, 'trade_date': trade_date, 'regular_start': start.isoformat() if start else '', 'regular_end': end.isoformat() if end else '', 'now': now_kst().isoformat()}, status=409)
             p = us_backup_zip_path(trade_date)
             if not os.path.isfile(p):
                 p, _ = create_us_backup_zip()
