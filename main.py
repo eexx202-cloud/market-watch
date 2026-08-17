@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_87_TOSS_1_2_13_US_BACKUP_GUARD_RAW_ONCE_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_89_TOSS_1_2_13_KR_US_HOLIDAY_EARLY_CLOSE_GUARD_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -360,6 +360,22 @@ def regular_market_open_now():
     if not start <= n <= end:
         return (False, 'OUTSIDE_REGULAR_SESSION')
     return (True, 'OK')
+
+def kr_backup_day_status(force=False):
+    """한국 백업용 거래일 판정. 휴장만 정상 차단하고, 캘린더 장애는 별도 오류로 구분한다."""
+    refresh_kr_market_calendar(force)
+    state = S.setdefault('market_data_capture', {})
+    cal = state.get('calendar', {})
+    if cal.get('date') == today() and cal.get('is_business_day') is False:
+        return (False, 'KR_MARKET_CLOSED', cal)
+    if not cal or cal.get('date') != today():
+        return (False, state.get('gate_reason') or 'KR_CALENDAR_INVALID', cal)
+    start = parse_api_datetime(cal.get('regular_start'))
+    end = parse_api_datetime(cal.get('regular_end'))
+    if not start or not end:
+        return (False, 'KR_CALENDAR_INVALID', cal)
+    return (True, 'OK', cal)
+
 
 def refresh_us_market_calendar(force=False):
     """공식 /api/v1/market-calendar/US의 KST 정규장 시간만 사용한다."""
@@ -3474,10 +3490,10 @@ def _create_backup_zip_unlocked():
                 pass
 
 def create_backup_zip():
-    """한국 백업 공통 진입점.
-    정식 GRADE_1 검사보다 먼저 당일 실제 원본 RAW 구조백업을 반드시 남긴다.
-    검증/API/토큰이 실패해도 원본 복구 ZIP은 유지하며 가짜 행은 만들지 않는다.
-    """
+    """한국 백업 공통 진입점. 휴장일에는 ZIP/RAW_RESCUE를 만들지 않는다."""
+    day_ok, day_reason, _ = kr_backup_day_status(force=True)
+    if not day_ok and day_reason == 'KR_MARKET_CLOSED':
+        raise RuntimeError('KR_BACKUP_NOT_READY:KR_MARKET_CLOSED')
     with BACKUP_LOCK:
         rescue_error = ''
         try:
@@ -3502,11 +3518,12 @@ def kr_rescue_backup_path(trade_date=None):
 
 
 def create_kr_raw_rescue_backup(trade_date=None):
-    """GRADE 판정과 무관하게 당일 실제 수집 원본을 먼저 보존한다.
-    가짜 행 생성/가격 수정/CSV 재작성은 하지 않는다. ZIP CRC만 확인한다.
-    이 파일은 분석용 GRADE_1 성공본이 아니라 복구용 원본 사본이다.
-    """
+    """거래일 원본 복구 ZIP. 공식 캘린더가 휴장으로 확정한 날에는 생성하지 않는다."""
     trade_date = trade_date or today()
+    if trade_date == today():
+        day_ok, day_reason, _ = kr_backup_day_status(force=False)
+        if not day_ok and day_reason == 'KR_MARKET_CLOSED':
+            raise RuntimeError('KR_RAW_RESCUE_NOT_READY:KR_MARKET_CLOSED')
     base = day_dir()
     source_files = _kr_backup_source_files(base)
     if not source_files:
@@ -4016,7 +4033,8 @@ def inspect_downloaded_us_backup_zip(path, expected_date):
                 failures.append('MANIFEST_REAL_ORDER_GUARD_FAIL')
             start = _parse_iso(manifest.get('regular_start'))
             end = _parse_iso(manifest.get('regular_end'))
-            if not start or not end or int((end - start).total_seconds() // 60) != 390:
+            session_minutes = int((end - start).total_seconds() // 60) if start and end else 0
+            if not start or not end or session_minutes <= 0 or session_minutes > 1440:
                 failures.append('MANIFEST_US_SESSION_BOUNDARY_INVALID')
             result['manifest_ok'] = not any((x.startswith('MANIFEST_') for x in failures))
             verified_raw = manifest.get('verified_source_gaps', {}) or {}
@@ -4062,7 +4080,7 @@ def inspect_downloaded_us_backup_zip(path, expected_date):
                 missing = []
                 future = 0
                 if start and end:
-                    expected_times = [start + timedelta(minutes=i) for i in range(390)]
+                    expected_times = [start + timedelta(minutes=i) for i in range(session_minutes)]
                     have = set(times)
                     missing = [t for t in expected_times if t not in have]
                     future = sum((1 for t in times if t < start or t >= end))
@@ -4070,7 +4088,7 @@ def inspect_downloaded_us_backup_zip(path, expected_date):
                 else:
                     boundary_ok = False
                 source_gap_ok = set(missing) == allowed
-                expected_rows = 390 - len(allowed)
+                expected_rows = session_minutes - len(allowed)
                 if len(rows) != expected_rows or duplicate or reverse or future or bad_ohlcv or (not boundary_ok) or (not source_gap_ok):
                     failures.append(f'{sym}:CANDLES rows={len(rows)}/{expected_rows},missing={len(missing)},allowed={len(allowed)},dup={duplicate},reverse={reverse},outside={future},bad={bad_ohlcv}')
                 for kind in ('prices', 'daily', 'orderbook', 'trades', 'metadata'):
@@ -4613,7 +4631,7 @@ def us_backup_zip_path(trade_date=None):
     return os.path.join(BACKUP_ROOT, 'US', f'backup_US_{trade_date}.zip')
 
 def us_backup_ready_status(now_value=None):
-    """공식 US market-calendar의 정규장 종료시각 기준으로 백업 가능 여부를 단일 판정한다."""
+    """공식 US market-calendar 기준. 휴장일은 정상 차단하고 조기폐장은 캘린더 길이를 그대로 사용한다."""
     refresh_us_market_calendar(False)
     state = S.setdefault('us_market_data_capture', {})
     cal = state.get('calendar', {})
@@ -4621,11 +4639,13 @@ def us_backup_ready_status(now_value=None):
     start = _parse_iso(cal.get('regular_start'))
     end = _parse_iso(cal.get('regular_end'))
     nowv = now_value or now_kst()
+    if state.get('status') == 'MARKET_CLOSED':
+        return (False, 'US_MARKET_CLOSED', trade_date, start, end, None)
     if not trade_date or not cal.get('is_business_day') or not start or not end:
         return (False, 'US_CALENDAR_INVALID', trade_date, start, end, None)
     session_minutes = int((end - start).total_seconds() // 60)
-    if session_minutes != 390:
-        return (False, f'US_REGULAR_SESSION_MINUTES_{session_minutes}', trade_date, start, end, None)
+    if session_minutes <= 0 or session_minutes > 1440:
+        return (False, f'US_REGULAR_SESSION_MINUTES_INVALID_{session_minutes}', trade_date, start, end, None)
     ready_at = end + timedelta(minutes=US_BACKUP_DELAY_MIN)
     if nowv < ready_at:
         return (False, 'US_REGULAR_NOT_FINISHED', trade_date, start, end, ready_at)
@@ -4807,6 +4827,11 @@ def maybe_send_daily_backup():
         return
     n = now_kst()
     if is_weekend_kst() or (n.hour, n.minute) < (15, 35):
+        return
+    day_ok, day_reason, _ = kr_backup_day_status(force=True)
+    if not day_ok and day_reason == 'KR_MARKET_CLOSED':
+        with LOCK:
+            S.setdefault('market_data_capture', {})['status'] = 'MARKET_CLOSED_NO_BACKUP'
         return
     trade_date = today()
     key = f'BACKUP_SENT_{trade_date}'
@@ -5011,14 +5036,18 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/selfcheck', '/configcheck'):
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path == '/rescue_today':
-            # GRADE 판정과 무관하게 현재 서버에 존재하는 오늘 KR 원본을 즉시 보존/다운로드한다.
-            # 데이터 재작성, 가짜 행 추가, 가격 수정은 하지 않는다.
+            day_ok, day_reason, _ = kr_backup_day_status(force=True)
+            if not day_ok and day_reason == 'KR_MARKET_CLOSED':
+                return self.json_response({'ok': False, 'error': 'KR_MARKET_CLOSED', 'date': today()}, status=409)
             try:
                 p = create_kr_raw_rescue_backup(today())
                 return self.download_file(p, os.path.basename(p), 'application/zip')
             except Exception as e:
                 return self.json_response({'ok': False, 'error': str(e), 'date': today()}, status=500)
         if path == '/download_backup':
+            day_ok, day_reason, _ = kr_backup_day_status(force=True)
+            if not day_ok and day_reason == 'KR_MARKET_CLOSED':
+                return self.json_response({'ok': False, 'error': 'KR_MARKET_CLOSED', 'date': today()}, status=409)
             p = backup_zip_path()
             if not os.path.isfile(p):
                 p = create_backup_zip()
@@ -5027,7 +5056,8 @@ class Handler(BaseHTTPRequestHandler):
             refresh_us_market_calendar(force=True)
             ready, reason, trade_date, start, end, ready_at = us_backup_ready_status()
             if not ready:
-                return self.json_response({'ok': False, 'error': 'US_BACKUP_NOT_READY', 'reason': reason, 'trade_date': trade_date, 'regular_start': start.isoformat() if start else '', 'regular_end': end.isoformat() if end else '', 'ready_at': ready_at.isoformat() if ready_at else ''}, status=409)
+                error_code = 'US_MARKET_CLOSED' if reason == 'US_MARKET_CLOSED' else 'US_BACKUP_NOT_READY'
+                return self.json_response({'ok': False, 'error': error_code, 'reason': reason, 'trade_date': trade_date, 'regular_start': start.isoformat() if start else '', 'regular_end': end.isoformat() if end else '', 'ready_at': ready_at.isoformat() if ready_at else ''}, status=409)
             p = us_backup_zip_path(trade_date)
             if not os.path.isfile(p):
                 p, _ = create_us_backup_zip()
