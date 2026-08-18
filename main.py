@@ -1,6 +1,6 @@
 # OPERATING_V4_80_DATA_PAPER_BACKUP_RAW_FIRST_FINAL_PAPER_ONLY
 # 최종 동결형: KR/US 데이터 수집 + 90 가상계좌 + 검증 + 백업/Drive 전용.
-# V4_83: Toss OpenAPI 1.2.13 / ThreadingHTTPServer health 분리 / KR·US RAW_RESCUE Drive 허용 / trades timestamp 정렬.
+# V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, urlencode
@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_89_TOSS_1_2_13_KR_US_HOLIDAY_EARLY_CLOSE_GUARD_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_94_TOSS_1_2_13_KR_US_CANONICAL_ONE_FILE_AUTO_BACKUP_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -45,9 +45,13 @@ GOOGLE_DRIVE_FOLDER_ID = os.environ.get('GOOGLE_DRIVE_FOLDER_ID', '').strip()
 GOOGLE_DRIVE_REDIRECT_URI = os.environ.get('GOOGLE_DRIVE_REDIRECT_URI', 'https://market-watch-6zgo.onrender.com/google/oauth/callback').strip()
 GOOGLE_DRIVE_UPLOAD_ENABLED = os.environ.get('GOOGLE_DRIVE_UPLOAD_ENABLED', 'true').lower() == 'true'
 GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
-GOOGLE_DRIVE_APPEND_ONLY = True
+# 자동백업 원칙: 거래일/백업종류별 canonical 파일명 1개만 유지한다.
+# 같은 canonical 파일이 이미 있고 내용이 더 최신이면 같은 Drive fileId의 내용만 갱신한다.
+# 다른 파일 삭제는 절대 하지 않는다.
+GOOGLE_DRIVE_APPEND_ONLY = False
+GOOGLE_DRIVE_CANONICAL_ONE_FILE = True
 GOOGLE_DRIVE_ALLOW_DELETE = False
-GOOGLE_DRIVE_ALLOW_UPDATE = False
+GOOGLE_DRIVE_ALLOW_UPDATE = True
 GOOGLE_DRIVE_VERIFY_EXISTING_UNCHANGED = True
 GOOGLE_DRIVE_CHUNK_BYTES = 8 * 1024 * 1024
 GOOGLE_OAUTH_STATE = ''
@@ -3489,23 +3493,25 @@ def _create_backup_zip_unlocked():
             except Exception:
                 pass
 
-def create_backup_zip():
-    """한국 백업 공통 진입점. 휴장일에는 ZIP/RAW_RESCUE를 만들지 않는다."""
+def create_backup_zip(preserve_raw=True):
+    """한국 백업 공통 진입점. 휴장일에는 ZIP/RAW_RESCUE를 만들지 않는다.
+    scheduler가 이미 RAW를 보존한 경우 preserve_raw=False로 중복 ZIP 생성을 피한다.
+    """
     day_ok, day_reason, _ = kr_backup_day_status(force=True)
     if not day_ok and day_reason == 'KR_MARKET_CLOSED':
         raise RuntimeError('KR_BACKUP_NOT_READY:KR_MARKET_CLOSED')
     with BACKUP_LOCK:
         rescue_error = ''
-        try:
-            create_kr_raw_rescue_backup(today())
-        except Exception as e:
-            rescue_error = str(e)[:500]
-            with LOCK:
-                S.setdefault('market_data_capture', {})['raw_rescue_error'] = rescue_error
+        if preserve_raw:
+            try:
+                create_kr_raw_rescue_backup(today())
+            except Exception as e:
+                rescue_error = str(e)[:500]
+                with LOCK:
+                    S.setdefault('market_data_capture', {})['raw_rescue_error'] = rescue_error
         try:
             return _create_backup_zip_unlocked()
         except Exception:
-            # 정식 백업 실패와 RAW 보존 실패를 혼동하지 않도록 상태만 남기고 원 예외를 유지한다.
             if rescue_error:
                 set_error('KR RAW 구조백업도 실패: ' + rescue_error)
             raise
@@ -3524,10 +3530,13 @@ def create_kr_raw_rescue_backup(trade_date=None):
         day_ok, day_reason, _ = kr_backup_day_status(force=False)
         if not day_ok and day_reason == 'KR_MARKET_CLOSED':
             raise RuntimeError('KR_RAW_RESCUE_NOT_READY:KR_MARKET_CLOSED')
-    base = day_dir()
+    # today()가 아닌 과거 trade_date를 수동 복구할 때도 해당 날짜 폴더만 읽는다.
+    base = os.path.join(LOG_ROOT, trade_date)
+    if trade_date == today():
+        os.makedirs(os.path.join(base, 'symbols'), exist_ok=True)
     source_files = _kr_backup_source_files(base)
     if not source_files:
-        raise RuntimeError('KR RAW RESCUE: 당일 원본 파일이 없습니다.')
+        raise RuntimeError(f'KR RAW RESCUE: {trade_date} 원본 파일이 없습니다.')
     path = kr_rescue_backup_path(trade_date)
     tmp_path = os.path.join(os.path.dirname(path), f'.backup_KR_RAW_RESCUE_{trade_date}_{uuid.uuid4().hex}.tmp.zip')
     manifest = {
@@ -3719,13 +3728,18 @@ def verify_drive_existing_files_unchanged(before_snapshot, after_snapshot, new_f
     if missing or changed:
         raise RuntimeError(f'Drive 기존 파일 불변성 검증 실패: missing={missing[:10]}, changed={changed[:3]}')
 
-def google_drive_find_file(access_token, filename):
+def google_drive_find_files_exact(access_token, filename):
+    """대상 폴더에서 이름이 완전히 같은 Drive 파일을 최신순으로 조회한다."""
     escaped = filename.replace('\\', '\\\\').replace("'", "\\'")
     q = f"name = '{escaped}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
-    r = requests.get('https://www.googleapis.com/drive/v3/files', headers={'Authorization': f'Bearer {access_token}'}, params={'q': q, 'fields': 'files(id,name,size,md5Checksum,webViewLink)', 'pageSize': 10}, timeout=30)
+    r = requests.get('https://www.googleapis.com/drive/v3/files', headers={'Authorization': f'Bearer {access_token}'}, params={'q': q, 'fields': 'files(id,name,size,md5Checksum,modifiedTime,webViewLink,parents)', 'orderBy': 'modifiedTime desc', 'pageSize': 100}, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f'Drive 중복 파일 조회 실패 HTTP {r.status_code}: {r.text[:300]}')
-    files = r.json().get('files', [])
+        raise RuntimeError(f'Drive 동일명 파일 조회 실패 HTTP {r.status_code}: {r.text[:300]}')
+    return [x for x in r.json().get('files', []) if str(x.get('name', '')) == filename]
+
+
+def google_drive_find_file(access_token, filename):
+    files = google_drive_find_files_exact(access_token, filename)
     return files[0] if files else None
 
 def google_drive_download_file(access_token, file_meta, destination_path):
@@ -4143,33 +4157,69 @@ def find_verified_existing_us_backup_on_drive(trade_date):
             checked.append({'id': meta.get('id', ''), 'name': meta.get('name', ''), 'ok': False, 'failures': [str(e)[:300]]})
     return (None, None, checked)
 
+def _is_canonical_auto_backup_name(filename):
+    return bool(re.fullmatch(r'backup_(?:KR|US)(?:_RAW_RESCUE)?_\d{4}-\d{2}-\d{2}\.zip', str(filename or '')))
+
+
 def google_drive_resumable_upload(path):
-    """기존 Drive 파일을 절대 건드리지 않고 새 ZIP만 추가한다."""
-    if not GOOGLE_DRIVE_APPEND_ONLY:
-        raise RuntimeError('Drive APPEND_ONLY 보호가 꺼져 있어 업로드를 중단합니다.')
-    if GOOGLE_DRIVE_ALLOW_DELETE or GOOGLE_DRIVE_ALLOW_UPDATE:
-        raise RuntimeError('Drive 삭제/수정 허용 설정이 감지되어 업로드를 중단합니다.')
+    """자동백업용 canonical upsert.
+
+    - 동일 filename+동일 MD5면 기존 Drive 파일을 그대로 재사용한다.
+    - 동일 canonical filename인데 내용이 달라졌으면 새 timestamp 파일을 만들지 않고
+      동일 Drive fileId의 내용만 갱신한다.
+    - 같은 canonical 이름이 이미 2개 이상이면 임의 선택/삭제하지 않고 즉시 실패한다.
+    - 대상 폴더의 다른 파일은 삭제/수정하지 않는다.
+    """
+    if GOOGLE_DRIVE_ALLOW_DELETE:
+        raise RuntimeError('Drive 자동삭제 허용 설정이 감지되어 업로드를 중단합니다.')
     validate_backup_zip_for_drive(path)
     access_token = google_drive_access_token()
     before_snapshot = google_drive_folder_snapshot(access_token)
     filename = os.path.basename(path)
     total = os.path.getsize(path)
     local_md5 = file_md5(path)
-    existing = google_drive_find_file(access_token, filename)
-    if existing and int(existing.get('size', -1)) == total and (str(existing.get('md5Checksum', '')) == local_md5):
-        return existing
-    upload_filename = filename
-    if existing:
-        stem, ext = os.path.splitext(filename)
-        upload_filename = f"{stem}__{now_kst().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
-    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': 'application/zip', 'X-Upload-Content-Length': str(total)}
-    init_url = 'https://www.googleapis.com/upload/drive/v3/files'
-    init = requests.post(init_url, headers=headers, params={'uploadType': 'resumable', 'fields': 'id,name,size,md5Checksum,webViewLink'}, json={'name': upload_filename, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}, timeout=30)
+    matches = google_drive_find_files_exact(access_token, filename)
+    if len(matches) > 1:
+        ids = ','.join(str(x.get('id', '')) for x in matches[:10])
+        raise RuntimeError(f'DRIVE_CANONICAL_DUPLICATE_CONFLICT:{filename}:count={len(matches)}:ids={ids}')
+    existing = matches[0] if matches else None
+    if existing and int(to_float(existing.get('size', -1), -1)) == total and str(existing.get('md5Checksum', '')).lower() == local_md5.lower():
+        meta = dict(existing)
+        meta['upload_action'] = 'REUSED_IDENTICAL'
+        return meta
+
+    is_update = existing is not None
+    if is_update:
+        if not GOOGLE_DRIVE_CANONICAL_ONE_FILE or not GOOGLE_DRIVE_ALLOW_UPDATE:
+            raise RuntimeError(f'DRIVE_CANONICAL_UPDATE_DISABLED:{filename}')
+        if not _is_canonical_auto_backup_name(filename):
+            raise RuntimeError(f'DRIVE_NONCANONICAL_CONFLICT_NO_UPDATE:{filename}')
+        file_id = str(existing.get('id', '')).strip()
+        if not file_id:
+            raise RuntimeError('Drive 기존 canonical 파일 ID가 없습니다.')
+        init_url = f"https://www.googleapis.com/upload/drive/v3/files/{quote(file_id, safe='')}"
+        init_method = requests.patch
+        metadata = {'name': filename}
+        action = 'UPDATED_CANONICAL'
+    else:
+        init_url = 'https://www.googleapis.com/upload/drive/v3/files'
+        init_method = requests.post
+        metadata = {'name': filename, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}
+        action = 'CREATED_CANONICAL'
+
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': 'application/zip',
+        'X-Upload-Content-Length': str(total),
+    }
+    init = init_method(init_url, headers=headers, params={'uploadType': 'resumable', 'fields': 'id,name,size,md5Checksum,webViewLink,parents'}, json=metadata, timeout=30)
     if init.status_code not in (200, 201):
         raise RuntimeError(f'Drive resumable 세션 생성 실패 HTTP {init.status_code}: {init.text[:300]}')
     session_url = init.headers.get('Location', '')
     if not session_url:
         raise RuntimeError('Drive resumable 업로드 Location 헤더가 없습니다.')
+
     final_response = None
     offset = 0
     with open(path, 'rb') as f:
@@ -4177,31 +4227,38 @@ def google_drive_resumable_upload(path):
             chunk = f.read(GOOGLE_DRIVE_CHUNK_BYTES)
             if not chunk:
                 break
-            end = offset + len(chunk) - 1
-            put = requests.put(session_url, headers={'Content-Length': str(len(chunk)), 'Content-Range': f'bytes {offset}-{end}/{total}', 'Content-Type': 'application/zip'}, data=chunk, timeout=180)
+            chunk_end = offset + len(chunk) - 1
+            put = requests.put(session_url, headers={'Content-Length': str(len(chunk)), 'Content-Range': f'bytes {offset}-{chunk_end}/{total}', 'Content-Type': 'application/zip'}, data=chunk, timeout=180)
             if put.status_code == 308:
-                offset = end + 1
+                offset = chunk_end + 1
                 continue
             if put.status_code not in (200, 201):
                 raise RuntimeError(f'Drive ZIP 전송 실패 HTTP {put.status_code}: {put.text[:300]}')
             final_response = put
-            offset = end + 1
+            offset = chunk_end + 1
     if final_response is None or offset != total:
         raise RuntimeError(f'Drive ZIP 전송이 완료되지 않았습니다: {offset}/{total} bytes')
+
     uploaded = final_response.json()
     file_id = str(uploaded.get('id') or (existing or {}).get('id') or '')
     if not file_id:
         raise RuntimeError('업로드 응답에 Drive file ID가 없습니다.')
-    verify = requests.get(f'https://www.googleapis.com/drive/v3/files/{file_id}', headers={'Authorization': f'Bearer {access_token}'}, params={'fields': 'id,name,size,md5Checksum,webViewLink'}, timeout=30)
+    verify = requests.get(f'https://www.googleapis.com/drive/v3/files/{quote(file_id, safe="")}', headers={'Authorization': f'Bearer {access_token}'}, params={'fields': 'id,name,size,md5Checksum,webViewLink,parents'}, timeout=30)
     if verify.status_code != 200:
         raise RuntimeError(f'Drive 업로드 검증 실패 HTTP {verify.status_code}: {verify.text[:300]}')
     meta = verify.json()
-    if int(meta.get('size', -1)) != total:
+    if str(meta.get('name', '')) != filename:
+        raise RuntimeError(f"Drive canonical 파일명 불일치: expected={filename} actual={meta.get('name')}")
+    if int(to_float(meta.get('size', -1), -1)) != total:
         raise RuntimeError(f"Drive 파일 크기 불일치: local={total}, drive={meta.get('size')}")
-    if meta.get('md5Checksum') and str(meta.get('md5Checksum')) != local_md5:
+    if meta.get('md5Checksum') and str(meta.get('md5Checksum')).lower() != local_md5.lower():
         raise RuntimeError('Drive MD5 검증 불일치')
+    parents = set(meta.get('parents', []) or [])
+    if GOOGLE_DRIVE_FOLDER_ID not in parents:
+        raise RuntimeError('Drive 업로드 대상 폴더 검증 실패')
     after_snapshot = google_drive_folder_snapshot(access_token)
     verify_drive_existing_files_unchanged(before_snapshot, after_snapshot, str(meta.get('id', '')))
+    meta['upload_action'] = action
     return meta
 
 def upload_backup_to_google_drive(path):
@@ -4714,36 +4771,39 @@ def maybe_send_us_backup():
     except Exception as e:
         rescue_err = str(e)[:500]
 
-    # 정식 품질검사보다 RAW_RESCUE를 먼저 로컬에 보존하되, Drive 업로드는 거래일당 1회만 한다.
-    with LOCK:
-        existing_item = completed_map.get(trade_date, {})
-        if not isinstance(existing_item, dict):
-            existing_item = {}
-        raw_already_uploaded = bool(existing_item.get('raw_rescue_drive_saved'))
-    if rescue_path and (not raw_already_uploaded) and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
-        try:
-            rescue_drive_ok, rescue_drive_result = upload_backup_to_google_drive(rescue_path)
-            if rescue_drive_ok:
-                with LOCK:
-                    item = completed_map.get(trade_date, {})
-                    if not isinstance(item, dict):
-                        item = {}
-                    item['raw_rescue_drive_saved'] = True
-                    item['raw_rescue_file_name'] = str(rescue_drive_result.get('name', os.path.basename(rescue_path)))
-                    item['raw_rescue_file_id'] = str(rescue_drive_result.get('id', ''))
-                    item['raw_rescue_saved_at'] = now_text()
-                    completed_map[trade_date] = item
-                save_state()
-        except Exception as e:
-            set_error(f'미국 RAW_RESCUE Drive 업로드 오류: {e}')
+    # RAW는 먼저 로컬에만 보존한다. Drive에는 정식 백업 실패가 확정된 뒤
+    # 마지막 상태로 다시 생성해 canonical 이름 1개만 upsert한다.
 
     try:
         path, quality = create_us_backup_zip()
     except Exception as e:
+        # repair/backfill 시도까지 끝난 뒤 RAW_RESCUE를 한 번 더 만들어 최신 원본 상태를 반영한다.
+        try:
+            rescue_path = create_us_raw_rescue_backup(trade_date)
+            rescue_err = ''
+        except Exception as rexc:
+            rescue_err = str(rexc)[:500]
+        raw_drive_note = ''
+        if rescue_path and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
+            try:
+                raw_ok, raw_result = upload_backup_to_google_drive(rescue_path)
+                if raw_ok:
+                    with LOCK:
+                        item = completed_map.get(trade_date, {})
+                        if not isinstance(item, dict):
+                            item = {}
+                        item.update({'raw_rescue_drive_saved': True, 'raw_rescue_file_name': str(raw_result.get('name', os.path.basename(rescue_path))), 'raw_rescue_file_id': str(raw_result.get('id', '')), 'raw_rescue_saved_at': now_text(), 'raw_rescue_upload_action': str(raw_result.get('upload_action', ''))})
+                        completed_map[trade_date] = item
+                    save_state()
+                    raw_drive_note = f"\n✅ RAW_RESCUE Drive 자동보존: {raw_result.get('name', os.path.basename(rescue_path))} ({raw_result.get('upload_action','')})"
+                else:
+                    raw_drive_note = f"\n⚠️ RAW_RESCUE Drive 업로드 실패: {str(raw_result.get('error',''))[:250]}"
+            except Exception as de:
+                raw_drive_note = f"\n⚠️ RAW_RESCUE Drive 업로드 예외: {str(de)[:250]}"
         signature = 'US_LOCAL_BACKUP:' + str(e)[:900]
         if _us_backup_failure_should_notify(trade_date, signature):
-            rescue_note = (f"\n✅ 미국 RAW_RESCUE 보존: {os.path.basename(rescue_path)}" if rescue_path else f"\n⚠️ 미국 RAW_RESCUE 생성 실패: {rescue_err}")
-            send_telegram(f'🇺🇸 미국시장 정식 백업 생성/검증 실패\n거래일: {trade_date}\n오류: {str(e)[:1200]}' + rescue_note + '\n정식 GRADE 성공본은 만들지 않으며 RAW 원본은 보존합니다.', force=True)
+            rescue_note = (f"\n✅ 미국 RAW_RESCUE 로컬 보존: {os.path.basename(rescue_path)}" if rescue_path else f"\n⚠️ 미국 RAW_RESCUE 생성 실패: {rescue_err}")
+            send_telegram(f'🇺🇸 미국시장 정식 백업 생성/검증 실패\n거래일: {trade_date}\n오류: {str(e)[:1200]}' + rescue_note + raw_drive_note + '\n정식 GRADE 성공본은 만들지 않으며 RAW 원본은 보존합니다.', force=True)
         return
     grade = quality.get('grade', 'FAILED')
     acceptable = bool(quality.get('backfill_ok')) and grade in {'GRADE_1', 'GRADE_1_WITH_VERIFIED_SOURCE_GAPS'}
@@ -4856,10 +4916,16 @@ def maybe_send_daily_backup():
     except Exception as e:
         rescue_err = str(e)[:500]
     try:
-        path = create_backup_zip()
+        path = create_backup_zip(preserve_raw=False)
     except Exception as e:
         err_text = str(e)[:1200]
         signature = 'LOCAL_BACKUP_VERIFY:' + err_text[:900]
+        # 품질검사/repair 시도가 끝난 최신 RAW 상태를 다시 canonical ZIP으로 확정한다.
+        try:
+            rescue_path = create_kr_raw_rescue_backup(trade_date)
+            rescue_err = ''
+        except Exception as rexc:
+            rescue_err = str(rexc)[:500]
         drive_rescue_note = ''
         if rescue_path and GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(require_refresh=True):
             try:
@@ -5034,7 +5100,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path == '/rescue_today':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -5219,6 +5285,10 @@ def print_core_selfcheck():
         raise RuntimeError('실주문 안전차단 실패')
     if not DATA_PAPER_BACKUP_ONLY:
         raise RuntimeError('DATA+PAPER+BACKUP 전용 모드 실패')
+    if GOOGLE_DRIVE_ALLOW_DELETE:
+        raise RuntimeError('Google Drive 자동삭제는 금지되어야 합니다.')
+    if not GOOGLE_DRIVE_CANONICAL_ONE_FILE or not GOOGLE_DRIVE_ALLOW_UPDATE:
+        raise RuntimeError('Google Drive 거래일당 canonical 1파일 자동백업 정책이 꺼져 있습니다.')
     if len(ALL26_SYMBOLS) != 26:
         raise RuntimeError(f'KR 종목 수 오류: {len(ALL26_SYMBOLS)}')
     if len(US_SYMBOLS) != 14:
