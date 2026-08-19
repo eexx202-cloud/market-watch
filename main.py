@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_94_TOSS_1_2_13_KR_US_CANONICAL_ONE_FILE_AUTO_BACKUP_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_96_TOSS_OFFICIAL_1_2_13_REPLAY_SAFE_ARCHIVE_IMMUTABLE_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -41,6 +41,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 GOOGLE_DRIVE_CLIENT_ID = os.environ.get('GOOGLE_DRIVE_CLIENT_ID', '').strip()
 GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get('GOOGLE_DRIVE_CLIENT_SECRET', '').strip()
 GOOGLE_DRIVE_REFRESH_TOKEN = os.environ.get('GOOGLE_DRIVE_REFRESH_TOKEN', '').strip()
+GOOGLE_DRIVE_FINAL_IMMUTABLE = os.environ.get('GOOGLE_DRIVE_FINAL_IMMUTABLE', 'true').lower() == 'true'
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get('GOOGLE_DRIVE_FOLDER_ID', '').strip()
 GOOGLE_DRIVE_REDIRECT_URI = os.environ.get('GOOGLE_DRIVE_REDIRECT_URI', 'https://market-watch-6zgo.onrender.com/google/oauth/callback').strip()
 GOOGLE_DRIVE_UPLOAD_ENABLED = os.environ.get('GOOGLE_DRIVE_UPLOAD_ENABLED', 'true').lower() == 'true'
@@ -116,6 +117,7 @@ LOG_ROOT = _default_data_root()
 BACKUP_ROOT = os.environ.get('BACKUP_ROOT', os.path.join(LOG_ROOT, '_backups')).strip()
 STATE_PATH = os.environ.get('STATE_PATH', os.path.join(LOG_ROOT, '_state', 'state.json')).strip()
 STATE_BAK_PATH = STATE_PATH + '.bak'
+GOOGLE_DRIVE_REFRESH_TOKEN_FILE = os.path.join(LOG_ROOT, '_state', 'google_drive_refresh_token.txt')
 HEALTH_ROOT = os.path.join(LOG_ROOT, '_health')
 INSTANCE_LOCK_PATH = os.path.join(LOG_ROOT, '_locks', 'collector.lock')
 INSTANCE_LOCK_HANDLE = None
@@ -381,38 +383,89 @@ def kr_backup_day_status(force=False):
     return (True, 'OK', cal)
 
 
+def _us_calendar_info_from_payload(payload, key='today'):
+    result = _result_dict(payload)
+    info = result.get(key, {}) if isinstance(result, dict) else {}
+    if not isinstance(info, dict):
+        return {}
+    regular = info.get('regularMarket') if isinstance(info.get('regularMarket'), dict) else None
+    return {
+        'date': str(info.get('date', '') or ''),
+        'is_business_day': bool(regular),
+        'regular_start': str(regular.get('startTime', '') or '') if regular else '',
+        'regular_end': str(regular.get('endTime', '') or '') if regular else '',
+    }
+
+def get_us_market_calendar_for_date(query_date):
+    """토스 공식 US market-calendar를 지정 거래일로 조회한다. 과거 재복구에도 사용한다."""
+    code, data = api_get('/api/v1/market-calendar/US', params={'date': str(query_date)}, timeout=8)
+    if code != 200:
+        return ({}, code)
+    cal = _us_calendar_info_from_payload(data, 'today')
+    if cal.get('date') != str(query_date):
+        return ({}, code)
+    return (cal, code)
+
+def _latest_completed_us_calendar(now_value=None):
+    """현재 시각 기준 가장 최근 완료된 미국 정규장을 공식 캘린더로 결정한다."""
+    nowv = now_value or now_kst()
+    qdate = nowv.date().isoformat()
+    code, data = api_get('/api/v1/market-calendar/US', params={'date': qdate}, timeout=8)
+    if code != 200:
+        return ({}, code)
+    today_cal = _us_calendar_info_from_payload(data, 'today')
+    prev_cal = _us_calendar_info_from_payload(data, 'previousBusinessDay')
+    candidates = [c for c in (today_cal, prev_cal) if c.get('is_business_day')]
+    completed = []
+    for cal in candidates:
+        end = _parse_iso(cal.get('regular_end'))
+        if end and end <= nowv:
+            completed.append((end, cal))
+    if not completed:
+        return ({}, code)
+    completed.sort(key=lambda x: x[0], reverse=True)
+    return (completed[0][1], code)
+
 def refresh_us_market_calendar(force=False):
-    """공식 /api/v1/market-calendar/US의 KST 정규장 시간만 사용한다."""
+    """공식 US market-calendar를 캐시한다. 장중 수집과 장후 복구를 모두 지원한다."""
     state = S.setdefault('us_market_data_capture', {})
     if not force and time.time() - to_float(state.get('calendar_checked_at', 0)) < MARKET_CALENDAR_REFRESH_SEC:
         return bool(state.get('calendar'))
     state['calendar_checked_at'] = time.time()
-    chosen = None
-    last_code = 0
     nowv = now_kst()
-    for query_date in (today(), (nowv - timedelta(days=1)).date().isoformat()):
-        code, data = api_get('/api/v1/market-calendar/US', params={'date': query_date}, timeout=8)
-        last_code = code
-        if code != 200:
-            continue
-        info = _result_dict(data).get('today', {})
-        regular = info.get('regularMarket') if isinstance(info, dict) else None
-        start = _parse_iso(regular.get('startTime')) if isinstance(regular, dict) else None
-        end = _parse_iso(regular.get('endTime')) if isinstance(regular, dict) else None
-        if start and end and (start <= nowv <= end + timedelta(hours=12)):
-            chosen = (info, regular)
-            break
-    if not chosen:
+    qdate = nowv.date().isoformat()
+    code, data = api_get('/api/v1/market-calendar/US', params={'date': qdate}, timeout=8)
+    if code != 200:
         state['calendar'] = {}
-        state['status'] = f'CALENDAR_HTTP_{last_code}' if last_code != 200 else 'MARKET_CLOSED'
+        state['status'] = f'CALENDAR_HTTP_{code}'
         return False
-    info, regular = chosen
-    state['calendar'] = {'date': str(info.get('date', '')), 'is_business_day': bool(regular), 'regular_start': str(regular.get('startTime', '')) if isinstance(regular, dict) else '', 'regular_end': str(regular.get('endTime', '')) if isinstance(regular, dict) else ''}
-    state['status'] = 'READY' if regular else 'MARKET_CLOSED'
-    return bool(regular)
+    today_cal = _us_calendar_info_from_payload(data, 'today')
+    prev_cal = _us_calendar_info_from_payload(data, 'previousBusinessDay')
+    chosen = {}
+    # 현재 정규장이라면 오늘 거래일을 우선한다.
+    for cal in (today_cal, prev_cal):
+        start = _parse_iso(cal.get('regular_start'))
+        end = _parse_iso(cal.get('regular_end'))
+        if start and end and start <= nowv <= end:
+            chosen = cal
+            break
+    # 장외에는 오늘 또는 직전 거래일 중 가장 최근 캘린더를 보존해 복구/백업에 쓴다.
+    if not chosen:
+        candidates = []
+        for cal in (today_cal, prev_cal):
+            end = _parse_iso(cal.get('regular_end'))
+            if end:
+                candidates.append((end, cal))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            chosen = candidates[0][1]
+    state['calendar'] = chosen
+    state['status'] = 'READY' if chosen.get('is_business_day') else 'MARKET_CLOSED'
+    return bool(chosen)
 
 def us_regular_market_open_now():
-    refresh_us_market_calendar(False)
+    # 백업/복구가 직전 거래일 캘린더를 임시 사용했더라도 장중 수집은 항상 공식 현재 캘린더를 다시 확인한다.
+    refresh_us_market_calendar(True)
     cal = S.setdefault('us_market_data_capture', {}).get('calendar', {})
     start = _parse_iso(cal.get('regular_start'))
     end = _parse_iso(cal.get('regular_end'))
@@ -615,7 +668,7 @@ def write_raw_api_event(method, path, params, status, data, requested_at, receiv
     body = _safe_json_dump(data)
     if len(body) > RAW_API_MAX_BODY_CHARS:
         body = body[:RAW_API_MAX_BODY_CHARS] + '...TRUNCATED'
-    row = {'raw_id': raw_id, 'ingest_seq': seq, 'method': method, 'path': path, 'params': params or {}, 'status': status, 'requested_at': requested_at, 'received_at': received_at, 'saved_at': now_text(), 'elapsed_ms': round(float(elapsed_ms), 3), 'rate_limit': {'limit': (headers or {}).get('X-RateLimit-Limit', ''), 'remaining': (headers or {}).get('X-RateLimit-Remaining', ''), 'reset': (headers or {}).get('X-RateLimit-Reset', ''), 'retry_after': (headers or {}).get('Retry-After', '')}, 'body': body}
+    row = {'raw_id': raw_id, 'ingest_seq': seq, 'method': method, 'path': path, 'params': params or {}, 'status': status, 'requested_at': requested_at, 'received_at': received_at, 'saved_at': now_text(), 'elapsed_ms': round(float(elapsed_ms), 3), 'rate_limit': {'limit': (headers or {}).get('X-RateLimit-Limit', ''), 'remaining': (headers or {}).get('X-RateLimit-Remaining', ''), 'reset': (headers or {}).get('X-RateLimit-Reset', ''), 'retry_after': (headers or {}).get('Retry-After', '')}, 'request_id': (headers or {}).get('X-Request-Id', '') or (headers or {}).get('x-request-id', ''), 'edge_request_id': (headers or {}).get('x-amz-cf-id', ''), 'body': body}
     event_date = us_trade_date_from_calendar() if market == 'US' else today()
     filepath = os.path.join(raw_market_dir(market), f'api_{event_date}.jsonl')
     with open(filepath, 'a', encoding='utf-8') as f:
@@ -3584,9 +3637,35 @@ def preserve_kr_raw_before_grade_check():
         return create_kr_raw_rescue_backup(today())
 
 
+def google_drive_refresh_token_value():
+    if GOOGLE_DRIVE_REFRESH_TOKEN:
+        return GOOGLE_DRIVE_REFRESH_TOKEN
+    try:
+        if os.path.isfile(GOOGLE_DRIVE_REFRESH_TOKEN_FILE):
+            return open(GOOGLE_DRIVE_REFRESH_TOKEN_FILE, 'r', encoding='utf-8').read().strip()
+    except Exception:
+        pass
+    return ''
+
+def _persist_google_drive_refresh_token(token):
+    token = str(token or '').strip()
+    if not token:
+        raise RuntimeError('저장할 Google refresh token이 비어 있습니다.')
+    os.makedirs(os.path.dirname(GOOGLE_DRIVE_REFRESH_TOKEN_FILE), exist_ok=True)
+    tmp = GOOGLE_DRIVE_REFRESH_TOKEN_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(token)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, GOOGLE_DRIVE_REFRESH_TOKEN_FILE)
+
 def google_drive_credentials_ready(require_refresh=True):
     basic = bool(GOOGLE_DRIVE_CLIENT_ID and GOOGLE_DRIVE_CLIENT_SECRET and GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_REDIRECT_URI)
-    return basic and (bool(GOOGLE_DRIVE_REFRESH_TOKEN) if require_refresh else True)
+    return basic and (bool(google_drive_refresh_token_value()) if require_refresh else True)
 
 def google_drive_oauth_start_url():
     """최초 1회 Google 승인을 위한 URL을 만든다. 토큰은 로그에 남기지 않는다."""
@@ -3623,6 +3702,7 @@ def google_drive_exchange_oauth_code(qs):
     refresh_token = str(data.get('refresh_token', '')).strip()
     if not refresh_token:
         raise RuntimeError('refresh token이 발급되지 않았습니다. Google 권한을 취소한 뒤 prompt=consent로 다시 승인하세요.')
+    _persist_google_drive_refresh_token(refresh_token)
     return refresh_token
 
 def _google_drive_auth_error_kind(status_code, body):
@@ -3636,8 +3716,8 @@ def _google_drive_auth_error_kind(status_code, body):
 
 def google_drive_access_token():
     if not google_drive_credentials_ready(require_refresh=True):
-        raise RuntimeError('GOOGLE_DRIVE_REFRESH_TOKEN을 포함한 Drive 환경변수가 아직 완성되지 않았습니다.')
-    r = requests.post('https://oauth2.googleapis.com/token', data={'client_id': GOOGLE_DRIVE_CLIENT_ID, 'client_secret': GOOGLE_DRIVE_CLIENT_SECRET, 'refresh_token': GOOGLE_DRIVE_REFRESH_TOKEN, 'grant_type': 'refresh_token'}, timeout=30)
+        raise RuntimeError('Google Drive refresh token이 환경변수 또는 영구 저장파일에 없습니다.')
+    r = requests.post('https://oauth2.googleapis.com/token', data={'client_id': GOOGLE_DRIVE_CLIENT_ID, 'client_secret': GOOGLE_DRIVE_CLIENT_SECRET, 'refresh_token': google_drive_refresh_token_value(), 'grant_type': 'refresh_token'}, timeout=30)
     if r.status_code != 200:
         kind = _google_drive_auth_error_kind(r.status_code, r.text)
         with LOCK:
@@ -4183,6 +4263,20 @@ def google_drive_resumable_upload(path):
         ids = ','.join(str(x.get('id', '')) for x in matches[:10])
         raise RuntimeError(f'DRIVE_CANONICAL_DUPLICATE_CONFLICT:{filename}:count={len(matches)}:ids={ids}')
     existing = matches[0] if matches else None
+    if existing and GOOGLE_DRIVE_FINAL_IMMUTABLE and re.fullmatch(r'backup_(KR|US)_(\d{4}-\d{2}-\d{2})\.zip', filename):
+        m = re.fullmatch(r'backup_(KR|US)_(\d{4}-\d{2}-\d{2})\.zip', filename)
+        market, trade_date = m.group(1), m.group(2)
+        try:
+            if market == 'US':
+                locked_ok, _ = verify_us_backup_file_from_google_drive(existing, trade_date)
+            else:
+                locked_ok, _ = verify_kr_backup_file_from_google_drive(existing, trade_date)
+            if locked_ok:
+                meta = dict(existing)
+                meta['upload_action'] = 'LOCKED_VERIFIED_FINAL'
+                return meta
+        except Exception:
+            pass
     if existing and int(to_float(existing.get('size', -1), -1)) == total and str(existing.get('md5Checksum', '')).lower() == local_md5.lower():
         meta = dict(existing)
         meta['upload_action'] = 'REUSED_IDENTICAL'
@@ -4293,51 +4387,65 @@ def _us_candle_row_from_api(sym, c, req, rec, latency):
     volume = to_float(c.get('volume', 0))
     return {'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': ts, 'open': c.get('openPrice', 0), 'high': c.get('highPrice', 0), 'low': c.get('lowPrice', 0), 'close': c.get('closePrice', 0), 'volume': c.get('volume', 0), 'estimated_trade_value': round(close * volume, 4), 'currency': c.get('currency', 'USD')}
 
-def _verify_us_source_gap(sym, target, cal, retries=3):
-    """정확한 1분봉이 과거 API에도 없는지 검증한다. 가짜 봉은 절대 생성하지 않는다."""
-    evidence = []
-    wanted = target.replace(second=0, microsecond=0)
-    before = (wanted + timedelta(minutes=2)).isoformat()
-    for attempt in range(max(1, retries)):
+def _fetch_us_session_candles_official(sym, cal, max_pages=8):
+    """공식 nextBefore 페이지네이션을 그대로 사용해 정규장 전체 1분봉을 읽는다.
+    before는 inclusive이며 다음 페이지는 응답 nextBefore 값을 변형 없이 전달한다.
+    """
+    start = _parse_iso(cal.get('regular_start'))
+    end = _parse_iso(cal.get('regular_end'))
+    if not start or not end:
+        return ({}, False, ['US_CALENDAR_INVALID'])
+    rows = {}
+    failures = []
+    before = end.isoformat()
+    seen_before = set()
+    oldest_seen = None
+    reached_before_session = False
+    for _ in range(max(1, max_pages)):
+        if before in seen_before:
+            failures.append('PAGINATION_CYCLE:' + before)
+            break
+        seen_before.add(before)
         req = now_kst()
         t0 = time.time()
-        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': 10, 'before': before, 'adjusted': True}, timeout=12)
+        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': 200, 'before': before, 'adjusted': True}, timeout=12)
         rec = now_kst()
         latency = round((time.time() - t0) * 1000, 3)
+        if code != 200:
+            failures.append(f'HTTP_{code}')
+            break
         result = _result_dict(data)
-        candles = result.get('candles', []) if code == 200 and isinstance(result, dict) else []
-        seen = []
-        exact = None
+        candles = result.get('candles', []) if isinstance(result, dict) else []
+        page_datetimes = []
         for c in candles if isinstance(candles, list) else []:
             dt = _parse_iso(c.get('timestamp'))
             if not dt:
                 continue
             minute = dt.replace(second=0, microsecond=0)
-            seen.append(minute.isoformat())
-            if minute == wanted:
-                exact = _us_candle_row_from_api(sym, c, req, rec, latency)
-                break
-        evidence.append({'attempt': attempt + 1, 'http': code, 'seen': seen})
-        if exact:
-            return (exact, False, evidence)
-        if attempt < retries - 1:
-            time.sleep(min(1 + attempt, 2))
-    prev = (wanted - timedelta(minutes=1)).isoformat()
-    nxt = (wanted + timedelta(minutes=1)).isoformat()
-    start = _parse_iso(cal.get('regular_start'))
-    end = _parse_iso(cal.get('regular_end'))
+            page_datetimes.append(minute)
+            oldest_seen = minute if oldest_seen is None else min(oldest_seen, minute)
+            if start <= minute < end:
+                rows[minute] = _us_candle_row_from_api(sym, c, req, rec, latency)
+        if page_datetimes and min(page_datetimes) < start:
+            reached_before_session = True
+            break
+        nxt = result.get('nextBefore') if isinstance(result, dict) else None
+        if not nxt:
+            # 세션 시작보다 과거까지 실제 응답을 확인하지 못했으면 원천결측 판정 금지.
+            reached_before_session = bool(oldest_seen is not None and oldest_seen <= start)
+            break
+        before = str(nxt)
+        _market_data_request_gap()
+    coverage_complete = bool(reached_before_session and not failures)
+    return (rows, coverage_complete, failures)
 
-    def _gap_evidence_ok(e):
-        if e.get('http') != 200 or wanted.isoformat() in e.get('seen', []):
-            return False
-        seen_times = e.get('seen', [])
-        if start and wanted == start.replace(second=0, microsecond=0):
-            return nxt in seen_times
-        if end and wanted == (end - timedelta(minutes=1)).replace(second=0, microsecond=0):
-            return prev in seen_times
-        return prev in seen_times and nxt in seen_times
-    verified = all((_gap_evidence_ok(e) for e in evidence))
-    return (None, verified, evidence)
+def _verify_us_source_gap(sym, target, cal, retries=1):
+    """호환용 단일 검증. 공식 세션 전체 페이지 조회 결과로만 원천결측을 인정한다."""
+    rows, coverage_complete, failures = _fetch_us_session_candles_official(sym, cal)
+    wanted = target.replace(second=0, microsecond=0)
+    if wanted in rows:
+        return (rows[wanted], False, [{'coverage_complete': coverage_complete, 'failures': failures}])
+    return (None, bool(coverage_complete), [{'coverage_complete': coverage_complete, 'failures': failures}])
 
 def finalize_us_candles_grade1():
     state = S.setdefault('us_market_data_capture', {})
@@ -4349,70 +4457,35 @@ def finalize_us_candles_grade1():
         return (False, ['US_CALENDAR_INVALID'])
     headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'estimated_trade_value', 'currency']
     verified_gaps = {}
+    expected_times = _us_expected_candle_times(start, end)
     for sym in US_SYMBOLS:
-        collected = {}
-        for old in _read_csv_rows(us_data_path('candles_1m', sym)):
-            ts = str(old.get('timestamp', ''))
-            dt = _parse_iso(ts)
-            if dt and start <= dt < end:
-                collected[ts] = {h: old.get(h, '') for h in headers}
-        before = end.isoformat()
-        seen = set()
-        for _ in range(4):
-            if before in seen:
-                break
-            seen.add(before)
-            req = now_kst()
-            t0 = time.time()
-            code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': 200, 'before': before, 'adjusted': True}, timeout=12)
-            rec = now_kst()
-            latency = round((time.time() - t0) * 1000, 3)
-            if code != 200:
-                failures.append(f'{sym}:HTTP_{code}')
-                break
-            result = _result_dict(data)
-            candles = result.get('candles', []) if isinstance(result, dict) else []
-            page_times = []
-            for c in candles if isinstance(candles, list) else []:
-                ts = str(c.get('timestamp', ''))
-                if _completed_session_candle(ts, None, cal.get('regular_start'), cal.get('regular_end')):
-                    dt = _parse_iso(ts)
-                    page_times.append(dt)
-                    collected[ts] = _us_candle_row_from_api(sym, c, req, rec, latency)
-            oldest = min((x for x in page_times if x), default=None)
-            if oldest and oldest <= start:
-                break
-            nxt = result.get('nextBefore') if isinstance(result, dict) else None
-            if not nxt:
-                break
-            before = str(nxt)
-            _market_data_request_gap()
         by_minute = {}
-        for ts, row in collected.items():
-            dt = _parse_iso(ts)
+        for old in _read_csv_rows(us_data_path('candles_1m', sym)):
+            dt = _parse_iso(old.get('timestamp'))
             if dt:
-                by_minute[dt.replace(second=0, microsecond=0)] = row
-        missing = [t for t in _us_expected_candle_times(start, end) if t not in by_minute]
-        for target in missing:
-            row, is_source_gap, evidence = _verify_us_source_gap(sym, target, cal)
-            if row:
-                dt = _parse_iso(row.get('timestamp'))
-                by_minute[dt.replace(second=0, microsecond=0)] = row
-            elif is_source_gap:
-                verified_gaps.setdefault(sym, []).append({'timestamp': target.isoformat(), 'evidence': evidence})
-            else:
-                failures.append(f'{sym}:TARGETED_BACKFILL_FAILED:{target.isoformat()}')
+                minute = dt.replace(second=0, microsecond=0)
+                if start <= minute < end:
+                    by_minute[minute] = {h: old.get(h, '') for h in headers}
+        api_rows, coverage_complete, fetch_failures = _fetch_us_session_candles_official(sym, cal)
+        by_minute.update(api_rows)
+        if fetch_failures:
+            failures.extend([f'{sym}:{x}' for x in fetch_failures])
+        missing = [t for t in expected_times if t not in by_minute]
+        if missing and not coverage_complete:
+            failures.append(f'{sym}:SESSION_COVERAGE_INCOMPLETE:missing={len(missing)}')
+        elif missing:
+            # 전체 세션을 공식 페이지네이션으로 끝까지 확인했는데도 없는 분봉만 source gap으로 인정.
+            verified_gaps[sym] = [{'timestamp': t.isoformat(), 'evidence': 'OFFICIAL_FULL_SESSION_PAGINATION_ABSENT'} for t in missing]
         rows = [by_minute[k] for k in sorted(by_minute) if start <= k < end]
         _rewrite_csv(us_data_path('candles_1m', sym), headers, rows)
-        allowed = {_parse_iso(x['timestamp']).replace(second=0, microsecond=0) for x in verified_gaps.get(sym, []) if _parse_iso(x.get('timestamp'))}
-        residual = [t for t in _us_expected_candle_times(start, end) if t not in by_minute and t not in allowed]
+        allowed = {t for t in missing} if coverage_complete else set()
         boundary_ok = (start in by_minute or start in allowed) and (end - timedelta(minutes=1) in by_minute or end - timedelta(minutes=1) in allowed)
-        if residual or not rows or (not boundary_ok):
+        residual = [t for t in expected_times if t not in by_minute and t not in allowed]
+        if residual or not rows or not boundary_ok:
             failures.append(f'{sym}:CANDLES_{len(rows)}:RESIDUAL_{len(residual)}:BOUNDARY_{boundary_ok}')
     state['verified_source_gaps'] = verified_gaps
     gap_path = os.path.join(us_market_data_dir(), f'verified_source_gaps_{us_trade_date_from_calendar()}.json')
-    with open(gap_path, 'w', encoding='utf-8') as f:
-        json.dump({'trade_date': us_trade_date_from_calendar(), 'verified_source_gaps': verified_gaps}, f, ensure_ascii=False, indent=2)
+    _atomic_json_write(gap_path, {'trade_date': us_trade_date_from_calendar(), 'verified_source_gaps': verified_gaps})
     return (not failures, failures)
 
 def repair_us_required_files_before_backup():
@@ -4508,6 +4581,15 @@ def audit_us_grade1():
     if not start or not end:
         return {'grade': 'FAILED', 'failures': ['US_CALENDAR_INVALID'], 'details': {}}
     verified = S.setdefault('us_market_data_capture', {}).get('verified_source_gaps', {}) or {}
+    if not verified:
+        gap_file = os.path.join(us_market_data_dir(), f'verified_source_gaps_{us_trade_date_from_calendar()}.json')
+        try:
+            payload = json.load(open(gap_file, 'r', encoding='utf-8')) if os.path.isfile(gap_file) else {}
+            verified = payload.get('verified_source_gaps', {}) if isinstance(payload, dict) else {}
+            if verified:
+                S.setdefault('us_market_data_capture', {})['verified_source_gaps'] = verified
+        except Exception as e:
+            failures.append('VERIFIED_SOURCE_GAPS_READ_FAILED:' + str(e)[:120])
     total_verified = 0
     for sym in US_SYMBOLS:
         rows = _read_csv_rows(us_data_path('candles_1m', sym))
@@ -4688,17 +4770,20 @@ def us_backup_zip_path(trade_date=None):
     return os.path.join(BACKUP_ROOT, 'US', f'backup_US_{trade_date}.zip')
 
 def us_backup_ready_status(now_value=None):
-    """공식 US market-calendar 기준. 휴장일은 정상 차단하고 조기폐장은 캘린더 길이를 그대로 사용한다."""
-    refresh_us_market_calendar(False)
+    """공식 US 캘린더 기준 가장 최근 완료 정규장을 백업 대상으로 선택한다.
+    과거 12시간 제한은 두지 않아 재시작/인증장애 뒤에도 복구할 수 있다.
+    """
+    nowv = now_value or now_kst()
+    cal, code = _latest_completed_us_calendar(nowv)
     state = S.setdefault('us_market_data_capture', {})
-    cal = state.get('calendar', {})
+    if not cal:
+        return (False, f'US_CALENDAR_NO_COMPLETED_SESSION_HTTP_{code}', '', None, None, None)
+    state['calendar'] = cal
+    state['status'] = 'READY_FOR_BACKUP'
     trade_date = str(cal.get('date', '') or '')
     start = _parse_iso(cal.get('regular_start'))
     end = _parse_iso(cal.get('regular_end'))
-    nowv = now_value or now_kst()
-    if state.get('status') == 'MARKET_CLOSED':
-        return (False, 'US_MARKET_CLOSED', trade_date, start, end, None)
-    if not trade_date or not cal.get('is_business_day') or not start or not end:
+    if not trade_date or not start or not end:
         return (False, 'US_CALENDAR_INVALID', trade_date, start, end, None)
     session_minutes = int((end - start).total_seconds() // 60)
     if session_minutes <= 0 or session_minutes > 1440:
@@ -4706,13 +4791,14 @@ def us_backup_ready_status(now_value=None):
     ready_at = end + timedelta(minutes=US_BACKUP_DELAY_MIN)
     if nowv < ready_at:
         return (False, 'US_REGULAR_NOT_FINISHED', trade_date, start, end, ready_at)
-    if nowv > end + timedelta(hours=12):
-        return (False, 'US_BACKUP_WINDOW_EXPIRED', trade_date, start, end, ready_at)
     return (True, 'OK', trade_date, start, end, ready_at)
 
 
 def create_us_backup_zip():
-    """장 종료 전 수동 호출까지 중앙 차단하고, ZIP 생성은 한 번만 수행한다."""
+    """완료된 미국 거래일만 백업한다. 현재 미국 정규장 중에는 캘린더/파일 경합 방지를 위해 생성하지 않는다."""
+    active, _ = us_regular_market_open_now()
+    if active:
+        raise RuntimeError('US_CURRENT_REGULAR_SESSION_ACTIVE')
     ready, reason, trade_date, start, end, ready_at = us_backup_ready_status()
     if not ready:
         raise RuntimeError(f'US_BACKUP_NOT_READY:{reason}:trade_date={trade_date}:regular_start={start}:regular_end={end}:ready_at={ready_at}')
@@ -4739,6 +4825,10 @@ def _us_backup_failure_should_notify(trade_date, signature):
 
 def maybe_send_us_backup():
     if not ENABLE_US_MARKET_DATA_CAPTURE:
+        return
+    # 정규장 수집이 최우선. 이전 거래일 백업 재시도는 현재 미국 정규장 중에는 하지 않는다.
+    active, _ = us_regular_market_open_now()
+    if active:
         return
     ready, reason, trade_date, start, end, ready_at = us_backup_ready_status()
     if not ready:
@@ -5081,6 +5171,29 @@ def loop():
         time.sleep(max(10, REFRESH_SEC))
 CSS = '\n<style>\n*{box-sizing:border-box}body{margin:0;padding:12px;background:#07090f;color:#eef1f7;font-family:Arial,sans-serif;font-size:13px}h1{margin:4px 0;text-align:center;font-size:22px}.sub{text-align:center;color:#8d95a7;font-size:11px;margin-bottom:12px}.grid{display:grid;grid-template-columns:minmax(260px,.9fr) minmax(440px,1.55fr) minmax(300px,1fr);gap:12px;align-items:start}.card{background:#111522;border:1px solid #242a3a;border-radius:12px;padding:12px;margin-bottom:12px;box-shadow:0 4px 18px rgba(0,0,0,.18)}.card h2{margin:0 0 9px;font-size:15px;color:#c2c8d5}.big{font-size:24px;font-weight:700}.mid{font-size:18px;font-weight:700}.small{font-size:11px;color:#929bad}.red{color:#ff6262}.blue{color:#63a0ff}.green{color:#55df91}.yellow{color:#ffd75a}.gray{color:#8b93a5}table{width:100%;border-collapse:collapse;font-size:11px}th{text-align:left;color:#9aa3b6;background:#171c2a;padding:7px;position:sticky;top:0}td{padding:7px;border-bottom:1px solid #202637;vertical-align:top}button{border:0;border-radius:7px;padding:8px 11px;margin:3px;font-weight:700;cursor:pointer}.buy{background:#db3038;color:#fff}.sell{background:#2b6cff;color:#fff}.graybtn{background:#343b4d;color:#fff}.gold{background:#ffd75a;color:#111}.paperbtn{background:#7c51e8;color:#fff}input{background:#090c14;color:#fff;border:1px solid #394156;border-radius:6px;padding:7px;width:72px}.progress{width:100%;height:8px;background:#222a3a;border-radius:10px;overflow:hidden;margin:6px 0}.bar{height:100%;background:#ffd75a}.scroll{max-height:680px;overflow:auto}.summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}.metric{background:#171c2a;border-radius:8px;padding:9px}.metric b{display:block;font-size:16px;margin-top:3px}.tabs{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}.tabbtn{background:#2a3040;color:#dce1eb;padding:6px 9px}.tabbtn.active{background:#ffd75a;color:#111}.hide{display:none}.badge{display:inline-block;padding:2px 6px;border-radius:10px;background:#252c3d;font-size:10px}.pos{background:#173c2a;color:#65e59a}.neg{background:#4a2025;color:#ff8087}.warn{background:#463b18;color:#ffdd6c}details summary{cursor:pointer;color:#cbd2df;font-weight:700;margin:4px 0}@media(max-width:1150px){.grid{grid-template-columns:1fr 1.5fr}.grid>div:last-child{grid-column:1/-1}}@media(max-width:760px){body{padding:7px}.grid{grid-template-columns:1fr}.summary-grid{grid-template-columns:repeat(2,1fr)}.card{padding:9px}.scroll{max-height:520px}}\n</style>\n'
 
+def _safe_trade_date(value):
+    value = str(value or '')
+    return value if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value) else ''
+
+def historical_backup_path(market, trade_date):
+    d = _safe_trade_date(trade_date)
+    m = str(market or '').upper()
+    if not d or m not in {'KR', 'US'}:
+        return ''
+    return os.path.join(BACKUP_ROOT, m, f'backup_{m}_{d}.zip')
+
+def backup_archive_index():
+    out = {'KR': [], 'US': []}
+    for market in ('KR', 'US'):
+        root = os.path.join(BACKUP_ROOT, market)
+        if not os.path.isdir(root):
+            continue
+        for fn in sorted(os.listdir(root), reverse=True):
+            if re.fullmatch(rf'backup_{market}_\d{{4}}-\d{{2}}-\d{{2}}\.zip', fn):
+                fp = os.path.join(root, fn)
+                out[market].append({'file': fn, 'size': os.path.getsize(fp), 'download': f'/download/{market.lower()}/{fn[-14:-4]}'})
+    return out
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -5094,13 +5207,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.result_page('Google Drive OAuth 시작 실패', str(e))
         if path == '/google/oauth/callback':
             try:
-                refresh_token = google_drive_exchange_oauth_code(qs)
-                token_html = html.escape(refresh_token, quote=True)
-                return self.html_response(f"<html><head><meta charset='utf-8'></head><body><h2>Google Drive 승인 성공</h2><p>아래 값을 Render GOOGLE_DRIVE_REFRESH_TOKEN 환경변수에 저장하세요.</p><textarea style='width:100%;height:100px' readonly>{token_html}</textarea></body></html>")
+                google_drive_exchange_oauth_code(qs)
+                return self.html_response("<html><head><meta charset='utf-8'></head><body><h2>Google Drive 승인 성공</h2><p>refresh token을 Persistent Disk에 안전하게 저장했습니다. 재배포 없이 다음 백업부터 자동 사용합니다.</p></body></html>")
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path == '/rescue_today':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -5110,6 +5222,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.download_file(p, os.path.basename(p), 'application/zip')
             except Exception as e:
                 return self.json_response({'ok': False, 'error': str(e), 'date': today()}, status=500)
+        m = re.fullmatch(r'/download/(kr|us)/(\d{4}-\d{2}-\d{2})', path)
+        if m:
+            market = m.group(1).upper()
+            trade_date = m.group(2)
+            p = historical_backup_path(market, trade_date)
+            if not p or not os.path.isfile(p):
+                return self.json_response({'ok': False, 'error': 'BACKUP_NOT_FOUND', 'market': market, 'trade_date': trade_date}, status=404)
+            return self.download_file(p, os.path.basename(p), 'application/zip')
+        if path == '/archives':
+            return self.json_response({'ok': True, 'archives': backup_archive_index()})
         if path == '/download_backup':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -5132,7 +5254,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS)}계좌</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS)}계좌</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
@@ -5289,6 +5411,8 @@ def print_core_selfcheck():
         raise RuntimeError('Google Drive 자동삭제는 금지되어야 합니다.')
     if not GOOGLE_DRIVE_CANONICAL_ONE_FILE or not GOOGLE_DRIVE_ALLOW_UPDATE:
         raise RuntimeError('Google Drive 거래일당 canonical 1파일 자동백업 정책이 꺼져 있습니다.')
+    if not GOOGLE_DRIVE_FINAL_IMMUTABLE:
+        raise RuntimeError('검증 완료 FINAL 불변 잠금이 꺼져 있습니다.')
     if len(ALL26_SYMBOLS) != 26:
         raise RuntimeError(f'KR 종목 수 오류: {len(ALL26_SYMBOLS)}')
     if len(US_SYMBOLS) != 14:
