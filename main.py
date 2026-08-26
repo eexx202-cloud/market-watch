@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_97_TOSS_OFFICIAL_1_2_13_US_DOWNLOAD_FALLBACK_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_97_US_DOWNLOAD_BUTTON_ONLY_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -4908,14 +4908,8 @@ def maybe_send_us_backup():
         if _us_backup_failure_should_notify(trade_date, signature):
             send_telegram(msg, force=True)
         return
-    # 미국도 한국과 동일하게 Drive 장애 시 검증된 ZIP을 사용자가 바로 받을 수 있게 한다.
-    url = f'{APP_URL}/download_us_backup' if APP_URL else '/download_us_backup'
-    oauth_url = f'{APP_URL}/google/oauth/start' if APP_URL else '/google/oauth/start'
     completed = not GOOGLE_DRIVE_UPLOAD_ENABLED
     result = {}
-    fallback_sent = False
-    fallback_msg = ''
-
     if GOOGLE_DRIVE_UPLOAD_ENABLED and google_drive_credentials_ready(True):
         drive_ok, result = upload_backup_to_google_drive(path)
         if drive_ok:
@@ -4928,29 +4922,12 @@ def maybe_send_us_backup():
                 msg += '\n✅ Drive 업로드 성공\n✅ Drive 재다운로드·CRC·14종목 1분봉·호가·체결·메타데이터 재검증 성공'
             else:
                 msg += '\n❌ Drive 업로드 후 재검증 실패\n성공 처리하지 않음 / 10분 뒤 기존 Drive 파일부터 재검증\n실패: ' + ' | '.join(map(str, verify_report.get('failures', [])[:8]))[:800]
-                fallback_sent, fallback_msg = send_telegram_file(
-                    path,
-                    msg + '\n✅ 서버의 검증된 미국 ZIP 외부사본',
-                    force=True
-                )
         else:
             completed = False
-            err = str(result.get('error', ''))
-            msg += '\n❌ Drive 업로드 실패: ' + err[:300]
-            fallback_sent, fallback_msg = send_telegram_file(
-                path,
-                msg + '\n✅ 서버의 검증된 미국 ZIP 외부사본',
-                force=True
-            )
+            msg += '\n❌ Drive 업로드 실패: ' + str(result.get('error', ''))[:300]
     elif GOOGLE_DRIVE_UPLOAD_ENABLED:
         completed = False
         msg += '\n❌ Drive 설정 미완료'
-        fallback_sent, fallback_msg = send_telegram_file(
-            path,
-            msg + '\n✅ 서버의 검증된 미국 ZIP 외부사본',
-            force=True
-        )
-
     if completed:
         with LOCK:
             item = completed_map.get(trade_date, {})
@@ -4959,34 +4936,13 @@ def maybe_send_us_backup():
             item.update({'completed_at': now_text(), 'grade': grade, 'file_name': str(result.get('name', os.path.basename(path))) if isinstance(result, dict) else os.path.basename(path), 'file_id': str(result.get('id', '')) if isinstance(result, dict) else '', 'drive_reverified': bool(GOOGLE_DRIVE_UPLOAD_ENABLED), 'completed': True})
             completed_map[trade_date] = item
         save_state()
-
     if completed:
         send_telegram(msg, force=True)
     else:
         signature = 'US_DRIVE:' + msg[-900:]
         if _us_backup_failure_should_notify(trade_date, signature):
-            err_text = str(result.get('error', '')) if isinstance(result, dict) else ''
-            auth_required = (
-                '재승인 필요' in err_text
-                or 'invalid_grant' in err_text.lower()
-                or 'expired' in err_text.lower()
-                or 'revoked' in err_text.lower()
-                or not google_drive_credentials_ready(True)
-            )
-            buttons = []
-            if auth_required:
-                buttons.append([telegram_button('Google Drive 재승인', oauth_url)])
-            buttons.append([telegram_button('미국 백업 다운로드', url)])
-            copy_note = (
-                '\n✅ Telegram 미국 ZIP 외부사본 전송 성공'
-                if fallback_sent
-                else f'\n⚠️ Telegram 미국 ZIP 전송 실패: {str(fallback_msg)[:300]}'
-            )
-            send_telegram(
-                msg + copy_note + '\n✅ 서버의 검증된 미국 ZIP은 유지됩니다.',
-                buttons,
-                force=True
-            )
+            url = f'{APP_URL}/download_us_backup' if APP_URL else '/download_us_backup'
+            send_telegram(msg, [[telegram_button('미국 백업 다운로드', url)]], force=True)
 
 def _kr_backup_failure_should_notify(trade_date, signature, cooldown_sec=86400):
     """한국 백업 실패는 거래일당 최초 1회만 알린다. 자동 재시도는 조용히 계속한다."""
