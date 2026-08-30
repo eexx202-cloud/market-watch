@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_97_US_DOWNLOAD_BUTTON_ONLY_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V4_98_DRIVE_PERSISTENT_TOKEN_PRIORITY_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -3638,14 +3638,14 @@ def preserve_kr_raw_before_grade_check():
 
 
 def google_drive_refresh_token_value():
-    if GOOGLE_DRIVE_REFRESH_TOKEN:
-        return GOOGLE_DRIVE_REFRESH_TOKEN
     try:
         if os.path.isfile(GOOGLE_DRIVE_REFRESH_TOKEN_FILE):
-            return open(GOOGLE_DRIVE_REFRESH_TOKEN_FILE, 'r', encoding='utf-8').read().strip()
+            token = open(GOOGLE_DRIVE_REFRESH_TOKEN_FILE, 'r', encoding='utf-8').read().strip()
+            if token:
+                return token
     except Exception:
         pass
-    return ''
+    return str(GOOGLE_DRIVE_REFRESH_TOKEN or '').strip()
 
 def _persist_google_drive_refresh_token(token):
     token = str(token or '').strip()
