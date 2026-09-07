@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V4_98_DRIVE_PERSISTENT_TOKEN_PRIORITY_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_01_ARCPRO_WEBHOOK_RECEIVER_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -38,6 +38,10 @@ CLIENT_ID = os.environ.get('TOSS_CLIENT_ID', '').strip()
 CLIENT_SECRET = os.environ.get('TOSS_CLIENT_SECRET', '').strip()
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+ARC_WEBHOOK_SECRET = os.environ.get('ARC_WEBHOOK_SECRET', '').strip()
+ARC_ALERT_ALLOWED_SYMBOLS = {'005930','042700','034020','042660','108490'}
+ARC_ALERT_ALLOWED_ACTIONS = {'BUY','ADD','PARTIAL','SELL'}
+ARC_WEBHOOK_MAX_BODY = 16 * 1024
 GOOGLE_DRIVE_CLIENT_ID = os.environ.get('GOOGLE_DRIVE_CLIENT_ID', '').strip()
 GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get('GOOGLE_DRIVE_CLIENT_SECRET', '').strip()
 GOOGLE_DRIVE_REFRESH_TOKEN = os.environ.get('GOOGLE_DRIVE_REFRESH_TOKEN', '').strip()
@@ -5195,6 +5199,65 @@ def backup_archive_index():
                 out[market].append({'file': fn, 'size': os.path.getsize(fp), 'download': f'/download/{market.lower()}/{fn[-14:-4]}'})
     return out
 
+
+def parse_arcpro_webhook_body(raw_body):
+    """TradingView Arc-pro webhook body parser. Never places a real order."""
+    if isinstance(raw_body, bytes):
+        body = raw_body.decode('utf-8', errors='replace').strip()
+    else:
+        body = str(raw_body or '').strip()
+    if not body:
+        raise ValueError('EMPTY_BODY')
+    symbol = action = ''
+    price = 0.0
+    signal_time = ''
+    payload = None
+    # JSON is preferred, but a compact pipe format is also accepted.
+    try:
+        payload = json.loads(body)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        symbol = str(payload.get('symbol') or payload.get('ticker') or '').strip().upper()
+        action = str(payload.get('action') or payload.get('signal') or '').strip().upper()
+        price = to_float(payload.get('price') or payload.get('close') or 0, 0)
+        signal_time = str(payload.get('time') or payload.get('timenow') or '').strip()
+    else:
+        parts = [p.strip() for p in body.split('|') if p.strip()]
+        if len(parts) >= 2:
+            symbol, action = parts[0].upper(), parts[1].upper()
+        for p in parts[2:]:
+            if '=' not in p:
+                continue
+            k, v = p.split('=', 1)
+            k = k.strip().lower(); v = v.strip()
+            if k in {'price','close'}:
+                price = to_float(v, 0)
+            elif k in {'time','timenow'}:
+                signal_time = v
+    if symbol not in ARC_ALERT_ALLOWED_SYMBOLS:
+        raise ValueError(f'INVALID_SYMBOL:{symbol}')
+    if action not in ARC_ALERT_ALLOWED_ACTIONS:
+        raise ValueError(f'INVALID_ACTION:{action}')
+    if price <= 0:
+        raise ValueError('INVALID_PRICE')
+    return {'symbol': symbol, 'action': action, 'price': price, 'signal_time': signal_time, 'received_at': now_text(), 'raw': body[:2000]}
+
+
+def arcpro_webhook_log_path():
+    return os.path.join(day_dir(), f'arcpro_webhook_{today()}.csv')
+
+
+def record_arcpro_webhook(evt):
+    write_row(arcpro_webhook_log_path(),
+              ['received_at','signal_time','symbol','name','action','price','raw'],
+              {'received_at': evt.get('received_at',''), 'signal_time': evt.get('signal_time',''),
+               'symbol': evt.get('symbol',''), 'name': name_of(evt.get('symbol','')),
+               'action': evt.get('action',''), 'price': evt.get('price',0), 'raw': evt.get('raw','')})
+    write_alert_log('INFO','arcpro_webhook',evt.get('symbol',''),evt.get('price',0),0,
+                    evt.get('action',''),'TRADINGVIEW_ARCPRO_RECEIVED',True,evt.get('signal_time',''))
+    return True
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -5260,7 +5323,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        return self.json_response({'ok': False, 'error': 'POST_DISABLED_PAPER_ONLY'}, status=405)
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        if path != '/arcpro_webhook':
+            return self.json_response({'ok': False, 'error': 'POST_DISABLED_PAPER_ONLY'}, status=405)
+        # Secret is required in production. TradingView can place it in the webhook URL query.
+        supplied = str((qs.get('key') or [''])[0]).strip()
+        if not ARC_WEBHOOK_SECRET or supplied != ARC_WEBHOOK_SECRET:
+            return self.json_response({'ok': False, 'error': 'WEBHOOK_UNAUTHORIZED'}, status=401)
+        try:
+            length = int(self.headers.get('Content-Length', '0') or '0')
+        except Exception:
+            length = 0
+        if length <= 0 or length > ARC_WEBHOOK_MAX_BODY:
+            return self.json_response({'ok': False, 'error': 'INVALID_BODY_LENGTH'}, status=400)
+        try:
+            raw = self.rfile.read(length)
+            evt = parse_arcpro_webhook_body(raw)
+            record_arcpro_webhook(evt)
+            # Important: V5.01 only receives and records. It never calls a real-order API.
+            return self.json_response({'ok': True, 'paper_only': True, 'received': evt}, status=200)
+        except ValueError as e:
+            return self.json_response({'ok': False, 'error': str(e)}, status=400)
+        except Exception as e:
+            set_error(f'Arc-pro webhook error: {e}')
+            return self.json_response({'ok': False, 'error': 'WEBHOOK_INTERNAL_ERROR'}, status=500)
 
     def download_file(self, path, filename, content_type='application/octet-stream'):
         if not os.path.isfile(path):
