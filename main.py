@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_01_ARCPRO_WEBHOOK_RECEIVER_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_02_ARCPRO_PAPER_ENGINE_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -42,6 +42,15 @@ ARC_WEBHOOK_SECRET = os.environ.get('ARC_WEBHOOK_SECRET', '').strip()
 ARC_ALERT_ALLOWED_SYMBOLS = {'005930','042700','034020','042660','108490'}
 ARC_ALERT_ALLOWED_ACTIONS = {'BUY','ADD','PARTIAL','SELL'}
 ARC_WEBHOOK_MAX_BODY = 16 * 1024
+# Arc-pro 전용 1천만원 가상계좌. 실주문 API는 절대 호출하지 않는다.
+ARC_PAPER_START_CASH = int(float(os.environ.get('ARC_PAPER_START_CASH', '10000000')))
+ARC_PAPER_RESERVE_RATIO = max(0.0, min(0.50, float(os.environ.get('ARC_PAPER_RESERVE_RATIO', '0.10'))))
+ARC_PAPER_BUY_TARGET_RATIO = max(0.05, min(0.30, float(os.environ.get('ARC_PAPER_BUY_TARGET_RATIO', '0.18'))))
+ARC_PAPER_ADD_MAX_RATIO = max(ARC_PAPER_BUY_TARGET_RATIO, min(0.50, float(os.environ.get('ARC_PAPER_ADD_MAX_RATIO', '0.30'))))
+ARC_PAPER_ADD_STEP_RATIO = max(0.01, min(0.20, float(os.environ.get('ARC_PAPER_ADD_STEP_RATIO', '0.12'))))
+ARC_PAPER_PARTIAL_RATIO = max(0.10, min(0.90, float(os.environ.get('ARC_PAPER_PARTIAL_RATIO', '0.50'))))
+ARC_PAPER_MAX_RECENT_EVENTS = max(20, min(500, int(os.environ.get('ARC_PAPER_MAX_RECENT_EVENTS', '100'))))
+ARC_PAPER_MAX_PROCESSED_IDS = max(100, min(5000, int(os.environ.get('ARC_PAPER_MAX_PROCESSED_IDS', '1000'))))
 GOOGLE_DRIVE_CLIENT_ID = os.environ.get('GOOGLE_DRIVE_CLIENT_ID', '').strip()
 GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get('GOOGLE_DRIVE_CLIENT_SECRET', '').strip()
 GOOGLE_DRIVE_REFRESH_TOKEN = os.environ.get('GOOGLE_DRIVE_REFRESH_TOKEN', '').strip()
@@ -71,6 +80,7 @@ VIRTUAL_BASE_CASH = int(float(os.environ.get('VIRTUAL_BASE_CASH', '10000000')))
 ENABLE_MULTI_PAPER_AI = os.environ.get('ENABLE_MULTI_PAPER_AI', 'true').lower() == 'true'
 MULTI_AI_START_CASH = int(float(os.environ.get('MULTI_AI_START_CASH', '10000000')))
 MULTI_AI_FEE_SIDE_PCT = float(os.environ.get('MULTI_AI_FEE_SIDE_PCT', '0.10'))
+ARC_PAPER_FEE_SIDE_PCT = max(0.0, float(os.environ.get('ARC_PAPER_FEE_SIDE_PCT', str(MULTI_AI_FEE_SIDE_PCT))))
 MULTI_AI_MAX_POSITION_RATIO = float(os.environ.get('MULTI_AI_MAX_POSITION_RATIO', '0.90'))
 MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get('MULTI_AI_DECISION_COOLDOWN_SEC', '180'))
 RESEARCH_BASE_NAMES = {1: '연구고정 오전추세', 2: '연구고정 오전역추세', 3: '연구고정 오전돌파', 4: '연구고정 오전눌림', 5: '연구고정 09:15', 6: '연구고정 10:00', 7: '연구고정 11:00', 8: '연구고정 오후추세', 9: '연구고정 오후역추세', 10: '연구고정 오후돌파', 11: '연구고정 2구간', 12: '연구고정 저노출', 13: '연구고정 관망강화', 14: '연구고정 추적청산', 15: '연구고정 오버나이트'}
@@ -209,7 +219,7 @@ ENABLE_DAILY_BACKUP_ALERT = True
 ENABLE_REAL_AUTO_BUY = False
 ENABLE_REAL_AUTO_SELL = False
 LOCK = threading.RLock()
-S = {'token': '', 'token_exp': 0, 'token_last_error': '', 'outbound_ip': '확인 전', 'outbound_ip_checked_at': 0, 'outbound_ip_error': '', 'status': '시작 중', 'updated': '없음', 'last_error': '', 'prices': {}, 'prev_prices': {}, 'history': {}, 'high': {}, 'low': {}, 'wma': {}, 'scores': {}, 'signals': {}, 'market_score': {'kospi': 0, 'kosdaq': 0, 'total': 0, 'label': '대기'}, 'alerts': [], 'last_alert': {}, 'us_backup_completed': {}, 'kr_backup_completed': {}, 'google_drive': {'status': 'DISABLED' if not GOOGLE_DRIVE_UPLOAD_ENABLED else 'WAITING_FOR_BACKUP', 'last_attempt_at': '', 'last_success_at': '', 'last_file_name': '', 'last_file_id': '', 'last_file_size': 0, 'last_web_view_link': '', 'last_error': '', 'retry_count': 0}, 'paper': {'start_cash': 0, 'cash': 0, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': 0, 'profit_rate': 0, 'last_action': '없음'}, 'paper_ais': {}, 'full_market': {'universe': {}, 'quotes': {}, 'ranked': [], 'cursor': 0, 'last_scan_ts': 0, 'last_scan_text': '없음', 'stock_master_checked_at': 0, 'stock_master_source': '없음', 'status': '대기', 'errors': 0}, 'daytrade': {'date': '', 'cash': 0, 'trade_count': 0, 'position': None, 'market_mode': 'LEGACY_REMOVED', 'pending': None, 'trades': [], 'last_action': '구 구 단타 단타 제거'}, 'market_data_capture': {'last_candle_ts': 0, 'last_orderflow_ts': 0, 'last_investor_ts': 0, 'last_daily_ts': 0, 'last_metadata_ts': 0, 'last_audit_ts': 0, 'last_candle_minute': {}, 'seen_candle_keys': {}, 'last_trade_timestamp': {}, 'last_orderbook_timestamp': {}, 'latest_orderbook': {}, 'latest_trade': {}, 'price_timestamp': {}, 'calendar': {}, 'calendar_checked_at': 0, 'gate_ok': False, 'gate_reason': 'NOT_CHECKED', 'status': '대기', 'errors': 0}}
+S = {'token': '', 'token_exp': 0, 'token_last_error': '', 'outbound_ip': '확인 전', 'outbound_ip_checked_at': 0, 'outbound_ip_error': '', 'status': '시작 중', 'updated': '없음', 'last_error': '', 'prices': {}, 'prev_prices': {}, 'history': {}, 'high': {}, 'low': {}, 'wma': {}, 'scores': {}, 'signals': {}, 'market_score': {'kospi': 0, 'kosdaq': 0, 'total': 0, 'label': '대기'}, 'alerts': [], 'last_alert': {}, 'us_backup_completed': {}, 'kr_backup_completed': {}, 'google_drive': {'status': 'DISABLED' if not GOOGLE_DRIVE_UPLOAD_ENABLED else 'WAITING_FOR_BACKUP', 'last_attempt_at': '', 'last_success_at': '', 'last_file_name': '', 'last_file_id': '', 'last_file_size': 0, 'last_web_view_link': '', 'last_error': '', 'retry_count': 0}, 'paper': {'start_cash': 0, 'cash': 0, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': 0, 'profit_rate': 0, 'last_action': '없음'}, 'paper_ais': {}, 'full_market': {'universe': {}, 'quotes': {}, 'ranked': [], 'cursor': 0, 'last_scan_ts': 0, 'last_scan_text': '없음', 'stock_master_checked_at': 0, 'stock_master_source': '없음', 'status': '대기', 'errors': 0}, 'daytrade': {'date': '', 'cash': 0, 'trade_count': 0, 'position': None, 'market_mode': 'LEGACY_REMOVED', 'pending': None, 'trades': [], 'last_action': '구 구 단타 단타 제거'}, 'market_data_capture': {'last_candle_ts': 0, 'last_orderflow_ts': 0, 'last_investor_ts': 0, 'last_daily_ts': 0, 'last_metadata_ts': 0, 'last_audit_ts': 0, 'last_candle_minute': {}, 'seen_candle_keys': {}, 'last_trade_timestamp': {}, 'last_orderbook_timestamp': {}, 'latest_orderbook': {}, 'latest_trade': {}, 'price_timestamp': {}, 'calendar': {}, 'calendar_checked_at': 0, 'gate_ok': False, 'gate_reason': 'NOT_CHECKED', 'status': '대기', 'errors': 0}, 'arcpro_paper': {'start_cash': ARC_PAPER_START_CASH, 'cash': ARC_PAPER_START_CASH, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': ARC_PAPER_START_CASH, 'profit_rate': 0.0, 'last_action': '초기 1천만원', 'last_event': {}, 'recent_events': [], 'processed_ids': [], 'paused_new_buys': False, 'failed_sell': None}}
 
 def now_kst():
     return datetime.now(KST)
@@ -781,7 +791,7 @@ def save_state():
     """상태를 원자적으로 저장하고 직전 정상본을 .bak로 보존한다."""
     try:
         with LOCK:
-            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {})}
+            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {})}
         if os.path.isfile(STATE_PATH):
             try:
                 with open(STATE_PATH, 'r', encoding='utf-8') as f:
@@ -830,6 +840,9 @@ def load_state():
             paper_ais = data.get('paper_ais')
             if isinstance(paper_ais, dict):
                 S['paper_ais'] = paper_ais
+            arcpro_paper = data.get('arcpro_paper')
+            if isinstance(arcpro_paper, dict):
+                S['arcpro_paper'].update(arcpro_paper)
             drive_state = data.get('google_drive')
             if isinstance(drive_state, dict):
                 S['google_drive'].update(drive_state)
@@ -5258,6 +5271,346 @@ def record_arcpro_webhook(evt):
                     evt.get('action',''),'TRADINGVIEW_ARCPRO_RECEIVED',True,evt.get('signal_time',''))
     return True
 
+
+
+def _arcpro_default_state():
+    return {'start_cash': ARC_PAPER_START_CASH, 'cash': ARC_PAPER_START_CASH, 'positions': {}, 'trades': [],
+            'realized_pl': 0, 'asset': ARC_PAPER_START_CASH, 'profit_rate': 0.0,
+            'last_action': '초기 1천만원', 'last_event': {}, 'recent_events': [], 'processed_ids': [],
+            'paused_new_buys': False, 'failed_sell': None}
+
+
+def ensure_arcpro_paper_state():
+    with LOCK:
+        st = S.get('arcpro_paper')
+        if not isinstance(st, dict):
+            S['arcpro_paper'] = _arcpro_default_state()
+            st = S['arcpro_paper']
+        d = _arcpro_default_state()
+        for k, v in d.items():
+            if k not in st:
+                st[k] = v
+        if to_float(st.get('start_cash', 0)) <= 0:
+            S['arcpro_paper'] = _arcpro_default_state()
+            st = S['arcpro_paper']
+        if not isinstance(st.get('positions'), dict):
+            st['positions'] = {}
+        if not isinstance(st.get('trades'), list):
+            st['trades'] = []
+        if not isinstance(st.get('recent_events'), list):
+            st['recent_events'] = []
+        if not isinstance(st.get('processed_ids'), list):
+            st['processed_ids'] = []
+        return st
+
+
+def arcpro_event_id(evt):
+    base = '|'.join([
+        str(evt.get('symbol','')).strip(), str(evt.get('action','')).strip(),
+        str(evt.get('signal_time','')).strip(), f"{to_float(evt.get('price',0)):.8f}"
+    ])
+    return hashlib.sha256(base.encode('utf-8')).hexdigest()[:32]
+
+
+def arcpro_paper_log_path():
+    return os.path.join(day_dir(), f'arcpro_paper_trades_{today()}.csv')
+
+
+def _arcpro_mark_price(sym, pos=None):
+    p = to_float(S.get('prices', {}).get(sym, 0))
+    if p > 0:
+        return p
+    ob = S.setdefault('market_data_capture', {}).get('latest_orderbook', {}).get(sym, {})
+    bid = to_float(ob.get('best_bid', 0)) if isinstance(ob, dict) else 0
+    ask = to_float(ob.get('best_ask', 0)) if isinstance(ob, dict) else 0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2
+    if isinstance(pos, dict):
+        return to_float(pos.get('avg', 0))
+    return 0.0
+
+
+def update_arcpro_paper_asset(save=False):
+    ensure_arcpro_paper_state()
+    with LOCK:
+        st = S['arcpro_paper']
+        asset = to_float(st.get('cash', 0))
+        for sym, pos in list(st.get('positions', {}).items()):
+            if not isinstance(pos, dict):
+                continue
+            qty = int(to_float(pos.get('qty', 0)))
+            if qty <= 0:
+                continue
+            asset += qty * _arcpro_mark_price(sym, pos)
+        st['asset'] = int(round(asset))
+        start = max(1, int(to_float(st.get('start_cash', ARC_PAPER_START_CASH))))
+        st['profit_rate'] = round((asset / start - 1.0) * 100.0, 6)
+        out = st['asset']
+    if save:
+        save_state()
+    return out
+
+
+def _arcpro_event_record(evt, status, reason='', extra=None):
+    ensure_arcpro_paper_state()
+    row = {
+        'received_at': evt.get('received_at',''), 'signal_time': evt.get('signal_time',''),
+        'event_id': evt.get('event_id',''), 'symbol': evt.get('symbol',''), 'name': name_of(evt.get('symbol','')),
+        'action': evt.get('action',''), 'signal_price': round(to_float(evt.get('price',0)), 4),
+        'status': status, 'reason': reason or '', 'processed_at': now_text()
+    }
+    if isinstance(extra, dict):
+        row.update(extra)
+    with LOCK:
+        st = S['arcpro_paper']
+        st['last_event'] = dict(row)
+        st.setdefault('recent_events', []).insert(0, dict(row))
+        del st['recent_events'][ARC_PAPER_MAX_RECENT_EVENTS:]
+    return row
+
+
+def _arcpro_write_trade(action, evt, fill_price, qty, fee, pl, status, reason=''):
+    update_arcpro_paper_asset(False)
+    with LOCK:
+        st = S['arcpro_paper']
+        row = {'time': now_text(), 'signal_time': evt.get('signal_time',''), 'event_id': evt.get('event_id',''),
+               'action': action, 'symbol': evt.get('symbol',''), 'name': name_of(evt.get('symbol','')),
+               'signal_price': round(to_float(evt.get('price',0)),4), 'fill_price': round(to_float(fill_price),4),
+               'qty': int(qty), 'fee': int(fee), 'pl': int(pl), 'cash': int(to_float(st.get('cash',0))),
+               'asset': int(to_float(st.get('asset',0))), 'profit_rate': round(to_float(st.get('profit_rate',0)),6),
+               'status': status, 'reason': reason, 'paper_only': True, 'real_order': False}
+        st.setdefault('trades', []).insert(0, dict(row))
+        del st['trades'][500:]
+    write_row(arcpro_paper_log_path(),
+              ['time','signal_time','event_id','action','symbol','name','signal_price','fill_price','qty','fee','pl','cash','asset','profit_rate','status','reason','paper_only','real_order'], row)
+    save_state()
+    return row
+
+
+def _arcpro_notify_success(action, sym, row):
+    labels = {'BUY':'자동매수', 'ADD':'추매', 'PARTIAL':'반익', 'SELL':'전량매도'}
+    label = labels.get(action, action)
+    msg = (f"✅ {label} 성공 (가상매매)\n{name_of(sym)} {sym}\n"
+           f"체결가 {row.get('fill_price',0):,.0f}원 / {row.get('qty',0)}주\n"
+           f"현금 {row.get('cash',0):,}원 / 총자산 {row.get('asset',0):,}원")
+    if action in {'PARTIAL','SELL'}:
+        msg += f"\n실현손익 {row.get('pl',0):+,}원"
+    send_telegram(msg, force=False)
+
+
+def _arcpro_notify_failure(evt, reason, urgent=False):
+    sym = evt.get('symbol','')
+    action = evt.get('action','')
+    title = '🚨 매도 실패 — 즉시 대응 필요' if action in {'SELL','PARTIAL'} else '⚠️ 매수 실패 — 가상매매 미체결'
+    with LOCK:
+        st = S.get('arcpro_paper', {})
+        pos = st.get('positions', {}).get(sym, {}) if isinstance(st.get('positions',{}), dict) else {}
+        qty = int(to_float(pos.get('qty',0))) if isinstance(pos,dict) else 0
+    msg = f"{title}\n{name_of(sym)} {sym}\n신호 {action} / 사유 {reason}\n현재 보유 {qty}주"
+    send_telegram(msg, force=urgent)
+
+
+def _arcpro_claim_event(evt):
+    ensure_arcpro_paper_state()
+    eid = evt.get('event_id') or arcpro_event_id(evt)
+    evt['event_id'] = eid
+    with LOCK:
+        st = S['arcpro_paper']
+        ids = st.setdefault('processed_ids', [])
+        if eid in ids:
+            return False
+        ids.append(eid)
+        if len(ids) > ARC_PAPER_MAX_PROCESSED_IDS:
+            del ids[:-ARC_PAPER_MAX_PROCESSED_IDS]
+    save_state()
+    return True
+
+
+def _arcpro_buy(evt, is_add=False):
+    sym = evt['symbol']
+    ensure_arcpro_paper_state()
+    if not ensure_live_orderbook(sym):
+        return (False, 'ORDERBOOK_REFRESH_FAILED', None)
+    gate_ok, gate_reason = market_safety_gate(sym)
+    if not gate_ok:
+        return (False, gate_reason, None)
+    update_arcpro_paper_asset(False)
+    with LOCK:
+        st = S['arcpro_paper']
+        if st.get('paused_new_buys'):
+            return (False, 'NEW_BUYS_PAUSED_AFTER_SELL_FAILURE', None)
+        pos = st.get('positions', {}).get(sym)
+        if is_add and not isinstance(pos, dict):
+            return (False, 'ADD_WITHOUT_POSITION', None)
+        if (not is_add) and isinstance(pos, dict) and int(to_float(pos.get('qty',0))) > 0:
+            return (False, 'BUY_ALREADY_POSITIONED_USE_ADD', None)
+        cash = int(to_float(st.get('cash', 0)))
+        equity = max(1, int(to_float(st.get('asset', cash))))
+        reserve = int(equity * ARC_PAPER_RESERVE_RATIO)
+        spendable = max(0, cash - reserve)
+        if is_add:
+            cur_qty = int(to_float(pos.get('qty',0)))
+            cur_value = cur_qty * _arcpro_mark_price(sym, pos)
+            cap_gap = max(0, int(equity * ARC_PAPER_ADD_MAX_RATIO - cur_value))
+            budget = min(spendable, int(equity * ARC_PAPER_ADD_STEP_RATIO), cap_gap)
+        else:
+            budget = min(spendable, int(equity * ARC_PAPER_BUY_TARGET_RATIO))
+    if budget <= 0:
+        return (False, 'NO_AVAILABLE_BUDGET', None)
+    fee_rate = ARC_PAPER_FEE_SIDE_PCT / 100.0
+    fill = simulated_orderbook_fill(sym, 'BUY', max_cash=budget / (1.0 + fee_rate))
+    if not fill.get('ok'):
+        return (False, fill.get('reason','BUY_FILL_FAILED'), None)
+    qty = int(fill.get('qty',0)); price = to_float(fill.get('avg_price',0)); gross = int(round(to_float(fill.get('gross',0))))
+    fee = int(round(gross * fee_rate)); total = gross + fee
+    if qty <= 0 or price <= 0:
+        return (False, 'INVALID_BUY_FILL', None)
+    with LOCK:
+        st = S['arcpro_paper']
+        cash_now = int(to_float(st.get('cash',0)))
+        if total > cash_now:
+            return (False, 'CASH_CHANGED_BEFORE_COMMIT', None)
+        old = st.get('positions', {}).get(sym)
+        if isinstance(old, dict):
+            old_qty = int(to_float(old.get('qty',0)))
+            old_cost = int(to_float(old.get('entry_total_cost', old_qty * to_float(old.get('avg',0)))))
+        else:
+            old_qty = 0; old_cost = 0
+        new_qty = old_qty + qty
+        new_cost = old_cost + total
+        st['cash'] = cash_now - total
+        st.setdefault('positions', {})[sym] = {'qty': new_qty, 'avg': round((old_qty * to_float(old.get('avg',0)) if isinstance(old,dict) else 0) + gross, 4) / max(1,new_qty),
+                                                     'entry_total_cost': new_cost, 'last_buy_at': now_text(), 'last_signal': evt.get('action','')}
+        # avg should represent gross average price, not fee-inclusive cost.
+        if new_qty > 0:
+            old_gross = old_qty * to_float(old.get('avg',0)) if isinstance(old,dict) else 0
+            st['positions'][sym]['avg'] = (old_gross + gross) / new_qty
+        st['last_action'] = f"{now_short()} {evt.get('action')} {name_of(sym)} {qty}주"
+    row = _arcpro_write_trade(evt.get('action','BUY'), evt, price, qty, fee, 0, 'FILLED', 'ARCPRO_SIGNAL')
+    return (True, 'OK', row)
+
+
+def _arcpro_sell(evt, partial=False):
+    sym = evt['symbol']
+    ensure_arcpro_paper_state()
+    with LOCK:
+        st = S['arcpro_paper']
+        pos = st.get('positions', {}).get(sym)
+        if not isinstance(pos, dict) or int(to_float(pos.get('qty',0))) <= 0:
+            return (False, 'SELL_WITHOUT_POSITION', None)
+        old_qty = int(to_float(pos.get('qty',0)))
+        avg = to_float(pos.get('avg',0))
+        old_cost = int(to_float(pos.get('entry_total_cost', old_qty * avg)))
+    if not ensure_live_orderbook(sym):
+        return (False, 'ORDERBOOK_REFRESH_FAILED', None)
+    gate_ok, gate_reason = market_safety_gate(sym)
+    if not gate_ok:
+        return (False, gate_reason, None)
+    target_qty = max(1, int(old_qty * ARC_PAPER_PARTIAL_RATIO)) if partial else old_qty
+    fill = simulated_orderbook_fill(sym, 'SELL', qty=target_qty)
+    if not fill.get('ok'):
+        return (False, fill.get('reason','SELL_FILL_FAILED'), None)
+    sold = int(fill.get('qty',0)); price = to_float(fill.get('avg_price',0)); gross = int(round(to_float(fill.get('gross',0))))
+    fee = int(round(gross * ARC_PAPER_FEE_SIDE_PCT / 100.0)); net = gross - fee
+    if sold <= 0 or price <= 0:
+        return (False, 'INVALID_SELL_FILL', None)
+    cost_part = int(round(old_cost * sold / max(1, old_qty)))
+    pl = net - cost_part
+    remain = old_qty - sold
+    with LOCK:
+        st = S['arcpro_paper']
+        current = st.get('positions', {}).get(sym)
+        if not isinstance(current, dict) or int(to_float(current.get('qty',0))) != old_qty:
+            return (False, 'POSITION_CHANGED_BEFORE_COMMIT', None)
+        st['cash'] = int(to_float(st.get('cash',0))) + net
+        st['realized_pl'] = int(to_float(st.get('realized_pl',0))) + pl
+        if remain <= 0:
+            st['positions'].pop(sym, None)
+        else:
+            current['qty'] = remain
+            current['entry_total_cost'] = max(0, old_cost - cost_part)
+            current['last_sell_at'] = now_text()
+        st['last_action'] = f"{now_short()} {evt.get('action')} {name_of(sym)} {sold}주"
+        incomplete = sold < target_qty
+        if evt.get('action') == 'SELL' and (remain > 0 or incomplete):
+            st['paused_new_buys'] = True
+            st['failed_sell'] = {'symbol': sym, 'remaining_qty': remain, 'reason': 'PARTIAL_LIQUIDITY', 'time': now_text()}
+        elif evt.get('action') == 'SELL' and remain <= 0:
+            st['failed_sell'] = None
+            st['paused_new_buys'] = False
+    status = 'FILLED' if sold == target_qty else 'PARTIAL_FILL'
+    row = _arcpro_write_trade(evt.get('action','SELL'), evt, price, sold, fee, pl, status, 'ARCPRO_SIGNAL')
+    if sold < target_qty:
+        return (False, 'PARTIAL_LIQUIDITY', row)
+    return (True, 'OK', row)
+
+
+def process_arcpro_paper_event(evt):
+    """Arc-pro 신호를 1천만원 전용 가상계좌에만 반영한다. 실주문 함수는 호출하지 않는다."""
+    try:
+        ensure_arcpro_paper_state()
+        if not _arcpro_claim_event(evt):
+            _arcpro_event_record(evt, 'DUPLICATE_IGNORED', 'DUPLICATE_SIGNAL')
+            return {'ok': True, 'duplicate': True}
+        action = evt.get('action','')
+        if action == 'BUY':
+            ok, reason, row = _arcpro_buy(evt, False)
+        elif action == 'ADD':
+            ok, reason, row = _arcpro_buy(evt, True)
+        elif action == 'PARTIAL':
+            ok, reason, row = _arcpro_sell(evt, True)
+        elif action == 'SELL':
+            ok, reason, row = _arcpro_sell(evt, False)
+        else:
+            ok, reason, row = (False, 'INVALID_ACTION', None)
+        if ok:
+            _arcpro_event_record(evt, 'EXECUTED', reason, {'fill_price': row.get('fill_price',0) if row else 0, 'qty': row.get('qty',0) if row else 0})
+            if row:
+                _arcpro_notify_success(action, evt.get('symbol',''), row)
+        else:
+            # 장 종료/휴장/과거 데이터는 정상적인 안전차단이며 계좌를 건드리지 않는다.
+            _arcpro_event_record(evt, 'NOT_EXECUTED', reason, {'fill_price': row.get('fill_price',0) if row else 0, 'qty': row.get('qty',0) if row else 0})
+            if action == 'SELL' and reason not in {'SELL_WITHOUT_POSITION'}:
+                with LOCK:
+                    st = S['arcpro_paper']
+                    st['paused_new_buys'] = True
+                    st['failed_sell'] = {'symbol': evt.get('symbol',''), 'remaining_qty': int(to_float(st.get('positions',{}).get(evt.get('symbol',''),{}).get('qty',0))) if isinstance(st.get('positions',{}).get(evt.get('symbol','')),dict) else 0, 'reason': reason, 'time': now_text()}
+                save_state()
+                _arcpro_notify_failure(evt, reason, urgent=True)
+            elif action in {'BUY','ADD'} and reason not in {'MARKET_CLOSED','OUTSIDE_KR_REGULAR','WEEKEND','HOLIDAY'}:
+                _arcpro_notify_failure(evt, reason, urgent=False)
+        save_state()
+        return {'ok': ok, 'reason': reason, 'row': row}
+    except Exception as e:
+        set_error(f'Arc-pro paper engine error: {e}')
+        _arcpro_event_record(evt, 'ENGINE_ERROR', str(e))
+        save_state()
+        try:
+            _arcpro_notify_failure(evt, f'ENGINE_ERROR:{e}', urgent=evt.get('action') == 'SELL')
+        except Exception:
+            pass
+        return {'ok': False, 'reason': f'ENGINE_ERROR:{e}'}
+
+
+def arcpro_status_snapshot():
+    ensure_arcpro_paper_state()
+    update_arcpro_paper_asset(False)
+    with LOCK:
+        st = S['arcpro_paper']
+        return {
+            'ok': True, 'version': OPERATING_VERSION, 'paper_only': True,
+            'real_order_enabled': bool(ENABLE_REAL_ORDER),
+            'start_cash': int(to_float(st.get('start_cash',0))), 'cash': int(to_float(st.get('cash',0))),
+            'asset': int(to_float(st.get('asset',0))), 'profit_rate': round(to_float(st.get('profit_rate',0)),6),
+            'realized_pl': int(to_float(st.get('realized_pl',0))), 'positions': json.loads(json.dumps(st.get('positions',{}))),
+            'paused_new_buys': bool(st.get('paused_new_buys')), 'failed_sell': json.loads(json.dumps(st.get('failed_sell'))),
+            'last_action': st.get('last_action',''), 'last_event': json.loads(json.dumps(st.get('last_event',{}))),
+            'recent_events': json.loads(json.dumps(st.get('recent_events',[])[:20])),
+            'rules': {'reserve_ratio': ARC_PAPER_RESERVE_RATIO, 'buy_target_ratio': ARC_PAPER_BUY_TARGET_RATIO,
+                      'add_max_ratio': ARC_PAPER_ADD_MAX_RATIO, 'add_step_ratio': ARC_PAPER_ADD_STEP_RATIO,
+                      'partial_ratio': ARC_PAPER_PARTIAL_RATIO, 'fee_side_pct': ARC_PAPER_FEE_SIDE_PCT}
+        }
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -5314,6 +5667,8 @@ class Handler(BaseHTTPRequestHandler):
             if not os.path.isfile(p):
                 p, _ = create_us_backup_zip()
             return self.download_file(p, os.path.basename(p), 'application/zip')
+        if path == '/arcpro_status':
+            return self.json_response(arcpro_status_snapshot())
         if path == '/health':
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
@@ -5341,9 +5696,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(length)
             evt = parse_arcpro_webhook_body(raw)
+            evt['event_id'] = arcpro_event_id(evt)
             record_arcpro_webhook(evt)
-            # Important: V5.01 only receives and records. It never calls a real-order API.
-            return self.json_response({'ok': True, 'paper_only': True, 'received': evt}, status=200)
+            # TradingView에는 즉시 200을 반환하고, 가상체결은 별도 스레드에서 수행한다.
+            threading.Thread(target=process_arcpro_paper_event, args=(dict(evt),), daemon=True).start()
+            return self.json_response({'ok': True, 'paper_only': True, 'queued': True, 'event_id': evt['event_id'], 'received': evt}, status=200)
         except ValueError as e:
             return self.json_response({'ok': False, 'error': str(e)}, status=400)
         except Exception as e:
@@ -5472,6 +5829,7 @@ def print_core_selfcheck():
     print('version=', OPERATING_VERSION, flush=True)
     print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS), flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
+    print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
     storage = storage_selfcheck()
     print('storage=', storage, flush=True)
     if not storage.get('writable'):
