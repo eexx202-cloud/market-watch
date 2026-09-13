@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_08_TOSS_OFFICIAL_SERVER_READY_PAPER_LAB'
+OPERATING_VERSION = 'OPERATING_V5_09_DAILY_RESEARCH_REPORT_SERVER_READY_PAPER_LAB'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -118,7 +118,7 @@ REQUIRE_FRESH_ORDERBOOK_FOR_PAPER = os.environ.get('REQUIRE_FRESH_ORDERBOOK_FOR_
 PAPER_BLOCKED_SYMBOLS = {x.strip() for x in os.environ.get('PAPER_BLOCKED_SYMBOLS', '0193W0').split(',') if x.strip()}
 FULL_MARKET_BLOCKED_SYMBOLS = FULL_MARKET_BLOCKED_SYMBOLS_BASE | PAPER_BLOCKED_SYMBOLS
 
-# V5.08: Toss Open API 1.2.13 공식 스펙 + 서버 중복호출 방지 + 프리마켓↔정규장 PAPER LAB.
+# V5.09: Toss Open API 1.2.13 + 프리마켓↔정규장 PAPER LAB + 장마감 자동 연구리포트.
 # 실주문은 계속 완전 차단한다. 목표수익은 보장값이 아니라 PAPER 검증 목표다.
 PROJECT_PAPER_LAB_ENABLED = os.environ.get('PROJECT_PAPER_LAB_ENABLED', 'true').lower() == 'true'
 PROJECT_MONTHLY_TARGET_PCT = float(os.environ.get('PROJECT_MONTHLY_TARGET_PCT', '30.0'))
@@ -149,6 +149,10 @@ PROJECT_REGULAR_SURGE_MIN_SCORE = float(os.environ.get('PROJECT_REGULAR_SURGE_MI
 PROJECT_CONTINUATION_MIN_SCORE = float(os.environ.get('PROJECT_CONTINUATION_MIN_SCORE', '60.0'))
 PROJECT_PREMARKET_FADE_BLOCK_PCT = float(os.environ.get('PROJECT_PREMARKET_FADE_BLOCK_PCT', '-1.5'))
 PROJECT_PREMARKET_STRONG_CHANGE_PCT = float(os.environ.get('PROJECT_PREMARKET_STRONG_CHANGE_PCT', '3.0'))
+PROJECT_REPORT_ENABLED = os.environ.get('PROJECT_REPORT_ENABLED', 'true').lower() == 'true'
+PROJECT_REPORT_TIME = os.environ.get('PROJECT_REPORT_TIME', '15:25')
+PROJECT_REPORT_SURGE_PCT = float(os.environ.get('PROJECT_REPORT_SURGE_PCT', '10.0'))
+PROJECT_REPORT_TARGET_LEVELS = (1.4, 2.0, 3.0, 5.0)
 PROJECT_SCANNER_THREAD = None
 FULL_MARKET_SCAN_LOCK = threading.RLock()
 PROJECT_SCANNER_HEARTBEAT_TS = 0.0
@@ -636,6 +640,12 @@ def project_candidate_event_path():
 
 def project_daily_summary_path():
     return os.path.join(project_research_dir(), f'project_summary_{today()}.json')
+
+def project_daily_summary_csv_path():
+    return os.path.join(project_research_dir(), f'project_summary_{today()}.csv')
+
+def project_missed_surge_path():
+    return os.path.join(project_research_dir(), f'missed_surges_{today()}.csv')
 
 def candle_1m_path(sym):
     return os.path.join(market_data_dir(), f'candles_1m_{sym}_{today()}.csv')
@@ -2247,6 +2257,128 @@ def project_write_candidate_event(ai_id, sym, metric, reason, event='CANDIDATE')
         return
     write_row(project_candidate_event_path(), ['time','event','ai_id','strategy','symbol','name','metric','price','reason'], {'time': now_text(), 'event': event, 'ai_id': ai_id, 'strategy': MULTI_AI_NAMES.get(ai_id,ai_id), 'symbol': sym, 'name': name_of(sym) if sym else '', 'metric': round(to_float(metric),4), 'price': to_float(S.get('prices',{}).get(sym,0)) if sym else 0, 'reason': str(reason)[:1500]})
 
+def _project_parse_time(value):
+    try:
+        return datetime.strptime(str(value), '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
+
+
+def _project_read_research_snapshots():
+    return _read_csv_rows(project_market_snapshot_path())
+
+
+def _project_g_trade_rows(ai_id):
+    return [r for r in _read_csv_rows(multi_ai_path(ai_id)) if str(r.get('time','')).startswith(today())]
+
+
+def _project_strategy_report(ai_id):
+    rows = _project_g_trade_rows(ai_id)
+    buys = [r for r in rows if str(r.get('action','')) == '가상매수']
+    sells = [r for r in rows if str(r.get('action','')) == '가상매도']
+    pls = [to_float(r.get('pl',0)) for r in sells]
+    wins = [x for x in pls if x > 0]
+    losses = [x for x in pls if x < 0]
+    mfe = [to_float(r.get('mfe_pct',0)) for r in sells if str(r.get('mfe_pct','')).strip() not in {'','None'}]
+    mae = [to_float(r.get('mae_pct',0)) for r in sells if str(r.get('mae_pct','')).strip() not in {'','None'}]
+    holds = [to_float(r.get('hold_sec',0)) for r in sells if str(r.get('hold_sec','')).strip() not in {'','None'}]
+    gross_win = sum(wins); gross_loss = abs(sum(losses))
+    with LOCK:
+        st = dict(S.get('paper_ais',{}).get(ai_id,{}) or {})
+    start_cash = max(1.0, to_float(st.get('start_cash', MULTI_AI_START_CASH)))
+    realized = sum(pls)
+    return {
+        'ai_id': ai_id, 'name': MULTI_AI_NAMES.get(ai_id, ai_id),
+        'buy_count': len(buys), 'sell_count': len(sells),
+        'wins': len(wins), 'losses': len(losses),
+        'win_rate_pct': round(len(wins) / len(sells) * 100.0, 2) if sells else 0.0,
+        'realized_pl': int(round(realized)), 'realized_pct': round(realized / start_cash * 100.0, 4),
+        'avg_win': round(sum(wins)/len(wins), 2) if wins else 0.0,
+        'avg_loss': round(sum(losses)/len(losses), 2) if losses else 0.0,
+        'profit_factor': round(gross_win/gross_loss, 4) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0),
+        'mdd_pct': round(to_float(st.get('mdd_pct',0)), 4),
+        'avg_mfe_pct': round(sum(mfe)/len(mfe), 4) if mfe else 0.0,
+        'avg_mae_pct': round(sum(mae)/len(mae), 4) if mae else 0.0,
+        'avg_hold_sec': round(sum(holds)/len(holds), 1) if holds else 0.0,
+        'target_hits': {str(level): sum(1 for x in mfe if x >= level) for level in PROJECT_REPORT_TARGET_LEVELS},
+    }
+
+
+def generate_project_daily_report(force=False):
+    """장마감 연구리포트. 수익뿐 아니라 프리마켓→정규장 전이, 놓친 급등, G01~G05 청산차이를 남긴다."""
+    if not PROJECT_REPORT_ENABLED or not PROJECT_RESEARCH_SAVE_ENABLED:
+        return None
+    hhmm = now_kst().strftime('%H:%M')
+    st = _project_state()
+    if not force and hhmm < PROJECT_REPORT_TIME:
+        return None
+    if not force and st.get('last_report_date') == today() and time.time() - to_float(st.get('last_report_ts',0)) < 900:
+        return st.get('last_report_path')
+    snapshots = _project_read_research_snapshots()
+    symbols = {}
+    for r in snapshots:
+        sym = str(r.get('symbol','')).strip()
+        if not sym:
+            continue
+        d = symbols.setdefault(sym, {'symbol': sym, 'name': r.get('name',''), 'pre_max': -999.0, 'reg_max': -999.0, 'reg_min': 999.0, 'max_change': -999.0, 'pre_samples':0, 'reg_samples':0, 'signal_types':set(), 'max_score':-999.0})
+        chg = to_float(r.get('change_pct',0)); score = to_float(r.get('project_score',0)); sess = str(r.get('session',''))
+        d['max_change'] = max(d['max_change'], chg); d['max_score'] = max(d['max_score'], score)
+        d['signal_types'].add(str(r.get('signal_type','')))
+        if sess in {'PREMARKET','PREMARKET_AUCTION'}:
+            d['pre_samples'] += 1; d['pre_max'] = max(d['pre_max'], chg)
+        elif sess in {'OPEN_FAST','REGULAR','REGULAR_LATE'}:
+            d['reg_samples'] += 1; d['reg_max'] = max(d['reg_max'], chg); d['reg_min'] = min(d['reg_min'], chg)
+    bought_symbols = set()
+    for ai_id in [f'G{i:02d}' for i in range(1,6)]:
+        for r in _project_g_trade_rows(ai_id):
+            if str(r.get('action','')) == '가상매수':
+                bought_symbols.add(str(r.get('symbol','')).strip())
+    actual_surges = []
+    missed = []
+    transition = {'pre_strong_count':0,'pre_to_regular_continuation_count':0,'pre_to_regular_fade_count':0,'regular_new_surge_count':0}
+    for sym,d in symbols.items():
+        pre_strong = d['pre_samples'] > 0 and d['pre_max'] >= PROJECT_PREMARKET_STRONG_CHANGE_PCT
+        continuation = pre_strong and d['reg_samples'] > 0 and d['reg_max'] >= max(PROJECT_PREMARKET_STRONG_CHANGE_PCT, d['pre_max'] - 1.0)
+        fade = pre_strong and d['reg_samples'] > 0 and d['reg_min'] <= d['pre_max'] + PROJECT_PREMARKET_FADE_BLOCK_PCT
+        regular_new = d['reg_samples'] > 0 and (d['pre_samples'] == 0 or d['pre_max'] < PROJECT_PREMARKET_STRONG_CHANGE_PCT) and d['reg_max'] >= PROJECT_REPORT_SURGE_PCT
+        if pre_strong: transition['pre_strong_count'] += 1
+        if continuation: transition['pre_to_regular_continuation_count'] += 1
+        if fade: transition['pre_to_regular_fade_count'] += 1
+        if regular_new: transition['regular_new_surge_count'] += 1
+        if d['max_change'] >= PROJECT_REPORT_SURGE_PCT:
+            item = {'symbol':sym,'name':d['name'],'max_change_pct':round(d['max_change'],4),'pre_max_change_pct':round(d['pre_max'],4) if d['pre_samples'] else '', 'regular_max_change_pct':round(d['reg_max'],4) if d['reg_samples'] else '', 'max_project_score':round(d['max_score'],4),'caught_by_g':sym in bought_symbols,'signal_types':'|'.join(sorted(x for x in d['signal_types'] if x))}
+            actual_surges.append(item)
+            if sym not in bought_symbols: missed.append(item)
+    actual_surges.sort(key=lambda x: to_float(x.get('max_change_pct',0)), reverse=True)
+    missed.sort(key=lambda x: to_float(x.get('max_change_pct',0)), reverse=True)
+    strategies = [_project_strategy_report(f'G{i:02d}') for i in range(1,6)]
+    ranked_strategies = sorted(strategies, key=lambda x: (x['realized_pct'], x['profit_factor'], -abs(x['mdd_pct'])), reverse=True)
+    transition['pre_continuation_rate_pct'] = round(transition['pre_to_regular_continuation_count']/transition['pre_strong_count']*100.0,2) if transition['pre_strong_count'] else 0.0
+    transition['pre_fade_rate_pct'] = round(transition['pre_to_regular_fade_count']/transition['pre_strong_count']*100.0,2) if transition['pre_strong_count'] else 0.0
+    report = {
+        'date': today(), 'generated_at': now_text(), 'version': OPERATING_VERSION,
+        'paper_only': PAPER_ONLY_MODE, 'surge_definition_pct': PROJECT_REPORT_SURGE_PCT,
+        'snapshot_rows': len(snapshots), 'symbols_observed': len(symbols),
+        'transition': transition,
+        'actual_surge_count': len(actual_surges), 'caught_surge_count': len(actual_surges)-len(missed), 'missed_surge_count': len(missed),
+        'surge_capture_rate_pct': round((len(actual_surges)-len(missed))/len(actual_surges)*100.0,2) if actual_surges else 0.0,
+        'strategies': strategies,
+        'best_strategy_today': ranked_strategies[0]['ai_id'] if ranked_strategies else '',
+        'actual_surges': actual_surges[:100], 'missed_surges': missed[:100],
+        'notes': ['급등 판정은 저장된 전체시장 상위 연구스냅샷 기준이므로 시장 전 종목 완전관측과 동일하지 않음', 'MFE/MAE는 PAPER 진입 후 코드가 추적한 가격 기준', '첫날 결과만으로 전략을 확정하지 않고 누적 표본으로 비교'],
+    }
+    _atomic_json_write(project_daily_summary_path(), report)
+    csv_headers = ['date','ai_id','name','buy_count','sell_count','wins','losses','win_rate_pct','realized_pl','realized_pct','avg_win','avg_loss','profit_factor','mdd_pct','avg_mfe_pct','avg_mae_pct','avg_hold_sec','hit_1_4','hit_2_0','hit_3_0','hit_5_0']
+    rows=[]
+    for x in strategies:
+        rows.append({'date':today(), **{k:x.get(k,'') for k in csv_headers if k not in {'date','hit_1_4','hit_2_0','hit_3_0','hit_5_0'}}, 'hit_1_4':x['target_hits'].get('1.4',0),'hit_2_0':x['target_hits'].get('2.0',0),'hit_3_0':x['target_hits'].get('3.0',0),'hit_5_0':x['target_hits'].get('5.0',0)})
+    _rewrite_csv(project_daily_summary_csv_path(), csv_headers, rows)
+    missed_headers=['symbol','name','max_change_pct','pre_max_change_pct','regular_max_change_pct','max_project_score','caught_by_g','signal_types']
+    _rewrite_csv(project_missed_surge_path(), missed_headers, missed)
+    st['last_report_date']=today(); st['last_report_ts']=time.time(); st['last_report_path']=project_daily_summary_path(); st['last_report']={'surge_capture_rate_pct':report['surge_capture_rate_pct'],'best_strategy_today':report['best_strategy_today'],'missed_surge_count':report['missed_surge_count']}
+    return project_daily_summary_path()
+
+
 def _project_disk_usage():
     try:
         total, used, free = shutil.disk_usage(PERSISTENT_DISK_MOUNT_PATH if os.path.exists(PERSISTENT_DISK_MOUNT_PATH) else LOG_ROOT)
@@ -2373,15 +2505,19 @@ def _multi_ai_update(ai_id):
         st['peak_asset'] = peak
         st['mdd_pct'] = min(to_float(st.get('mdd_pct', 0)), pct(asset, peak) if peak else 0)
 
-def _multi_ai_record(ai_id, action, sym, price, qty, fee, pl, reason, partial=False):
+def _multi_ai_record(ai_id, action, sym, price, qty, fee, pl, reason, partial=False, extras=None):
     _multi_ai_update(ai_id)
     with LOCK:
         st = S['paper_ais'][ai_id]
-        row = {'time': now_text(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'action': action, 'symbol': sym, 'name': name_of(sym), 'price': round(to_float(price), 4), 'qty': int(qty), 'fee': int(fee), 'pl': int(pl), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 4), 'reason': reason, 'partial': bool(partial), 'real_order': False}
+        row = {'time': now_text(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'action': action, 'symbol': sym, 'name': name_of(sym), 'price': round(to_float(price), 4), 'qty': int(qty), 'fee': int(fee), 'pl': int(pl), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 4), 'reason': reason, 'partial': bool(partial), 'real_order': False, 'mfe_pct': '', 'mae_pct': '', 'hold_sec': '', 'entry_reason': ''}
+        if isinstance(extras, dict):
+            for k in ('mfe_pct','mae_pct','hold_sec','entry_reason'):
+                if k in extras:
+                    row[k] = extras.get(k)
         st.setdefault('trades', []).insert(0, row)
         st['trades'] = st['trades'][:200]
         st['last_action'] = f'{now_short()} {action} {name_of(sym)}'
-    write_row(multi_ai_path(ai_id), ['time', 'ai_id', 'ai_name', 'action', 'symbol', 'name', 'price', 'qty', 'fee', 'pl', 'cash', 'asset', 'profit_rate', 'reason', 'partial', 'real_order'], row)
+    write_row(multi_ai_path(ai_id), ['time', 'ai_id', 'ai_name', 'action', 'symbol', 'name', 'price', 'qty', 'fee', 'pl', 'cash', 'asset', 'profit_rate', 'reason', 'partial', 'real_order', 'mfe_pct', 'mae_pct', 'hold_sec', 'entry_reason'], row)
     save_state()
 
 def _multi_ai_buy(ai_id, sym, reason, ratio=None):
@@ -2417,7 +2553,7 @@ def _multi_ai_buy(ai_id, sym, reason, ratio=None):
     with LOCK:
         st = S['paper_ais'][ai_id]
         st['cash'] = cash - total
-        st['positions'][sym] = {'qty': qty, 'avg': price, 'entry_time': now_text(), 'entry_date': today(), 'entry_total_cost': total, 'entry_fee': fee, 'high_after_buy': price}
+        st['positions'][sym] = {'qty': qty, 'avg': price, 'entry_time': now_text(), 'entry_date': today(), 'entry_total_cost': total, 'entry_fee': fee, 'high_after_buy': price, 'low_after_buy': price, 'entry_reason': str(reason)[:1500]}
     _multi_ai_record(ai_id, '가상매수', sym, price, qty, fee, 0, reason, bool(fill.get('partial')))
     return True
 
@@ -2431,6 +2567,10 @@ def _multi_ai_sell(ai_id, sym, reason):
         qty = int(to_float(pos.get('qty', 0)))
         avg = to_float(pos.get('avg', 0))
         total_cost = int(to_float(pos.get('entry_total_cost', qty * avg)))
+        high_after_buy = max(avg, to_float(pos.get('high_after_buy', avg)))
+        low_after_buy = min(avg, to_float(pos.get('low_after_buy', avg)) or avg)
+        entry_time = str(pos.get('entry_time', ''))
+        entry_reason = str(pos.get('entry_reason', ''))
     gate_ok, _ = market_safety_gate(sym)
     if not gate_ok:
         return False
@@ -2455,7 +2595,18 @@ def _multi_ai_sell(ai_id, sym, reason):
             pos['qty'] = remain
             pos['entry_total_cost'] = max(0, total_cost - cost_part)
             st['positions'][sym] = pos
-    _multi_ai_record(ai_id, '가상매도', sym, price, sold, fee, pl, reason, remain > 0)
+    try:
+        et = datetime.strptime(entry_time, '%Y-%m-%d %H:%M:%S') if entry_time else None
+        hold_sec = max(0, int((now_kst().replace(tzinfo=None) - et).total_seconds())) if et else ''
+    except Exception:
+        hold_sec = ''
+    extras = {
+        'mfe_pct': round(pct(high_after_buy, avg), 4) if avg > 0 else '',
+        'mae_pct': round(pct(low_after_buy, avg), 4) if avg > 0 else '',
+        'hold_sec': hold_sec,
+        'entry_reason': entry_reason,
+    }
+    _multi_ai_record(ai_id, '가상매도', sym, price, sold, fee, pl, reason, remain > 0, extras)
     return True
 
 def _multi_ai_recent_metrics(sym):
@@ -2658,9 +2809,12 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
     if price <= 0 or avg <= 0:
         return ''
     high = max(to_float(pos.get('high_after_buy', avg)), price)
+    low0 = to_float(pos.get('low_after_buy', avg)) or avg
+    low = min(low0, price)
     with LOCK:
         if sym in S['paper_ais'][ai_id]['positions']:
             S['paper_ais'][ai_id]['positions'][sym]['high_after_buy'] = high
+            S['paper_ais'][ai_id]['positions'][sym]['low_after_buy'] = low
     profit = pct(price, avg)
     draw = pct(price, high)
     parent = _multi_ai_parent_id(logic_id)
@@ -5502,6 +5656,11 @@ def maybe_send_daily_backup():
             S.setdefault('market_data_capture', {})['status'] = 'MARKET_CLOSED_NO_BACKUP'
         return
     trade_date = today()
+    # V5.09: 백업 ZIP 생성 전에 최종 장마감 연구리포트를 강제 갱신해 함께 보존한다.
+    try:
+        generate_project_daily_report(force=True)
+    except Exception as e:
+        set_error(f'PROJECT 장마감 리포트 생성 오류: {e}')
     key = f'BACKUP_SENT_{trade_date}'
     attempt_key = key + '_ATTEMPT'
     completed_map = S.setdefault('kr_backup_completed', {})
@@ -5712,6 +5871,10 @@ def loop():
                             set_error(f'PROJECT 연구스냅샷 오류: {e}')
             except Exception as e:
                 set_error(f'가상매매 오류: {e}')
+            try:
+                generate_project_daily_report(False)
+            except Exception as e:
+                set_error(f'PROJECT 장마감 리포트 오류: {e}')
             try:
                 maybe_send_daily_backup()
             except Exception as e:
@@ -6373,7 +6536,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path == '/rescue_today':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
