@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_08_TOSS_OFFICIAL_SERVER_READY_PAPER_LAB'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -98,7 +98,7 @@ MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get('MULTI_AI_DECISION_COOLDOWN_
 RESEARCH_BASE_NAMES = {1: '연구고정 오전추세', 2: '연구고정 오전역추세', 3: '연구고정 오전돌파', 4: '연구고정 오전눌림', 5: '연구고정 09:15', 6: '연구고정 10:00', 7: '연구고정 11:00', 8: '연구고정 오후추세', 9: '연구고정 오후역추세', 10: '연구고정 오후돌파', 11: '연구고정 2구간', 12: '연구고정 저노출', 13: '연구고정 관망강화', 14: '연구고정 추적청산', 15: '연구고정 오버나이트'}
 WALK_BASE_NAMES = {1: '순방향 누적수익 1위', 2: '순방향 누적 상위3 분산', 3: '순방향 최근3일 1위', 4: '순방향 최근5일 1위', 5: '순방향 최근7일 1위', 6: '순방향 최근10일 1위', 7: '순방향 최근5일 위험조정', 8: '순방향 최근10일 위험조정', 9: '순방향 최소MDD', 10: '순방향 승률우선', 11: '순방향 수익MDD 혼합', 12: '순방향 50·30·20', 13: '순방향 단기역추세', 14: '순방향 지연추세', 15: '순방향 현금관망'}
 MULTI_AI_IDS = [f'RI{i:02d}' for i in range(1, 16)] + [f'RE{i:02d}' for i in range(1, 16)] + [f'WI{i:02d}' for i in range(1, 16)] + [f'WE{i:02d}' for i in range(1, 16)] + [f'G{i:02d}' for i in range(1, 6)] + [f'C{i:02d}' for i in range(1, 6)] + [f'L{i:02d}' for i in range(1, 6)] + [f'V{i:02d}' for i in range(1, 16)]
-MULTI_AI_NAMES = {**{f'RI{i:02d}': f'1그룹 포함형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'RE{i:02d}': f'1그룹 제외형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WI{i:02d}': f'2그룹 포함형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WE{i:02d}': f'2그룹 제외형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, 'G01': '전체시장 거래대금·돈몰림', 'G02': '전체시장 추세·돌파', 'G03': '전체시장 눌림목·재상승', 'G04': '전체시장 급락·반전', 'G05': '전체시장 종합자율', 'C01': '조합 오전인버스→오후레버리지', 'C02': '조합 오전인버스→오후인버스', 'C03': '조합 11:30 방향전환', 'C04': '조합 삼성·하이닉스 포함 자율', 'C05': '조합 삼성·하이닉스 제외 자율', 'L01': '학습 직전5일 최근가중 1위', 'L02': '학습 직전5일 최근가중 상위3', 'L03': '학습 직전7일 수익 1위', 'L04': '학습 직전5일 수익·MDD 균형', 'L05': '학습 비용·낙폭 방어형', 'V01': '검증 4천만원 하루2회 494310·252670', 'V02': '검증 미래변수제거 하루2회', 'V03': '검증 1억원대 삼성·하이닉스 4종목', 'V04': '일봉 삼성·하이닉스·KODEX200 MA10 완전합의', 'V05': '일봉방향 + 장중 눌림 재진입', 'V06': '일봉방향 + 같은 방향 상대강도 1위', 'V07': '삼성전자·SK하이닉스 장중 방향합의', 'V08': '관망강화 데이터·혼조 필터', 'V09': '고정 09:15 진입 60분 보유', 'V10': '고정 10:00 진입 90분 보유', 'V11': '고정 11:00 진입 90분 보유', 'V12': '11시 방향합의 90분 보유', 'V13': '오버나이트 15:10 진입 다음날 09:05 청산', 'V14': '하루 최대4회 방향추종', 'V15': '장중 방향전환·재진입 2회'}
+MULTI_AI_NAMES = {**{f'RI{i:02d}': f'1그룹 포함형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'RE{i:02d}': f'1그룹 제외형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WI{i:02d}': f'2그룹 포함형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WE{i:02d}': f'2그룹 제외형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, 'G01': '급등LAB 고정 TP1.0 SL0.5', 'G02': '급등LAB 고정 TP1.4 SL0.7', 'G03': '급등LAB 고정 TP2.0 SL0.7', 'G04': '급등LAB 고정 TP2.5 SL0.8', 'G05': '급등LAB 자동 변동성적응', 'C01': '조합 오전인버스→오후레버리지', 'C02': '조합 오전인버스→오후인버스', 'C03': '조합 11:30 방향전환', 'C04': '조합 삼성·하이닉스 포함 자율', 'C05': '조합 삼성·하이닉스 제외 자율', 'L01': '학습 직전5일 최근가중 1위', 'L02': '학습 직전5일 최근가중 상위3', 'L03': '학습 직전7일 수익 1위', 'L04': '학습 직전5일 수익·MDD 균형', 'L05': '학습 비용·낙폭 방어형', 'V01': '검증 4천만원 하루2회 494310·252670', 'V02': '검증 미래변수제거 하루2회', 'V03': '검증 1억원대 삼성·하이닉스 4종목', 'V04': '일봉 삼성·하이닉스·KODEX200 MA10 완전합의', 'V05': '일봉방향 + 장중 눌림 재진입', 'V06': '일봉방향 + 같은 방향 상대강도 1위', 'V07': '삼성전자·SK하이닉스 장중 방향합의', 'V08': '관망강화 데이터·혼조 필터', 'V09': '고정 09:15 진입 60분 보유', 'V10': '고정 10:00 진입 90분 보유', 'V11': '고정 11:00 진입 90분 보유', 'V12': '11시 방향합의 90분 보유', 'V13': '오버나이트 15:10 진입 다음날 09:05 청산', 'V14': '하루 최대4회 방향추종', 'V15': '장중 방향전환·재진입 2회'}
 MULTI_AI_GROUP = {**{f'RI{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'RE{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'WI{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'WE{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET_LIVE' for i in range(1, 6)}, **{f'C{i:02d}': 'INTRADAY_COMBO' for i in range(1, 6)}, **{f'L{i:02d}': 'DAILY_LEARNING' for i in range(1, 6)}, **{f'V{i:02d}': 'EXPANDED_VERIFIED_RULE' for i in range(1, 16)}}
 MULTI_AI_UNIVERSE = {**{f'RI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'RE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'C01': 'INCLUDE_SAMSUNG_HYNIX', 'C02': 'INCLUDE_SAMSUNG_HYNIX', 'C03': 'INCLUDE_SAMSUNG_HYNIX', 'C04': 'INCLUDE_SAMSUNG_HYNIX', 'C05': 'EXCLUDE_SAMSUNG_HYNIX', **{f'L{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'V01': 'VERIFIED_494310_252670', 'V02': 'VERIFIED_494310_252670', 'V03': 'VERIFIED_SAMSUNG_HYNIX_4', **{f'V{i:02d}': 'ALL26_PAPER' for i in range(4, 16)}}
 MULTI_AI_PARENT = {**{f'RI{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'RE{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'WI{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'WE{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'G{i:02d}': f'G{i:02d}' for i in range(1, 6)}, **{f'C{i:02d}': f'C{i:02d}' for i in range(1, 6)}, **{f'L{i:02d}': f'L{i:02d}' for i in range(1, 6)}, **{f'V{i:02d}': f'V{i:02d}' for i in range(1, 16)}}
@@ -117,6 +117,50 @@ MAX_ORDERBOOK_AGE_SEC = int(os.environ.get('MAX_ORDERBOOK_AGE_SEC', '90'))
 REQUIRE_FRESH_ORDERBOOK_FOR_PAPER = os.environ.get('REQUIRE_FRESH_ORDERBOOK_FOR_PAPER', 'true').lower() == 'true'
 PAPER_BLOCKED_SYMBOLS = {x.strip() for x in os.environ.get('PAPER_BLOCKED_SYMBOLS', '0193W0').split(',') if x.strip()}
 FULL_MARKET_BLOCKED_SYMBOLS = FULL_MARKET_BLOCKED_SYMBOLS_BASE | PAPER_BLOCKED_SYMBOLS
+
+# V5.08: Toss Open API 1.2.13 공식 스펙 + 서버 중복호출 방지 + 프리마켓↔정규장 PAPER LAB.
+# 실주문은 계속 완전 차단한다. 목표수익은 보장값이 아니라 PAPER 검증 목표다.
+PROJECT_PAPER_LAB_ENABLED = os.environ.get('PROJECT_PAPER_LAB_ENABLED', 'true').lower() == 'true'
+PROJECT_MONTHLY_TARGET_PCT = float(os.environ.get('PROJECT_MONTHLY_TARGET_PCT', '30.0'))
+PROJECT_DAILY_SOFT_TARGET_PCT = float(os.environ.get('PROJECT_DAILY_SOFT_TARGET_PCT', '1.4'))
+PROJECT_DAILY_MAX_LOSS_PCT = float(os.environ.get('PROJECT_DAILY_MAX_LOSS_PCT', '-1.4'))
+PROJECT_MAX_DAILY_TRADES = max(1, min(5, int(os.environ.get('PROJECT_MAX_DAILY_TRADES', '2'))))
+PROJECT_STOP_AFTER_DAILY_TARGET = os.environ.get('PROJECT_STOP_AFTER_DAILY_TARGET', 'true').lower() == 'true'
+PROJECT_ENTRY_MIN_SCORE = float(os.environ.get('PROJECT_ENTRY_MIN_SCORE', '58.0'))
+PROJECT_OPENING_START = os.environ.get('PROJECT_OPENING_START', '09:00')
+PROJECT_OPENING_FAST_END = os.environ.get('PROJECT_OPENING_FAST_END', '09:20')
+PROJECT_PRIMARY_ENTRY_END = os.environ.get('PROJECT_PRIMARY_ENTRY_END', '10:30')
+PROJECT_LAST_ENTRY = os.environ.get('PROJECT_LAST_ENTRY', '14:40')
+PROJECT_PREMARKET_START = os.environ.get('PROJECT_PREMARKET_START', '08:00')
+PROJECT_PREMARKET_END = os.environ.get('PROJECT_PREMARKET_END', '09:00')
+PROJECT_PREMARKET_AUCTION_FALLBACK = os.environ.get('PROJECT_PREMARKET_AUCTION_FALLBACK', '08:50')
+PROJECT_RESEARCH_TOP_N = max(20, min(100, int(os.environ.get('PROJECT_RESEARCH_TOP_N', '100'))))
+PROJECT_RESEARCH_SNAPSHOT_SEC = max(30, int(os.environ.get('PROJECT_RESEARCH_SNAPSHOT_SEC', '60')))
+PROJECT_SCAN_OPEN_SEC = max(5, int(os.environ.get('PROJECT_SCAN_OPEN_SEC', '10')))
+PROJECT_SCAN_DAY_SEC = max(15, int(os.environ.get('PROJECT_SCAN_DAY_SEC', '30')))
+PROJECT_SCAN_PREMARKET_SEC = max(15, int(os.environ.get('PROJECT_SCAN_PREMARKET_SEC', '30')))
+PROJECT_LOCAL_KEEP_DAYS = max(2, min(7, int(os.environ.get('PROJECT_LOCAL_KEEP_DAYS', '3'))))
+PROJECT_STORAGE_WARN_PCT = max(50.0, min(90.0, float(os.environ.get('PROJECT_STORAGE_WARN_PCT', '70'))))
+PROJECT_STORAGE_CLEAN_PCT = max(PROJECT_STORAGE_WARN_PCT, min(95.0, float(os.environ.get('PROJECT_STORAGE_CLEAN_PCT', '80'))))
+PROJECT_STORAGE_CRITICAL_PCT = max(PROJECT_STORAGE_CLEAN_PCT, min(98.0, float(os.environ.get('PROJECT_STORAGE_CRITICAL_PCT', '90'))))
+PROJECT_RESEARCH_SAVE_ENABLED = os.environ.get('PROJECT_RESEARCH_SAVE_ENABLED', 'true').lower() == 'true'
+PROJECT_SCANNER_WORKER_ENABLED = os.environ.get('PROJECT_SCANNER_WORKER_ENABLED', 'true').lower() == 'true'
+PROJECT_REGULAR_SURGE_MIN_SCORE = float(os.environ.get('PROJECT_REGULAR_SURGE_MIN_SCORE', '58.0'))
+PROJECT_CONTINUATION_MIN_SCORE = float(os.environ.get('PROJECT_CONTINUATION_MIN_SCORE', '60.0'))
+PROJECT_PREMARKET_FADE_BLOCK_PCT = float(os.environ.get('PROJECT_PREMARKET_FADE_BLOCK_PCT', '-1.5'))
+PROJECT_PREMARKET_STRONG_CHANGE_PCT = float(os.environ.get('PROJECT_PREMARKET_STRONG_CHANGE_PCT', '3.0'))
+PROJECT_SCANNER_THREAD = None
+FULL_MARKET_SCAN_LOCK = threading.RLock()
+PROJECT_SCANNER_HEARTBEAT_TS = 0.0
+
+# 같은 진입후보를 서로 다른 청산법으로 비교한다.
+PROJECT_G_EXIT_PROFILES = {
+    'G01': {'name': '고정 TP1.0 SL0.5', 'tp': 1.0, 'sl': -0.5, 'trail_start': 999.0, 'trail': -99.0},
+    'G02': {'name': '고정 TP1.4 SL0.7', 'tp': 1.4, 'sl': -0.7, 'trail_start': 999.0, 'trail': -99.0},
+    'G03': {'name': '고정 TP2.0 SL0.7', 'tp': 2.0, 'sl': -0.7, 'trail_start': 999.0, 'trail': -99.0},
+    'G04': {'name': '고정 TP2.5 SL0.8', 'tp': 2.5, 'sl': -0.8, 'trail_start': 999.0, 'trail': -99.0},
+    'G05': {'name': '자동 변동성적응', 'tp': None, 'sl': None, 'trail_start': 1.0, 'trail': -0.55},
+}
 ENABLE_TOSS_MARKET_DATA_CAPTURE = os.environ.get('ENABLE_TOSS_MARKET_DATA_CAPTURE', 'true').lower() == 'true'
 MARKET_DATA_CANDLE_SEC = int(os.environ.get('MARKET_DATA_CANDLE_SEC', '60'))
 MARKET_DATA_ORDERFLOW_SEC = int(os.environ.get('MARKET_DATA_ORDERFLOW_SEC', '30'))
@@ -174,6 +218,7 @@ US_METADATA_REFRESH_SEC = max(3600, int(os.environ.get('US_METADATA_REFRESH_SEC'
 US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))
 TOSS_OPENAPI_SPEC_VERSION = '1.2.13'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
+TOSS_MARKET_DATA_TRANSPORT = 'REST_POLLING'  # 공식 1.2.13: WebSocket은 추후 지원 예정
 MARKET_MODE = 'KR_US_PAPER_ONLY'
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_START_MIN', '2')))
 KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_END_MIN', '15')))
@@ -360,7 +405,20 @@ def refresh_kr_market_calendar(force=False):
     today_info = result.get('today', {}) if isinstance(result, dict) else {}
     integrated = today_info.get('integrated') if isinstance(today_info, dict) else None
     regular = integrated.get('regularMarket') if isinstance(integrated, dict) else None
-    state['calendar'] = {'date': str(today_info.get('date', '')) if isinstance(today_info, dict) else '', 'is_business_day': bool(regular), 'regular_start': str(regular.get('startTime', '')) if isinstance(regular, dict) else '', 'regular_end': str(regular.get('endTime', '')) if isinstance(regular, dict) else '', 'auction_start': str(regular.get('singlePriceAuctionStartTime', '')) if isinstance(regular, dict) else ''}
+    pre = integrated.get('preMarket') if isinstance(integrated, dict) else None
+    after = integrated.get('afterMarket') if isinstance(integrated, dict) else None
+    state['calendar'] = {
+        'date': str(today_info.get('date', '')) if isinstance(today_info, dict) else '',
+        'is_business_day': bool(integrated),
+        'pre_start': str(pre.get('startTime', '')) if isinstance(pre, dict) else '',
+        'pre_auction_start': str(pre.get('singlePriceAuctionStartTime', '')) if isinstance(pre, dict) else '',
+        'pre_end': str(pre.get('endTime', '')) if isinstance(pre, dict) else '',
+        'regular_start': str(regular.get('startTime', '')) if isinstance(regular, dict) else '',
+        'regular_end': str(regular.get('endTime', '')) if isinstance(regular, dict) else '',
+        'auction_start': str(regular.get('singlePriceAuctionStartTime', '')) if isinstance(regular, dict) else '',
+        'after_start': str(after.get('startTime', '')) if isinstance(after, dict) else '',
+        'after_end': str(after.get('endTime', '')) if isinstance(after, dict) else '',
+    }
     cal = state['calendar']
     if not cal.get('date') or cal.get('date') != today():
         state['gate_ok'] = False
@@ -564,6 +622,20 @@ def market_data_dir():
     path = os.path.join(day_dir(), 'market_data')
     os.makedirs(path, exist_ok=True)
     return path
+
+def project_research_dir():
+    path = os.path.join(day_dir(), 'project_research')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def project_market_snapshot_path():
+    return os.path.join(project_research_dir(), f'full_market_1m_{today()}.csv')
+
+def project_candidate_event_path():
+    return os.path.join(project_research_dir(), f'candidate_events_{today()}.csv')
+
+def project_daily_summary_path():
+    return os.path.join(project_research_dir(), f'project_summary_{today()}.json')
 
 def candle_1m_path(sym):
     return os.path.join(market_data_dir(), f'candles_1m_{sym}_{today()}.csv')
@@ -1716,7 +1788,7 @@ def load_full_market_universe(force=False):
     """
     state = S.setdefault('full_market', {})
     now_ts = time.time()
-    if state.get('universe') and (not force) and (now_ts - to_float(state.get('stock_master_checked_at', 0)) < FULL_MARKET_SCAN_INTERVAL_SEC):
+    if state.get('universe') and (not force) and (now_ts - to_float(state.get('stock_master_checked_at', 0)) < (_project_scan_interval_sec() if PROJECT_PAPER_LAB_ENABLED else FULL_MARKET_SCAN_INTERVAL_SEC)):
         return state['universe']
     merged = {}
     errors = []
@@ -1782,13 +1854,16 @@ def _quote_field(item, keys, default=0.0):
             return to_float(item.get(k), default)
     return default
 
-def scan_full_market_universe(force=False):
-    """토스 전체시장 랭킹 후보를 실시간 가격으로 보강해 3그룹 순위를 만든다."""
+def _scan_full_market_universe_impl(force=False):
+    """토스 전체시장 랭킹 후보를 현재가로 보강한다.
+    REST 폴링 전용이며(공식 1.2.13 WebSocket 미지원), 중복 스레드 호출은 전역 lock으로 직렬화한다.
+    """
     state = S.setdefault('full_market', {})
     if not ENABLE_FULL_MARKET_SCANNER:
         state['status'] = '전체시장 스캐너 OFF'
         return False
-    if not force and time.time() - to_float(state.get('last_scan_ts', 0)) < FULL_MARKET_SCAN_INTERVAL_SEC:
+    scan_interval = _project_scan_interval_sec() if PROJECT_PAPER_LAB_ENABLED else FULL_MARKET_SCAN_INTERVAL_SEC
+    if not force and time.time() - to_float(state.get('last_scan_ts', 0)) < scan_interval:
         return bool(state.get('ranked'))
     universe = load_full_market_universe(force)
     symbols = list(universe)
@@ -1837,7 +1912,7 @@ def scan_full_market_universe(force=False):
     for sym, q in state.get('quotes', {}).items():
         if sym not in universe or sym in FULL_MARKET_BLOCKED_SYMBOLS:
             continue
-        if data_age_seconds(q.get('timestamp')) > max(MAX_PRICE_AGE_SEC, FULL_MARKET_SCAN_INTERVAL_SEC * 3):
+        if data_age_seconds(q.get('timestamp')) > max(MAX_PRICE_AGE_SEC, (_project_scan_interval_sec() if PROJECT_PAPER_LAB_ENABLED else FULL_MARKET_SCAN_INTERVAL_SEC) * 3):
             continue
         turnover = to_float(q.get('turnover'), 0)
         volume = to_float(q.get('volume'), 0)
@@ -1930,37 +2005,330 @@ def _arcpro_prepare_trade_market_data(sym):
             time.sleep(0.6 * (2 ** attempt) + random.uniform(0.05, 0.20))
     return (False, last_reason)
 
+
+def scan_full_market_universe(force=False):
+    """전체시장 스캔 단일 진입점. worker/fallback가 겹쳐도 REST 호출은 한 번씩만 수행한다."""
+    with FULL_MARKET_SCAN_LOCK:
+        return _scan_full_market_universe_impl(force)
+
+def _project_state():
+    st = S.setdefault('project_lab', {})
+    st.setdefault('last_snapshot_ts', 0.0)
+    st.setdefault('last_housekeeping_ts', 0.0)
+    st.setdefault('last_rank_refresh_ts', 0.0)
+    st.setdefault('status', '대기')
+    st.setdefault('storage', {})
+    st.setdefault('session_symbols', {})
+    st.setdefault('shared_candidate', {})
+    st.setdefault('scanner_thread_started', False)
+    return st
+
+def _project_session_label():
+    """공식 KR market-calendar의 integrated 세션을 우선 사용한다.
+    프리마켓 08:00~08:50 접속매매와 08:50~09:00 시가단일가를 구분한다.
+    캘린더 장애 때만 환경변수 시간을 fallback으로 쓴다.
+    """
+    cal = S.setdefault('market_data_capture', {}).get('calendar', {})
+    n = now_kst()
+    if cal.get('date') == today():
+        ps = parse_api_datetime(cal.get('pre_start'))
+        pa = parse_api_datetime(cal.get('pre_auction_start'))
+        pe = parse_api_datetime(cal.get('pre_end'))
+        rs = parse_api_datetime(cal.get('regular_start'))
+        re_ = parse_api_datetime(cal.get('regular_end'))
+        if ps and pe and ps <= n < pe:
+            if pa and n >= pa:
+                return 'PREMARKET_AUCTION'
+            return 'PREMARKET'
+        if rs and re_ and rs <= n <= re_:
+            if n.strftime('%H:%M') <= PROJECT_OPENING_FAST_END:
+                return 'OPEN_FAST'
+            if n.strftime('%H:%M') <= PROJECT_LAST_ENTRY:
+                return 'REGULAR'
+            return 'REGULAR_LATE'
+        return 'OFF'
+    hhmm = n.strftime('%H:%M')
+    if PROJECT_PREMARKET_START <= hhmm < PROJECT_PREMARKET_AUCTION_FALLBACK:
+        return 'PREMARKET'
+    if PROJECT_PREMARKET_AUCTION_FALLBACK <= hhmm < PROJECT_OPENING_START:
+        return 'PREMARKET_AUCTION'
+    if PROJECT_OPENING_START <= hhmm <= PROJECT_OPENING_FAST_END:
+        return 'OPEN_FAST'
+    if PROJECT_OPENING_FAST_END < hhmm <= PROJECT_LAST_ENTRY:
+        return 'REGULAR'
+    return 'OFF'
+
+def _project_scan_interval_sec():
+    phase = _project_session_label()
+    if phase in {'PREMARKET', 'PREMARKET_AUCTION'}:
+        return PROJECT_SCAN_PREMARKET_SEC
+    if phase == 'OPEN_FAST':
+        return PROJECT_SCAN_OPEN_SEC
+    return PROJECT_SCAN_DAY_SEC
+
+
+def _project_update_session_symbol(sym, q, project_score=0.0):
+    """프리마켓과 정규장을 같은 종목별 상태로 연결해 continuation/fade/regular-surge를 비교한다."""
+    st = _project_state()
+    ss = st.setdefault('session_symbols', {}).setdefault(sym, {})
+    if ss.get('date') != today():
+        ss.clear(); ss['date'] = today()
+    phase = _project_session_label()
+    price = to_float(q.get('price', 0))
+    chg = to_float(q.get('change_pct', 0))
+    turnover = to_float(q.get('turnover', 0))
+    if price <= 0:
+        return ss
+    if phase in {'PREMARKET', 'PREMARKET_AUCTION'}:
+        if not ss.get('pre_first_price'):
+            ss['pre_first_price'] = price
+            ss['pre_first_change_pct'] = chg
+            ss['pre_first_at'] = now_text()
+        ss['pre_last_price'] = price
+        ss['pre_last_change_pct'] = chg
+        ss['pre_last_at'] = now_text()
+        ss['pre_high_price'] = max(to_float(ss.get('pre_high_price', price)), price)
+        low0 = to_float(ss.get('pre_low_price', price)) or price
+        ss['pre_low_price'] = min(low0, price)
+        ss['pre_max_change_pct'] = max(to_float(ss.get('pre_max_change_pct', chg)), chg)
+        ss['pre_min_change_pct'] = min(to_float(ss.get('pre_min_change_pct', chg)), chg)
+        ss['pre_max_score'] = max(to_float(ss.get('pre_max_score', project_score)), project_score)
+        ss['pre_last_score'] = project_score
+        ss['pre_last_turnover'] = turnover
+        ss['pre_samples'] = int(ss.get('pre_samples', 0)) + 1
+    elif phase in {'OPEN_FAST', 'REGULAR'}:
+        if not ss.get('reg_first_price'):
+            ss['reg_first_price'] = price
+            ss['reg_first_change_pct'] = chg
+            ss['reg_first_at'] = now_text()
+        ss['reg_last_price'] = price
+        ss['reg_last_change_pct'] = chg
+        ss['reg_last_at'] = now_text()
+        ss['reg_high_price'] = max(to_float(ss.get('reg_high_price', price)), price)
+        low0 = to_float(ss.get('reg_low_price', price)) or price
+        ss['reg_low_price'] = min(low0, price)
+        ss['reg_max_change_pct'] = max(to_float(ss.get('reg_max_change_pct', chg)), chg)
+        ss['reg_max_score'] = max(to_float(ss.get('reg_max_score', project_score)), project_score)
+        ss['reg_last_score'] = project_score
+        ss['reg_last_turnover'] = turnover
+        ss['reg_samples'] = int(ss.get('reg_samples', 0)) + 1
+    return ss
+
+
+def _project_premarket_regular_features(sym, q):
+    ss = _project_state().setdefault('session_symbols', {}).get(sym, {})
+    cur = to_float(q.get('price', 0))
+    cur_chg = to_float(q.get('change_pct', 0))
+    pre_last = to_float(ss.get('pre_last_price', 0))
+    pre_high = to_float(ss.get('pre_high_price', 0))
+    pre_last_chg = to_float(ss.get('pre_last_change_pct', 0))
+    pre_peak_chg = to_float(ss.get('pre_max_change_pct', pre_last_chg))
+    reg_open = to_float(ss.get('reg_first_price', 0))
+    reg_vs_pre = pct(cur, pre_last) if pre_last > 0 else 0.0
+    reg_vs_open = pct(cur, reg_open) if reg_open > 0 else 0.0
+    pre_hold = pct(pre_last, pre_high) if pre_last > 0 and pre_high > 0 else 0.0
+    pre_had_data = int(ss.get('pre_samples', 0)) >= 2
+    pre_strong = pre_had_data and (pre_last_chg >= PROJECT_PREMARKET_STRONG_CHANGE_PCT or pre_peak_chg >= PROJECT_PREMARKET_STRONG_CHANGE_PCT)
+    fade = pre_strong and (reg_vs_pre <= PROJECT_PREMARKET_FADE_BLOCK_PCT or cur_chg <= pre_last_chg - 2.0)
+    return {'pre_had_data': pre_had_data, 'pre_strong': pre_strong, 'fade': fade,
+            'pre_last_chg': pre_last_chg, 'pre_peak_chg': pre_peak_chg, 'pre_hold': pre_hold,
+            'reg_vs_pre': reg_vs_pre, 'reg_vs_open': reg_vs_open}
+
+
+def _project_intraday_volatility(sym, points=12):
+    hist = [to_float(x) for x in list(S.get('history', {}).get(sym, []) or [])[-points:] if to_float(x) > 0]
+    if len(hist) < 3:
+        return 0.0
+    rets = [abs(pct(hist[i], hist[i-1])) for i in range(1, len(hist)) if hist[i-1] > 0]
+    return sum(rets) / len(rets) if rets else 0.0
+
+def _project_adaptive_exit(sym):
+    # G05 주전 후보: 고정 목표가로 수익 상단을 잘라버리지 않고 변동성 기반 손절+추적청산으로 끝까지 따라간다.
+    v = _project_intraday_volatility(sym, 15)
+    sl = -min(1.10, max(0.50, 0.48 + v * 0.85))
+    trail_start = min(1.80, max(0.90, 1.05 + v * 0.70))
+    trail = -min(1.20, max(0.42, 0.45 + v * 0.75))
+    return {'tp': None, 'sl': sl, 'trail_start': trail_start, 'trail': trail, 'volatility': v}
+
+def _project_daily_stats(ai_id):
+    ensure_multi_ai_states()
+    with LOCK:
+        st = S['paper_ais'][ai_id]
+        rows = [r for r in st.get('trades', []) if str(r.get('time','')).startswith(today())]
+    sells = [r for r in rows if str(r.get('action','')).upper() in {'SELL','PARTIAL_SELL'}]
+    realized = sum(to_float(r.get('pl', 0)) for r in sells)
+    start_cash = max(1.0, to_float(st.get('start_cash', MULTI_AI_START_CASH)))
+    return {'sell_count': len(sells), 'realized_pl': realized, 'realized_pct': realized / start_cash * 100.0}
+
+def _project_allow_new_entry(ai_id):
+    if not PROJECT_PAPER_LAB_ENABLED or not str(ai_id).startswith('G'):
+        return True
+    ds = _project_daily_stats(ai_id)
+    if ds['sell_count'] >= PROJECT_MAX_DAILY_TRADES:
+        return False
+    if ds['realized_pct'] <= PROJECT_DAILY_MAX_LOSS_PCT:
+        return False
+    if PROJECT_STOP_AFTER_DAILY_TARGET and ds['realized_pct'] >= PROJECT_DAILY_SOFT_TARGET_PCT:
+        return False
+    return True
+
+def _project_candidate_score(base_score, sym, q):
+    hist = list(S.get('history', {}).get(sym, []) or [])
+    cur = to_float(q.get('price', 0))
+    if cur <= 0:
+        return (-999.0, 0.0, 0.0, 0.0, 0.0, 'INVALID', {})
+    def move(n):
+        return pct(cur, to_float(hist[-n - 1])) if len(hist) > n and to_float(hist[-n - 1]) > 0 else 0.0
+    r1, r3, r5 = move(1), move(3), move(5)
+    recent = [to_float(x) for x in hist[-20:] if to_float(x) > 0]
+    high = max(recent or [cur]); low = min(recent or [cur])
+    from_high, from_low = pct(cur, high), pct(cur, low)
+    turnover = to_float(q.get('turnover', 0)); change_pct = to_float(q.get('change_pct', 0))
+    liquidity = min(28.0, max(turnover, 0.0) ** 0.5 / 22000.0)
+    extension_penalty = max(0.0, change_pct - 12.0) * 3.0 + max(0.0, -change_pct - 5.0) * 2.0
+    sweet_spot = 10.0 if 1.0 <= change_pct <= 8.0 else (4.0 if 0.0 <= change_pct <= 12.0 else 0.0)
+    high_hold = 12.0 if from_high >= -0.5 else (6.0 if from_high >= -1.2 else -4.0)
+    accel = max(-12.0, min(22.0, r1 * 18.0 + r3 * 8.0 + r5 * 3.0))
+    core = base_score * 0.32 + liquidity + sweet_spot + high_hold + accel - extension_penalty
+
+    phase = _project_session_label()
+    # 먼저 현재 스냅샷을 세션 상태에 반영한다. 이후 정규장에서는 프리마켓 상태와 연결해서 본다.
+    ss = _project_update_session_symbol(sym, q, core)
+    feat = _project_premarket_regular_features(sym, q)
+    signal_type = 'PREMARKET_WATCH' if phase in {'PREMARKET', 'PREMARKET_AUCTION'} else 'REGULAR_SURGE'
+    score = core
+
+    if phase in {'OPEN_FAST', 'REGULAR'}:
+        # 1) 프리마켓 강세가 정규장으로 이어지는 continuation 경로.
+        continuation = core
+        if feat['pre_had_data']:
+            continuation += min(16.0, max(-8.0, feat['pre_last_chg'] * 1.1))
+            continuation += 8.0 if feat['pre_hold'] >= -0.8 else (-8.0 if feat['pre_hold'] <= -2.0 else 0.0)
+            continuation += min(14.0, max(-14.0, feat['reg_vs_pre'] * 5.0))
+        # 2) 프리마켓에서 안 보였어도 정규장 시작 후 갑자기 돈이 몰리는 종목 경로.
+        regular_surge = core + min(20.0, max(-8.0, r1 * 24.0 + r3 * 10.0))
+        regular_surge += min(12.0, max(-8.0, feat['reg_vs_open'] * 5.0))
+        if not feat['pre_strong']:
+            regular_surge += 5.0
+        # 프리마켓 급등 후 정규장 폭락형은 차단/강감점.
+        if feat['fade']:
+            continuation -= 45.0
+            score = min(continuation, regular_surge - 20.0)
+            signal_type = 'PREMARKET_FADE_AVOID'
+        elif feat['pre_had_data'] and continuation >= regular_surge and continuation >= PROJECT_CONTINUATION_MIN_SCORE:
+            score = continuation
+            signal_type = 'PREMARKET_CONTINUATION'
+        else:
+            score = regular_surge
+            signal_type = 'REGULAR_SURGE'
+    return (score, r3, r5, from_high, from_low, signal_type, feat)
+
+def project_capture_market_snapshot(force=False):
+    if not PROJECT_RESEARCH_SAVE_ENABLED:
+        return False
+    st = _project_state()
+    if not force and time.time() - to_float(st.get('last_snapshot_ts', 0)) < PROJECT_RESEARCH_SNAPSHOT_SEC:
+        return False
+    ranked = list(S.setdefault('full_market', {}).get('ranked', []))[:PROJECT_RESEARCH_TOP_N]
+    if not ranked:
+        return False
+    headers = ['time','session','rank','symbol','name','price','change_pct','turnover','volume','short_mom','base_score','project_score','signal_type','r3','r5','from_high','from_low','pre_last_chg','pre_peak_chg','pre_hold','reg_vs_pre','reg_vs_open','fade','ranking_types']
+    path = project_market_snapshot_path()
+    for rank_no, (base_score, sym, q) in enumerate(ranked, 1):
+        ps, r3, r5, fh, fl, sigtype, feat = _project_candidate_score(base_score, sym, q)
+        row = {'time': now_text(), 'session': _project_session_label(), 'rank': rank_no, 'symbol': sym, 'name': name_of(sym), 'price': to_float(q.get('price',0)), 'change_pct': to_float(q.get('change_pct',0)), 'turnover': to_float(q.get('turnover',0)), 'volume': to_float(q.get('volume',0)), 'short_mom': to_float(q.get('short_mom',0)), 'base_score': round(base_score,4), 'project_score': round(ps,4), 'signal_type': sigtype, 'r3': round(r3,4), 'r5': round(r5,4), 'from_high': round(fh,4), 'from_low': round(fl,4), 'pre_last_chg': round(to_float(feat.get('pre_last_chg',0)),4), 'pre_peak_chg': round(to_float(feat.get('pre_peak_chg',0)),4), 'pre_hold': round(to_float(feat.get('pre_hold',0)),4), 'reg_vs_pre': round(to_float(feat.get('reg_vs_pre',0)),4), 'reg_vs_open': round(to_float(feat.get('reg_vs_open',0)),4), 'fade': bool(feat.get('fade')), 'ranking_types': '|'.join(q.get('ranking_types',[]) if isinstance(q.get('ranking_types'),list) else [])}
+        write_row(path, headers, row)
+    st['last_snapshot_ts'] = time.time()
+    st['status'] = f'시장연구 스냅샷 {len(ranked)}종목 저장'
+    return True
+
+def project_write_candidate_event(ai_id, sym, metric, reason, event='CANDIDATE'):
+    if not PROJECT_RESEARCH_SAVE_ENABLED:
+        return
+    write_row(project_candidate_event_path(), ['time','event','ai_id','strategy','symbol','name','metric','price','reason'], {'time': now_text(), 'event': event, 'ai_id': ai_id, 'strategy': MULTI_AI_NAMES.get(ai_id,ai_id), 'symbol': sym, 'name': name_of(sym) if sym else '', 'metric': round(to_float(metric),4), 'price': to_float(S.get('prices',{}).get(sym,0)) if sym else 0, 'reason': str(reason)[:1500]})
+
+def _project_disk_usage():
+    try:
+        total, used, free = shutil.disk_usage(PERSISTENT_DISK_MOUNT_PATH if os.path.exists(PERSISTENT_DISK_MOUNT_PATH) else LOG_ROOT)
+        pct_used = used / total * 100.0 if total else 0.0
+        return {'total': total, 'used': used, 'free': free, 'used_pct': pct_used}
+    except Exception as e:
+        return {'total': 0, 'used': 0, 'free': 0, 'used_pct': 0.0, 'error': str(e)}
+
+def project_storage_housekeeping(force=False):
+    # Drive 재다운로드 검증까지 끝난 거래일만 로컬에서 지운다. 미검증 데이터는 절대 삭제하지 않는다.
+    st = _project_state()
+    if not force and time.time() - to_float(st.get('last_housekeeping_ts', 0)) < 3600:
+        return []
+    st['last_housekeeping_ts'] = time.time()
+    usage = _project_disk_usage()
+    st['storage'] = usage
+    removed = []
+    cutoff = now_kst().date() - timedelta(days=PROJECT_LOCAL_KEEP_DAYS)
+    completed = S.setdefault('kr_backup_completed', {})
+    try:
+        for name in os.listdir(LOG_ROOT):
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', name):
+                continue
+            try:
+                d = datetime.strptime(name, '%Y-%m-%d').date()
+            except Exception:
+                continue
+            if d > cutoff:
+                continue
+            info = completed.get(name, {})
+            if not isinstance(info, dict) or not info.get('drive_reverified'):
+                continue
+            path = os.path.join(LOG_ROOT, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+                removed.append(path)
+            z = os.path.join(BACKUP_ROOT, 'KR', f'backup_KR_{name}.zip')
+            if os.path.isfile(z):
+                os.remove(z)
+                removed.append(z)
+    except Exception as e:
+        set_error(f'PROJECT 저장공간 정리 오류: {e}')
+    usage2 = _project_disk_usage()
+    st['storage'] = usage2
+    st['last_removed'] = removed[-20:]
+    if usage2.get('used_pct',0) >= PROJECT_STORAGE_CRITICAL_PCT:
+        set_error(f"저장공간 CRITICAL {usage2.get('used_pct',0):.1f}% / 미검증 데이터 자동삭제 금지")
+    return removed
+
 def full_market_candidate(ai_id):
-    """G01~G05가 서로 다른 방식으로 전체시장 후보를 고른다."""
-    scan_full_market_universe(False)
+    """G01~G05는 같은 시점의 같은 진입후보를 공유하고 청산법만 달리한다.
+    후보는 PREMARKET_CONTINUATION과 REGULAR_SURGE 두 경로를 동시에 경쟁시킨다.
+    """
+    st = _project_state()
+    fm = S.setdefault('full_market', {})
+    stale_after = max(20, _project_scan_interval_sec() * 2)
+    if time.time() - to_float(fm.get('last_scan_ts', 0)) > stale_after:
+        # worker 장애 시에만 안전 fallback. 정상 시에는 API를 추가 호출하지 않는다.
+        scan_full_market_universe(False)
+    project_capture_market_snapshot(False)
     ranked = list(S.setdefault('full_market', {}).get('ranked', []))
+    scan_key = str(S.setdefault('full_market', {}).get('last_scan_text', ''))
+    cached = st.get('shared_candidate', {})
+    if cached.get('scan_key') == scan_key and cached.get('tuple'):
+        return tuple(cached['tuple'])
     scored = []
     for base_score, sym, q in ranked:
-        hist = list(S.get('history', {}).get(sym, []) or [])
-        cur = to_float(q.get('price', 0))
-        if cur <= 0:
+        ps, r3, r5, from_high, from_low, sigtype, feat = _project_candidate_score(base_score, sym, q)
+        if sigtype == 'PREMARKET_FADE_AVOID':
             continue
-
-        def move(n):
-            return pct(cur, to_float(hist[-n - 1])) if len(hist) > n and to_float(hist[-n - 1]) > 0 else 0.0
-        r3, r10 = (move(3), move(10))
-        high = max([to_float(x) for x in hist[-30:] if to_float(x) > 0] or [cur])
-        low = min([to_float(x) for x in hist[-30:] if to_float(x) > 0] or [cur])
-        from_high, from_low = (pct(cur, high), pct(cur, low))
-        turnover = to_float(q.get('turnover', 0))
-        liquidity = min(30.0, max(turnover, 0.0) ** 0.5 / 20000.0)
-        if ai_id == 'G01':
-            metric = base_score + liquidity + r3 * 8
-        elif ai_id == 'G02':
-            metric = liquidity + r3 * 16 + r10 * 8 + (12 if from_high >= -0.3 else -10)
-        elif ai_id == 'G03':
-            metric = liquidity + from_low * 7 + r3 * 10 if -4.0 <= from_high <= -0.3 and r3 > 0 else -999
-        elif ai_id == 'G04':
-            metric = liquidity + from_low * 9 + r3 * 14 if from_low >= 1.0 and r10 < 0 else -999
-        else:
-            metric = base_score * 0.45 + liquidity + r3 * 10 + r10 * 6 - abs(from_high) * 1.5
-        scored.append((metric, sym, base_score, r3, r10, from_high, from_low, liquidity))
-    return max(scored, default=(0, '', 0, 0, 0, 0, 0, 0), key=lambda x: x[0])
+        scored.append((ps, sym, base_score, r3, r5, from_high, from_low,
+                       min(30.0, max(to_float(q.get('turnover',0)),0.0) ** 0.5 / 20000.0), sigtype, feat))
+    best = max(scored, default=(-999.0, '', 0, 0, 0, 0, 0, 0, 'NONE', {}), key=lambda x: x[0])
+    # 기존 8개 반환 인터페이스를 유지하되 signal_type은 project state와 reason log에 보존한다.
+    out = best[:8]
+    st['shared_candidate'] = {'scan_key': scan_key, 'tuple': list(out), 'signal_type': best[8], 'features': best[9], 'symbol': best[1], 'metric': best[0], 'saved_at': now_text()}
+    if best[1]:
+        f = best[9]
+        project_write_candidate_event(ai_id, best[1], best[0],
+            f"type={best[8]} base={best[2]:.1f} r3={best[3]:.2f} r5={best[4]:.2f} high={best[5]:.2f} low={best[6]:.2f} pre_last={to_float(f.get('pre_last_chg',0)):.2f}% pre_peak={to_float(f.get('pre_peak_chg',0)):.2f}% reg_vs_pre={to_float(f.get('reg_vs_pre',0)):.2f}% reg_vs_open={to_float(f.get('reg_vs_open',0)):.2f}%",
+            'TOP_CANDIDATE')
+    return out
 
 def multi_ai_path(ai_id):
     return os.path.join(day_dir(), f'paper_ai_{ai_id}_{today()}.csv')
@@ -2273,7 +2641,7 @@ def _multi_ai_entry_window(ai_id, hhmm):
     family = _multi_ai_family(ai_id)
     idx = _multi_ai_index(ai_id)
     if family == 'G':
-        return '09:10' <= hhmm < '14:40'
+        return PROJECT_OPENING_START <= hhmm < PROJECT_LAST_ENTRY
     if family == 'R':
         fixed = {5: '09:15', 6: '10:00', 7: '11:00', 8: '12:30', 9: '13:00', 10: '13:30'}
         if idx in fixed:
@@ -2298,14 +2666,20 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
     parent = _multi_ai_parent_id(logic_id)
     family = _multi_ai_family(logic_id)
     if family == 'G':
-        stops = {'G01': -1.4, 'G02': -1.8, 'G03': -1.3, 'G04': -1.6, 'G05': -1.2}
-        trails = {'G01': -0.9, 'G02': -1.1, 'G03': -0.7, 'G04': -0.9, 'G05': -0.8}
-        if profit <= stops[parent]:
-            return f'{ai_id} 실시간 손실제한 {profit:.2f}%'
-        if profit >= 0.7 and draw <= trails[parent]:
-            return f'{ai_id} 실시간 수익보호 {draw:.2f}%'
+        prof = PROJECT_G_EXIT_PROFILES.get(parent, PROJECT_G_EXIT_PROFILES['G02'])
+        if parent == 'G05':
+            adaptive = _project_adaptive_exit(sym)
+            tp, sl, trail_start, trail = adaptive['tp'], adaptive['sl'], adaptive['trail_start'], adaptive['trail']
+        else:
+            tp, sl, trail_start, trail = prof['tp'], prof['sl'], prof['trail_start'], prof['trail']
+        if profit <= sl:
+            return f'{ai_id} PROJECT 손절 {profit:.2f}% <= {sl:.2f}%'
+        if tp is not None and profit >= tp:
+            return f'{ai_id} PROJECT 목표익절 {profit:.2f}% >= {tp:.2f}%'
+        if parent == 'G05' and profit >= trail_start and draw <= trail:
+            return f'{ai_id} PROJECT 자동추적청산 profit={profit:.2f}% draw={draw:.2f}%'
         if hhmm >= '15:10':
-            return f'{ai_id} 당일 15:10 청산'
+            return f'{ai_id} PROJECT 당일 15:10 청산'
     elif parent == 'R14':
         if profit >= 0.8 and draw <= -1.0:
             return f'{ai_id} 추적청산 {draw:.2f}%'
@@ -2769,8 +3143,8 @@ def run_multi_paper_ais():
     mode = target_market_regime()
     now_ts = time.time()
     hhmm = now_kst().strftime('%H:%M')
-    if any((x.startswith('G') for x in MULTI_AI_IDS)):
-        scan_full_market_universe(False)
+    # V5.08: G계열은 전용 project_scanner_worker가 만든 최신 스냅샷만 소비한다.
+    # worker가 늦거나 죽었을 때의 fallback은 full_market_candidate 내부에서만 수행한다.
     for ai_id in MULTI_AI_IDS:
         if ai_id in {'V01', 'V02', 'V03'}:
             _run_verified_fixed_account(ai_id, hhmm, now_ts)
@@ -2796,6 +3170,11 @@ def run_multi_paper_ais():
             continue
         if not _multi_ai_entry_window(ai_id, hhmm):
             continue
+        if _multi_ai_family(ai_id) == 'G' and not _project_allow_new_entry(ai_id):
+            with LOCK:
+                st = S['paper_ais'][ai_id]
+                st['last_action'] = f'{now_short()} PROJECT 일일목표/손실/횟수 게이트 관망'
+            continue
         parent = _multi_ai_parent_id(ai_id)
         family = _multi_ai_family(ai_id)
         if parent == 'W15' and mode in ['CHOPPY', 'NO_TRADE', 'RECOVERY']:
@@ -2804,7 +3183,7 @@ def run_multi_paper_ais():
                 st['last_action'] = f'{now_short()} 현금관망 {mode}'
             continue
         metric, sym, score, r3, r10, from_high, from_low, rel = _multi_ai_candidate(ai_id, mode)
-        threshold = 46 if ai_id.startswith('L') else 48 if family == 'G' else 42 if family == 'W' else 40
+        threshold = 46 if ai_id.startswith('L') else PROJECT_ENTRY_MIN_SCORE if family == 'G' else 42 if family == 'W' else 40
         if not sym or metric < threshold:
             with LOCK:
                 st['last_decision_ts'] = now_ts
@@ -2816,9 +3195,10 @@ def run_multi_paper_ais():
                 st['last_decision_ts'] = now_ts
                 st['last_action'] = f'{now_short()} 호가미수신 관망 {sym}'
             continue
-        ratios = {'G01': 0.6, 'G02': 0.7, 'G03': 0.55, 'G04': 0.5, 'G05': 0.65, 'W15': 0.3, 'R12': 0.35, 'R13': 0.4, 'L01': 0.7, 'L02': 0.55, 'L03': 0.65, 'L04': 0.5, 'L05': 0.35}
+        ratios = {'G01': 0.90, 'G02': 0.90, 'G03': 0.90, 'G04': 0.90, 'G05': 0.90, 'W15': 0.3, 'R12': 0.35, 'R13': 0.4, 'L01': 0.7, 'L02': 0.55, 'L03': 0.65, 'L04': 0.5, 'L05': 0.35}
         ratio = ratios.get(parent, 0.7)
-        reason = f'{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, universe={MULTI_AI_UNIVERSE[ai_id]}, parent={parent}, mode={mode}, metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%, decision_data_end={now_text()}'
+        project_type = _project_state().get('shared_candidate', {}).get('signal_type', '') if family == 'G' else ''
+        reason = f'{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, universe={MULTI_AI_UNIVERSE[ai_id]}, parent={parent}, mode={mode}, project_type={project_type}, metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%, decision_data_end={now_text()}'
         if _multi_ai_buy(ai_id, sym, reason, ratio):
             with LOCK:
                 st['last_decision_ts'] = now_ts
@@ -5231,6 +5611,38 @@ def maybe_send_daily_backup():
                 completed_map[trade_date] = {'local_verified': True, 'local_verified_at': now_text(), 'local_file': os.path.basename(path), 'local_size': os.path.getsize(path), 'drive_reverified': False, 'telegram_exported': True}
             save_state()
 
+def project_scanner_worker():
+    """공식 KR 캘린더 기반 전용 REST 스캐너.
+    Open API 1.2.13은 WebSocket이 아직 미지원이므로 랭킹+현재가를 폴링한다.
+    """
+    global PROJECT_SCANNER_HEARTBEAT_TS
+    while True:
+        try:
+            PROJECT_SCANNER_HEARTBEAT_TS = time.time()
+            if is_weekend_kst() or not PROJECT_PAPER_LAB_ENABLED:
+                time.sleep(30); continue
+            refresh_kr_market_calendar(False)
+            phase = _project_session_label()
+            if phase in {'PREMARKET', 'PREMARKET_AUCTION', 'OPEN_FAST', 'REGULAR'}:
+                scan_full_market_universe(False)
+                project_capture_market_snapshot(False)
+            time.sleep(max(5, _project_scan_interval_sec()))
+        except Exception as e:
+            set_error(f'PROJECT scanner worker 오류: {e}')
+            time.sleep(15)
+
+
+def start_project_scanner_worker_once():
+    global PROJECT_SCANNER_THREAD
+    if not PROJECT_SCANNER_WORKER_ENABLED or not PROJECT_PAPER_LAB_ENABLED:
+        return
+    if PROJECT_SCANNER_THREAD is not None and PROJECT_SCANNER_THREAD.is_alive():
+        return
+    PROJECT_SCANNER_THREAD = threading.Thread(target=project_scanner_worker, name='project-scanner', daemon=True)
+    PROJECT_SCANNER_THREAD.start()
+    _project_state()['scanner_thread_started'] = True
+
+
 def loop():
     """DATA+PAPER ONLY 핵심 루프: KR/US 데이터 수집 + 가상매매 + 원본보존/백업만 수행한다. 실주문/추천 실행 없음."""
     load_state()
@@ -5270,9 +5682,12 @@ def loop():
                 load_prices()
                 calc_wma_all()
                 calc_scores()
+                start_project_scanner_worker_once()
                 initialized = True
             refresh_kr_market_calendar(force=False)
             load_prices()
+            # V5.07: 전체시장 REST 폴링은 project_scanner_worker 한 곳에서만 담당한다.
+            # 메인 루프는 스캐너 결과를 소비해 API 중복호출/429 위험을 줄인다.
             try:
                 maybe_capture_toss_market_data()
             except Exception as e:
@@ -5290,12 +5705,21 @@ def loop():
                 if gate_ok:
                     run_paper_ai_if_enabled()
                     run_multi_paper_ais()
+                    if PROJECT_PAPER_LAB_ENABLED:
+                        try:
+                            project_capture_market_snapshot(False)
+                        except Exception as e:
+                            set_error(f'PROJECT 연구스냅샷 오류: {e}')
             except Exception as e:
                 set_error(f'가상매매 오류: {e}')
             try:
                 maybe_send_daily_backup()
             except Exception as e:
                 set_error(f'한국 백업 오류: {e}')
+            try:
+                project_storage_housekeeping(False)
+            except Exception as e:
+                set_error(f'PROJECT 저장공간 관리 오류: {e}')
             try:
                 maybe_send_us_backup()
             except Exception as e:
@@ -5949,7 +6373,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path == '/rescue_today':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -6150,6 +6574,7 @@ def print_core_selfcheck():
     print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS), flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
     print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
+    print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
     storage = storage_selfcheck()
     print('storage=', storage, flush=True)
     if not storage.get('writable'):
