@@ -1,5 +1,5 @@
 # OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
-# 최종 동결형: KR/US 데이터 수집 + 90 가상계좌 + 검증 + 백업/Drive 전용.
+# V5.12: KR/US 데이터 수집 + 92 가상계좌(G급등주 + E ETF LAB 포함) + 검증 + 백업/Drive 전용.
 # V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -27,9 +27,9 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_09_DAILY_RESEARCH_REPORT_SERVER_READY_PAPER_LAB'
+OPERATING_VERSION = 'OPERATING_V5_12_TUESDAY_GUARDED_SURGE_ETF_LAB'
 DATA_PAPER_BACKUP_ONLY = True
-RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_90', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
+RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
@@ -97,11 +97,11 @@ MULTI_AI_MAX_POSITION_RATIO = float(os.environ.get('MULTI_AI_MAX_POSITION_RATIO'
 MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get('MULTI_AI_DECISION_COOLDOWN_SEC', '180'))
 RESEARCH_BASE_NAMES = {1: '연구고정 오전추세', 2: '연구고정 오전역추세', 3: '연구고정 오전돌파', 4: '연구고정 오전눌림', 5: '연구고정 09:15', 6: '연구고정 10:00', 7: '연구고정 11:00', 8: '연구고정 오후추세', 9: '연구고정 오후역추세', 10: '연구고정 오후돌파', 11: '연구고정 2구간', 12: '연구고정 저노출', 13: '연구고정 관망강화', 14: '연구고정 추적청산', 15: '연구고정 오버나이트'}
 WALK_BASE_NAMES = {1: '순방향 누적수익 1위', 2: '순방향 누적 상위3 분산', 3: '순방향 최근3일 1위', 4: '순방향 최근5일 1위', 5: '순방향 최근7일 1위', 6: '순방향 최근10일 1위', 7: '순방향 최근5일 위험조정', 8: '순방향 최근10일 위험조정', 9: '순방향 최소MDD', 10: '순방향 승률우선', 11: '순방향 수익MDD 혼합', 12: '순방향 50·30·20', 13: '순방향 단기역추세', 14: '순방향 지연추세', 15: '순방향 현금관망'}
-MULTI_AI_IDS = [f'RI{i:02d}' for i in range(1, 16)] + [f'RE{i:02d}' for i in range(1, 16)] + [f'WI{i:02d}' for i in range(1, 16)] + [f'WE{i:02d}' for i in range(1, 16)] + [f'G{i:02d}' for i in range(1, 6)] + [f'C{i:02d}' for i in range(1, 6)] + [f'L{i:02d}' for i in range(1, 6)] + [f'V{i:02d}' for i in range(1, 16)]
-MULTI_AI_NAMES = {**{f'RI{i:02d}': f'1그룹 포함형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'RE{i:02d}': f'1그룹 제외형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WI{i:02d}': f'2그룹 포함형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WE{i:02d}': f'2그룹 제외형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, 'G01': '급등LAB 고정 TP1.0 SL0.5', 'G02': '급등LAB 고정 TP1.4 SL0.7', 'G03': '급등LAB 고정 TP2.0 SL0.7', 'G04': '급등LAB 고정 TP2.5 SL0.8', 'G05': '급등LAB 자동 변동성적응', 'C01': '조합 오전인버스→오후레버리지', 'C02': '조합 오전인버스→오후인버스', 'C03': '조합 11:30 방향전환', 'C04': '조합 삼성·하이닉스 포함 자율', 'C05': '조합 삼성·하이닉스 제외 자율', 'L01': '학습 직전5일 최근가중 1위', 'L02': '학습 직전5일 최근가중 상위3', 'L03': '학습 직전7일 수익 1위', 'L04': '학습 직전5일 수익·MDD 균형', 'L05': '학습 비용·낙폭 방어형', 'V01': '검증 4천만원 하루2회 494310·252670', 'V02': '검증 미래변수제거 하루2회', 'V03': '검증 1억원대 삼성·하이닉스 4종목', 'V04': '일봉 삼성·하이닉스·KODEX200 MA10 완전합의', 'V05': '일봉방향 + 장중 눌림 재진입', 'V06': '일봉방향 + 같은 방향 상대강도 1위', 'V07': '삼성전자·SK하이닉스 장중 방향합의', 'V08': '관망강화 데이터·혼조 필터', 'V09': '고정 09:15 진입 60분 보유', 'V10': '고정 10:00 진입 90분 보유', 'V11': '고정 11:00 진입 90분 보유', 'V12': '11시 방향합의 90분 보유', 'V13': '오버나이트 15:10 진입 다음날 09:05 청산', 'V14': '하루 최대4회 방향추종', 'V15': '장중 방향전환·재진입 2회'}
-MULTI_AI_GROUP = {**{f'RI{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'RE{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'WI{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'WE{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET_LIVE' for i in range(1, 6)}, **{f'C{i:02d}': 'INTRADAY_COMBO' for i in range(1, 6)}, **{f'L{i:02d}': 'DAILY_LEARNING' for i in range(1, 6)}, **{f'V{i:02d}': 'EXPANDED_VERIFIED_RULE' for i in range(1, 16)}}
-MULTI_AI_UNIVERSE = {**{f'RI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'RE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'C01': 'INCLUDE_SAMSUNG_HYNIX', 'C02': 'INCLUDE_SAMSUNG_HYNIX', 'C03': 'INCLUDE_SAMSUNG_HYNIX', 'C04': 'INCLUDE_SAMSUNG_HYNIX', 'C05': 'EXCLUDE_SAMSUNG_HYNIX', **{f'L{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'V01': 'VERIFIED_494310_252670', 'V02': 'VERIFIED_494310_252670', 'V03': 'VERIFIED_SAMSUNG_HYNIX_4', **{f'V{i:02d}': 'ALL26_PAPER' for i in range(4, 16)}}
-MULTI_AI_PARENT = {**{f'RI{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'RE{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'WI{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'WE{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'G{i:02d}': f'G{i:02d}' for i in range(1, 6)}, **{f'C{i:02d}': f'C{i:02d}' for i in range(1, 6)}, **{f'L{i:02d}': f'L{i:02d}' for i in range(1, 6)}, **{f'V{i:02d}': f'V{i:02d}' for i in range(1, 16)}}
+MULTI_AI_IDS = [f'RI{i:02d}' for i in range(1, 16)] + [f'RE{i:02d}' for i in range(1, 16)] + [f'WI{i:02d}' for i in range(1, 16)] + [f'WE{i:02d}' for i in range(1, 16)] + [f'G{i:02d}' for i in range(1, 6)] + [f'C{i:02d}' for i in range(1, 6)] + [f'L{i:02d}' for i in range(1, 6)] + [f'V{i:02d}' for i in range(1, 16)] + ['E01','E02']
+MULTI_AI_NAMES = {**{f'RI{i:02d}': f'1그룹 포함형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'RE{i:02d}': f'1그룹 제외형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WI{i:02d}': f'2그룹 포함형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WE{i:02d}': f'2그룹 제외형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, 'G01': '급등LAB 고정 TP1.0 SL0.5', 'G02': '급등LAB 고정 TP1.4 SL0.7', 'G03': '급등LAB 고정 TP2.0 SL0.7', 'G04': '급등LAB 고정 TP2.5 SL0.8', 'G05': '급등LAB 자동 변동성적응', 'E01': 'ETF LAB +1.4% 성공후 당일종료', 'E02': 'ETF LAB 추적청산', 'C01': '조합 오전인버스→오후레버리지', 'C02': '조합 오전인버스→오후인버스', 'C03': '조합 11:30 방향전환', 'C04': '조합 삼성·하이닉스 포함 자율', 'C05': '조합 삼성·하이닉스 제외 자율', 'L01': '학습 직전5일 최근가중 1위', 'L02': '학습 직전5일 최근가중 상위3', 'L03': '학습 직전7일 수익 1위', 'L04': '학습 직전5일 수익·MDD 균형', 'L05': '학습 비용·낙폭 방어형', 'V01': '검증 4천만원 하루2회 494310·252670', 'V02': '검증 미래변수제거 하루2회', 'V03': '검증 1억원대 삼성·하이닉스 4종목', 'V04': '일봉 삼성·하이닉스·KODEX200 MA10 완전합의', 'V05': '일봉방향 + 장중 눌림 재진입', 'V06': '일봉방향 + 같은 방향 상대강도 1위', 'V07': '삼성전자·SK하이닉스 장중 방향합의', 'V08': '관망강화 데이터·혼조 필터', 'V09': '고정 09:15 진입 60분 보유', 'V10': '고정 10:00 진입 90분 보유', 'V11': '고정 11:00 진입 90분 보유', 'V12': '11시 방향합의 90분 보유', 'V13': '오버나이트 15:10 진입 다음날 09:05 청산', 'V14': '하루 최대4회 방향추종', 'V15': '장중 방향전환·재진입 2회'}
+MULTI_AI_GROUP = {**{f'RI{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'RE{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'WI{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'WE{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET_LIVE' for i in range(1, 6)}, 'E01':'ETF_DIRECTION_LAB', 'E02':'ETF_DIRECTION_LAB', **{f'C{i:02d}': 'INTRADAY_COMBO' for i in range(1, 6)}, **{f'L{i:02d}': 'DAILY_LEARNING' for i in range(1, 6)}, **{f'V{i:02d}': 'EXPANDED_VERIFIED_RULE' for i in range(1, 16)}}
+MULTI_AI_UNIVERSE = {**{f'RI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'RE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'E01':'ETF5', 'E02':'ETF5', 'C01': 'INCLUDE_SAMSUNG_HYNIX', 'C02': 'INCLUDE_SAMSUNG_HYNIX', 'C03': 'INCLUDE_SAMSUNG_HYNIX', 'C04': 'INCLUDE_SAMSUNG_HYNIX', 'C05': 'EXCLUDE_SAMSUNG_HYNIX', **{f'L{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'V01': 'VERIFIED_494310_252670', 'V02': 'VERIFIED_494310_252670', 'V03': 'VERIFIED_SAMSUNG_HYNIX_4', **{f'V{i:02d}': 'ALL26_PAPER' for i in range(4, 16)}}
+MULTI_AI_PARENT = {**{f'RI{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'RE{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'WI{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'WE{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'G{i:02d}': f'G{i:02d}' for i in range(1, 6)}, 'E01':'E01', 'E02':'E02', **{f'C{i:02d}': f'C{i:02d}' for i in range(1, 6)}, **{f'L{i:02d}': f'L{i:02d}' for i in range(1, 6)}, **{f'V{i:02d}': f'V{i:02d}' for i in range(1, 16)}}
 ENABLE_FULL_MARKET_SCANNER = os.environ.get('ENABLE_FULL_MARKET_SCANNER', 'true').lower() == 'true'
 FULL_MARKET_SCAN_INTERVAL_SEC = int(os.environ.get('FULL_MARKET_SCAN_INTERVAL_SEC', '60'))
 FULL_MARKET_TOP_N = int(os.environ.get('FULL_MARKET_TOP_N', '80'))
@@ -118,15 +118,49 @@ REQUIRE_FRESH_ORDERBOOK_FOR_PAPER = os.environ.get('REQUIRE_FRESH_ORDERBOOK_FOR_
 PAPER_BLOCKED_SYMBOLS = {x.strip() for x in os.environ.get('PAPER_BLOCKED_SYMBOLS', '0193W0').split(',') if x.strip()}
 FULL_MARKET_BLOCKED_SYMBOLS = FULL_MARKET_BLOCKED_SYMBOLS_BASE | PAPER_BLOCKED_SYMBOLS
 
-# V5.09: Toss Open API 1.2.13 + 프리마켓↔정규장 PAPER LAB + 장마감 자동 연구리포트.
+# V5.10: 08시 프리마켓 관찰 + 정규장 확인진입 + 재진입/연속손실/수익반납 보호 + PAPER LAB.
 # 실주문은 계속 완전 차단한다. 목표수익은 보장값이 아니라 PAPER 검증 목표다.
 PROJECT_PAPER_LAB_ENABLED = os.environ.get('PROJECT_PAPER_LAB_ENABLED', 'true').lower() == 'true'
 PROJECT_MONTHLY_TARGET_PCT = float(os.environ.get('PROJECT_MONTHLY_TARGET_PCT', '30.0'))
-PROJECT_DAILY_SOFT_TARGET_PCT = float(os.environ.get('PROJECT_DAILY_SOFT_TARGET_PCT', '1.4'))
+PROJECT_DAILY_SOFT_TARGET_PCT = float(os.environ.get('PROJECT_DAILY_SOFT_TARGET_PCT', '1.4'))  # 보고/비교용, 기본 강제종료 아님
 PROJECT_DAILY_MAX_LOSS_PCT = float(os.environ.get('PROJECT_DAILY_MAX_LOSS_PCT', '-1.4'))
-PROJECT_MAX_DAILY_TRADES = max(1, min(5, int(os.environ.get('PROJECT_MAX_DAILY_TRADES', '2'))))
-PROJECT_STOP_AFTER_DAILY_TARGET = os.environ.get('PROJECT_STOP_AFTER_DAILY_TARGET', 'true').lower() == 'true'
+PROJECT_MAX_DAILY_TRADES = max(1, min(20, int(os.environ.get('PROJECT_MAX_DAILY_TRADES', '20'))))  # 호환용. G계열은 종목별/보호모드로 제어
+PROJECT_STOP_AFTER_DAILY_TARGET = os.environ.get('PROJECT_STOP_AFTER_DAILY_TARGET', 'false').lower() == 'true'
 PROJECT_ENTRY_MIN_SCORE = float(os.environ.get('PROJECT_ENTRY_MIN_SCORE', '58.0'))
+# V5.10: 08시 프리마켓은 관찰/문맥용. 실제 G 신규진입은 09시 이후 확인된 모멘텀만 허용한다.
+PROJECT_G_MIN_R10_PCT = float(os.environ.get('PROJECT_G_MIN_R10_PCT', '0.50'))
+PROJECT_G_REENTRY_MIN_R3_PCT = float(os.environ.get('PROJECT_G_REENTRY_MIN_R3_PCT', '0.50'))
+PROJECT_G_REENTRY_HIGH_GAP_PCT = float(os.environ.get('PROJECT_G_REENTRY_HIGH_GAP_PCT', '-0.20'))
+PROJECT_G_LOSS_REENTRY_COOLDOWN_SEC = int(os.environ.get('PROJECT_G_LOSS_REENTRY_COOLDOWN_SEC', '1800'))
+PROJECT_G_WIN_REENTRY_COOLDOWN_SEC = int(os.environ.get('PROJECT_G_WIN_REENTRY_COOLDOWN_SEC', '600'))
+PROJECT_G_MAX_SYMBOL_CYCLES = max(1, min(3, int(os.environ.get('PROJECT_G_MAX_SYMBOL_CYCLES', '2'))))
+PROJECT_G_LOSS_STREAK_WARN = max(1, int(os.environ.get('PROJECT_G_LOSS_STREAK_WARN', '2')))
+PROJECT_G_LOSS_STREAK_PAUSE = max(PROJECT_G_LOSS_STREAK_WARN + 1, int(os.environ.get('PROJECT_G_LOSS_STREAK_PAUSE', '3')))
+PROJECT_G_LOSS_STREAK_PAUSE_SEC = int(os.environ.get('PROJECT_G_LOSS_STREAK_PAUSE_SEC', '1200'))
+PROJECT_G_PROFIT_PROTECT_MIN_PEAK_PCT = float(os.environ.get('PROJECT_G_PROFIT_PROTECT_MIN_PEAK_PCT', '1.20'))
+PROJECT_G_PROFIT_GIVEBACK_PCT = float(os.environ.get('PROJECT_G_PROFIT_GIVEBACK_PCT', '0.70'))
+PROJECT_G_PROTECTION_SCORE_ADD = float(os.environ.get('PROJECT_G_PROTECTION_SCORE_ADD', '10.0'))
+PROJECT_G_PROFIT_HARD_GIVEBACK_PCT = float(os.environ.get('PROJECT_G_PROFIT_HARD_GIVEBACK_PCT', '1.20'))
+PROJECT_G_FIRST_ENTRY_HIGH_GAP_PCT = float(os.environ.get('PROJECT_G_FIRST_ENTRY_HIGH_GAP_PCT', '-0.80'))
+PROJECT_G_MAX_CHASE_CHANGE_PCT = float(os.environ.get('PROJECT_G_MAX_CHASE_CHANGE_PCT', '15.0'))
+PROJECT_G_REENTRY_METRIC_IMPROVE = float(os.environ.get('PROJECT_G_REENTRY_METRIC_IMPROVE', '3.0'))
+# V5.12 ETF 전용 PAPER LAB. 기존 G계열과 자금/손익/로그를 완전히 분리한다.
+ETF_LAB_SYMBOLS = ['122630','252670','233740','251340','494310']
+ETF_LAB_START = os.environ.get('ETF_LAB_START', '09:00')
+ETF_LAB_LAST_ENTRY = os.environ.get('ETF_LAB_LAST_ENTRY', '14:40')
+ETF_LAB_FORCE_EXIT = os.environ.get('ETF_LAB_FORCE_EXIT', '15:10')
+ETF_LAB_ENTRY_RATIO = max(0.10, min(0.95, float(os.environ.get('ETF_LAB_ENTRY_RATIO', '0.90'))))
+ETF_LAB_MIN_R3_PCT = float(os.environ.get('ETF_LAB_MIN_R3_PCT', '0.10'))
+ETF_LAB_MIN_R10_PCT = float(os.environ.get('ETF_LAB_MIN_R10_PCT', '0.20'))
+ETF_LAB_HIGH_GAP_PCT = float(os.environ.get('ETF_LAB_HIGH_GAP_PCT', '-0.60'))
+ETF_LAB_MIN_METRIC = float(os.environ.get('ETF_LAB_MIN_METRIC', '58.0'))
+ETF_LAB_E01_TP_PCT = float(os.environ.get('ETF_LAB_E01_TP_PCT', '1.40'))
+ETF_LAB_E01_SL_PCT = float(os.environ.get('ETF_LAB_E01_SL_PCT', '-0.70'))
+ETF_LAB_E02_SL_PCT = float(os.environ.get('ETF_LAB_E02_SL_PCT', '-0.70'))
+ETF_LAB_E02_TRAIL_START_PCT = float(os.environ.get('ETF_LAB_E02_TRAIL_START_PCT', '1.00'))
+ETF_LAB_E02_TRAIL_DRAW_PCT = float(os.environ.get('ETF_LAB_E02_TRAIL_DRAW_PCT', '-0.50'))
+ETF_LAB_DAILY_MAX_LOSS_PCT = float(os.environ.get('ETF_LAB_DAILY_MAX_LOSS_PCT', '-1.40'))
+ETF_LAB_REENTRY_COOLDOWN_SEC = int(os.environ.get('ETF_LAB_REENTRY_COOLDOWN_SEC', '1200'))
 PROJECT_OPENING_START = os.environ.get('PROJECT_OPENING_START', '09:00')
 PROJECT_OPENING_FAST_END = os.environ.get('PROJECT_OPENING_FAST_END', '09:20')
 PROJECT_PRIMARY_ENTRY_END = os.environ.get('PROJECT_PRIMARY_ENTRY_END', '10:30')
@@ -2160,27 +2194,120 @@ def _project_adaptive_exit(sym):
     trail = -min(1.20, max(0.42, 0.45 + v * 0.75))
     return {'tp': None, 'sl': sl, 'trail_start': trail_start, 'trail': trail, 'volatility': v}
 
-def _project_daily_stats(ai_id):
+def _project_is_sell_action(action):
+    a = str(action or '').strip().upper()
+    return a in {'SELL','PARTIAL_SELL','가상매도','부분가상매도','수동가상매도'} or '매도' in a
+
+def _project_is_buy_action(action):
+    a = str(action or '').strip().upper()
+    return a in {'BUY','가상매수','AI자동가상매수'} or ('매수' in a and '매도' not in a)
+
+def _project_today_rows(ai_id):
     ensure_multi_ai_states()
     with LOCK:
         st = S['paper_ais'][ai_id]
-        rows = [r for r in st.get('trades', []) if str(r.get('time','')).startswith(today())]
-    sells = [r for r in rows if str(r.get('action','')).upper() in {'SELL','PARTIAL_SELL'}]
+        return [dict(r) for r in st.get('trades', []) if str(r.get('time','')).startswith(today())]
+
+def _project_row_epoch(row):
+    raw = str(row.get('time','')).strip()
+    for fmt in ('%Y-%m-%d %H:%M:%S','%Y-%m-%d %H:%M','%H:%M:%S','%H:%M'):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            if fmt.startswith('%H'):
+                n = now_kst(); dt = dt.replace(year=n.year, month=n.month, day=n.day)
+            return KST.localize(dt).timestamp() if dt.tzinfo is None else dt.timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+def _project_daily_stats(ai_id):
+    rows = _project_today_rows(ai_id)
+    sells = [r for r in rows if _project_is_sell_action(r.get('action'))]
+    sells_chrono = sorted(sells, key=_project_row_epoch)
     realized = sum(to_float(r.get('pl', 0)) for r in sells)
-    start_cash = max(1.0, to_float(st.get('start_cash', MULTI_AI_START_CASH)))
-    return {'sell_count': len(sells), 'realized_pl': realized, 'realized_pct': realized / start_cash * 100.0}
+    start_cash = max(1.0, to_float(S['paper_ais'][ai_id].get('start_cash', MULTI_AI_START_CASH)))
+    cumulative = 0.0; peak = 0.0; streak = 0
+    for r in sells_chrono:
+        pl = to_float(r.get('pl',0)); cumulative += pl; peak = max(peak, cumulative)
+        streak = streak + 1 if pl < 0 else 0
+    return {
+        'sell_count': len(sells), 'realized_pl': realized, 'realized_pct': realized / start_cash * 100.0,
+        'peak_realized_pl': peak, 'peak_realized_pct': peak / start_cash * 100.0,
+        'giveback_pct': max(0.0, (peak - cumulative) / start_cash * 100.0),
+        'loss_streak': streak, 'last_sell_ts': _project_row_epoch(sells_chrono[-1]) if sells_chrono else 0.0,
+    }
 
 def _project_allow_new_entry(ai_id):
+    """G계열 계좌 공통 비상게이트. +1.4% 수익은 보고용이고 기본 강제종료하지 않는다."""
     if not PROJECT_PAPER_LAB_ENABLED or not str(ai_id).startswith('G'):
         return True
     ds = _project_daily_stats(ai_id)
-    if ds['sell_count'] >= PROJECT_MAX_DAILY_TRADES:
-        return False
+    # 하루 손실 한도만 하드 스톱. 수익이 났다고 좋은 기회를 자동으로 닫지 않는다.
     if ds['realized_pct'] <= PROJECT_DAILY_MAX_LOSS_PCT:
         return False
     if PROJECT_STOP_AFTER_DAILY_TARGET and ds['realized_pct'] >= PROJECT_DAILY_SOFT_TARGET_PCT:
         return False
+    # 최고 실현수익을 크게 반납한 날은 2단계 보호로 신규진입을 완전히 중단한다.
+    if ds['peak_realized_pct'] >= PROJECT_G_PROFIT_PROTECT_MIN_PEAK_PCT and ds['giveback_pct'] >= PROJECT_G_PROFIT_HARD_GIVEBACK_PCT:
+        return False
+    # 3연속 손실 직후에는 잠깐 쉬어서 연속 추격을 막는다.
+    if ds['loss_streak'] >= PROJECT_G_LOSS_STREAK_PAUSE and time.time() - ds['last_sell_ts'] < PROJECT_G_LOSS_STREAK_PAUSE_SEC:
+        return False
     return True
+
+def _project_symbol_reentry_state(ai_id, sym):
+    rows = sorted(_project_today_rows(ai_id), key=_project_row_epoch)
+    sells = [r for r in rows if _project_is_sell_action(r.get('action')) and str(r.get('symbol','')) == str(sym)]
+    last = sells[-1] if sells else None
+    return {'cycles': len(sells), 'last': last, 'last_ts': _project_row_epoch(last) if last else 0.0, 'last_pl': to_float(last.get('pl',0)) if last else 0.0}
+
+def _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, signal_type=''):
+    """좋은 기회는 계속 허용하되 반복추격/수익반납/연속손실만 억제한다."""
+    if not str(ai_id).startswith('G'):
+        return (True, 'NON_G')
+    if not _project_allow_new_entry(ai_id):
+        return (False, 'DAILY_LOSS_OR_STREAK_GUARD')
+    # 08~09시는 연구/후보수집만. 실제 신규진입은 entry window가 09:00부터이며 이중 방어한다.
+    if _project_session_label() in {'PREMARKET','PREMARKET_AUCTION'}:
+        return (False, 'PREMARKET_WATCH_ONLY')
+    if r10 < PROJECT_G_MIN_R10_PCT:
+        return (False, f'R10_WEAK {r10:.2f}<{PROJECT_G_MIN_R10_PCT:.2f}')
+    ds = _project_daily_stats(ai_id)
+    re = _project_symbol_reentry_state(ai_id, sym)
+    if re['cycles'] >= PROJECT_G_MAX_SYMBOL_CYCLES:
+        return (False, f'SYMBOL_MAX_CYCLES {re["cycles"]}')
+    change_now = price_change_pct(sym)
+    # 첫 진입도 고점에서 너무 멀어진 종목/이미 과도하게 뻗은 종목의 뒤늦은 추격은 막는다.
+    if not re['last']:
+        if from_high < PROJECT_G_FIRST_ENTRY_HIGH_GAP_PCT:
+            return (False, f'FIRST_ENTRY_NOT_NEAR_HIGH {from_high:.2f}')
+        if change_now >= PROJECT_G_MAX_CHASE_CHANGE_PCT and r3 < PROJECT_G_REENTRY_MIN_R3_PCT:
+            return (False, f'OVERHEAT_CHASE change={change_now:.2f} r3={r3:.2f}')
+    if re['last']:
+        elapsed = max(0.0, time.time() - re['last_ts'])
+        cooldown = PROJECT_G_LOSS_REENTRY_COOLDOWN_SEC if re['last_pl'] < 0 else PROJECT_G_WIN_REENTRY_COOLDOWN_SEC
+        if elapsed < cooldown:
+            return (False, f'REENTRY_COOLDOWN {elapsed:.0f}<{cooldown}s')
+        # 재진입은 재가속 + 직전 고점 근처/재돌파 조건을 동시에 요구한다.
+        if r3 < PROJECT_G_REENTRY_MIN_R3_PCT or from_high < PROJECT_G_REENTRY_HIGH_GAP_PCT:
+            return (False, f'REENTRY_NO_REBREAK r3={r3:.2f} high={from_high:.2f}')
+        # 재진입은 직전 진입보다 신호 강도가 실제로 좋아져야 한다.
+        prior_metric = 0.0
+        try:
+            m = re.search(r'metric=([-+]?\d+(?:\.\d+)?)', str(re['last'].get('entry_reason','')))
+            prior_metric = float(m.group(1)) if m else 0.0
+        except Exception:
+            prior_metric = 0.0
+        if prior_metric and metric < prior_metric + PROJECT_G_REENTRY_METRIC_IMPROVE:
+            return (False, f'REENTRY_NOT_STRONGER metric={metric:.1f} prior={prior_metric:.1f}')
+    # 2연속 손실 또는 당일 최고수익에서 큰 반납이면 보호모드: 후보 기준을 더 엄격하게.
+    protection = ds['loss_streak'] >= PROJECT_G_LOSS_STREAK_WARN or (
+        ds['peak_realized_pct'] >= PROJECT_G_PROFIT_PROTECT_MIN_PEAK_PCT and ds['giveback_pct'] >= PROJECT_G_PROFIT_GIVEBACK_PCT)
+    if protection and metric < PROJECT_ENTRY_MIN_SCORE + PROJECT_G_PROTECTION_SCORE_ADD:
+        return (False, f'PROTECTION_MODE metric={metric:.1f}')
+    if signal_type == 'PREMARKET_FADE_AVOID':
+        return (False, 'PREMARKET_FADE_AVOID')
+    return (True, 'OK_PROTECTION' if protection else 'OK')
 
 def _project_candidate_score(base_score, sym, q):
     hist = list(S.get('history', {}).get(sym, []) or [])
@@ -2189,7 +2316,7 @@ def _project_candidate_score(base_score, sym, q):
         return (-999.0, 0.0, 0.0, 0.0, 0.0, 'INVALID', {})
     def move(n):
         return pct(cur, to_float(hist[-n - 1])) if len(hist) > n and to_float(hist[-n - 1]) > 0 else 0.0
-    r1, r3, r5 = move(1), move(3), move(5)
+    r1, r3, r5, r10 = move(1), move(3), move(5), move(10)
     recent = [to_float(x) for x in hist[-20:] if to_float(x) > 0]
     high = max(recent or [cur]); low = min(recent or [cur])
     from_high, from_low = pct(cur, high), pct(cur, low)
@@ -2231,7 +2358,7 @@ def _project_candidate_score(base_score, sym, q):
         else:
             score = regular_surge
             signal_type = 'REGULAR_SURGE'
-    return (score, r3, r5, from_high, from_low, signal_type, feat)
+    return (score, r3, r10, from_high, from_low, signal_type, feat)
 
 def project_capture_market_snapshot(force=False):
     if not PROJECT_RESEARCH_SAVE_ENABLED:
@@ -2446,10 +2573,10 @@ def full_market_candidate(ai_id):
         return tuple(cached['tuple'])
     scored = []
     for base_score, sym, q in ranked:
-        ps, r3, r5, from_high, from_low, sigtype, feat = _project_candidate_score(base_score, sym, q)
+        ps, r3, r10, from_high, from_low, sigtype, feat = _project_candidate_score(base_score, sym, q)
         if sigtype == 'PREMARKET_FADE_AVOID':
             continue
-        scored.append((ps, sym, base_score, r3, r5, from_high, from_low,
+        scored.append((ps, sym, base_score, r3, r10, from_high, from_low,
                        min(30.0, max(to_float(q.get('turnover',0)),0.0) ** 0.5 / 20000.0), sigtype, feat))
     best = max(scored, default=(-999.0, '', 0, 0, 0, 0, 0, 0, 'NONE', {}), key=lambda x: x[0])
     # 기존 8개 반환 인터페이스를 유지하되 signal_type은 project state와 reason log에 보존한다.
@@ -2458,7 +2585,7 @@ def full_market_candidate(ai_id):
     if best[1]:
         f = best[9]
         project_write_candidate_event(ai_id, best[1], best[0],
-            f"type={best[8]} base={best[2]:.1f} r3={best[3]:.2f} r5={best[4]:.2f} high={best[5]:.2f} low={best[6]:.2f} pre_last={to_float(f.get('pre_last_chg',0)):.2f}% pre_peak={to_float(f.get('pre_peak_chg',0)):.2f}% reg_vs_pre={to_float(f.get('reg_vs_pre',0)):.2f}% reg_vs_open={to_float(f.get('reg_vs_open',0)):.2f}%",
+            f"type={best[8]} base={best[2]:.1f} r3={best[3]:.2f} r10={best[4]:.2f} high={best[5]:.2f} low={best[6]:.2f} pre_last={to_float(f.get('pre_last_chg',0)):.2f}% pre_peak={to_float(f.get('pre_peak_chg',0)):.2f}% reg_vs_pre={to_float(f.get('reg_vs_pre',0)):.2f}% reg_vs_open={to_float(f.get('reg_vs_open',0)):.2f}%",
             'TOP_CANDIDATE')
     return out
 
@@ -2521,6 +2648,8 @@ def _multi_ai_record(ai_id, action, sym, price, qty, fee, pl, reason, partial=Fa
     save_state()
 
 def _multi_ai_buy(ai_id, sym, reason, ratio=None):
+    if str(ai_id).startswith('G') and not _project_allow_new_entry(ai_id):
+        return False
     if not ensure_live_orderbook(sym):
         return False
     gate_ok, gate_reason = market_safety_gate(sym)
@@ -2793,6 +2922,8 @@ def _multi_ai_entry_window(ai_id, hhmm):
     idx = _multi_ai_index(ai_id)
     if family == 'G':
         return PROJECT_OPENING_START <= hhmm < PROJECT_LAST_ENTRY
+    if family == 'E':
+        return ETF_LAB_START <= hhmm < ETF_LAB_LAST_ENTRY
     if family == 'R':
         fixed = {5: '09:15', 6: '10:00', 7: '11:00', 8: '12:30', 9: '13:00', 10: '13:30'}
         if idx in fixed:
@@ -2819,7 +2950,17 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
     draw = pct(price, high)
     parent = _multi_ai_parent_id(logic_id)
     family = _multi_ai_family(logic_id)
-    if family == 'G':
+    if family == 'E':
+        if profit <= (ETF_LAB_E01_SL_PCT if parent == 'E01' else ETF_LAB_E02_SL_PCT):
+            sl = ETF_LAB_E01_SL_PCT if parent == 'E01' else ETF_LAB_E02_SL_PCT
+            return f'{ai_id} ETF 손절 {profit:.2f}% <= {sl:.2f}%'
+        if parent == 'E01' and profit >= ETF_LAB_E01_TP_PCT:
+            return f'{ai_id} ETF 목표익절 {profit:.2f}% >= {ETF_LAB_E01_TP_PCT:.2f}%'
+        if parent == 'E02' and profit >= ETF_LAB_E02_TRAIL_START_PCT and draw <= ETF_LAB_E02_TRAIL_DRAW_PCT:
+            return f'{ai_id} ETF 추적청산 profit={profit:.2f}% draw={draw:.2f}%'
+        if hhmm >= ETF_LAB_FORCE_EXIT:
+            return f'{ai_id} ETF 당일 {ETF_LAB_FORCE_EXIT} 청산'
+    elif family == 'G':
         prof = PROJECT_G_EXIT_PROFILES.get(parent, PROJECT_G_EXIT_PROFILES['G02'])
         if parent == 'G05':
             adaptive = _project_adaptive_exit(sym)
@@ -3284,8 +3425,77 @@ def _run_expanded_account(ai_id, hhmm, now_ts):
         return True
     return True
 
+def _etf_lab_candidate():
+    """5개 ETF를 동일한 변동성 단위로 비교해 1배/2배 상품의 단순 변동폭 편향을 줄인다."""
+    rows = []
+    for sym in ETF_LAB_SYMBOLS:
+        if to_float(S.get('prices', {}).get(sym, 0)) <= 0:
+            continue
+        score, r3, r10, from_high, from_low = _multi_ai_recent_metrics(sym)
+        vol = max(0.08, _project_intraday_volatility(sym, 15))
+        n3, n10 = r3 / vol, r10 / vol
+        high_bonus = 8.0 if from_high >= -0.20 else (4.0 if from_high >= ETF_LAB_HIGH_GAP_PCT else -8.0)
+        metric = 50.0 + min(18.0, n3 * 5.0) + min(18.0, n10 * 2.5) + high_bonus + min(6.0, score * 0.06)
+        rows.append((metric, sym, score, r3, r10, from_high, from_low, vol))
+    return max(rows, default=(0,'',0,0,0,0,0,0), key=lambda x: x[0])
+
+def _etf_lab_target_done(ai_id):
+    with LOCK:
+        return str(S['paper_ais'][ai_id].get('etf_done_date','')) == today()
+
+def _run_etf_lab_account(ai_id, hhmm, now_ts):
+    """E01=첫 +1.4% 목표익절 성공 후 당일 종료, E02=같은 진입후보를 추적청산으로 비교."""
+    ensure_multi_ai_states()
+    with LOCK:
+        st = S['paper_ais'][ai_id]
+        positions = dict(st.get('positions', {}))
+        last_ts = to_float(st.get('last_decision_ts', 0))
+    if positions:
+        for sym, pos in list(positions.items()):
+            reason = _multi_ai_exit_reason(ai_id, sym, pos, target_market_regime(), hhmm)
+            if reason:
+                ensure_live_orderbook(sym)
+                if _multi_ai_sell(ai_id, sym, reason):
+                    if ai_id == 'E01' and 'ETF 목표익절' in reason:
+                        with LOCK:
+                            S['paper_ais'][ai_id]['etf_done_date'] = today()
+                            S['paper_ais'][ai_id]['last_action'] = f'{now_short()} ETF +1.4% 성공, 당일 신규진입 종료'
+        return True
+    if ai_id == 'E01' and _etf_lab_target_done(ai_id):
+        return True
+    if not (ETF_LAB_START <= hhmm < ETF_LAB_LAST_ENTRY):
+        return True
+    if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC:
+        return True
+    ds = _project_daily_stats(ai_id)
+    if ds['realized_pct'] <= ETF_LAB_DAILY_MAX_LOSS_PCT:
+        with LOCK:
+            st['last_action'] = f'{now_short()} ETF 일일손실한도 관망 {ds["realized_pct"]:.2f}%'
+        return True
+    metric, sym, score, r3, r10, from_high, from_low, vol = _etf_lab_candidate()
+    if (not sym or metric < ETF_LAB_MIN_METRIC or r3 < ETF_LAB_MIN_R3_PCT or
+            r10 < ETF_LAB_MIN_R10_PCT or from_high < ETF_LAB_HIGH_GAP_PCT):
+        with LOCK:
+            st['last_decision_ts'] = now_ts
+            st['last_action'] = f'{now_short()} ETF 관망 metric={metric:.1f} r3={r3:.2f} r10={r10:.2f} high={from_high:.2f}'
+        return True
+    re_state = _project_symbol_reentry_state(ai_id, sym)
+    if re_state['last'] and time.time() - re_state['last_ts'] < ETF_LAB_REENTRY_COOLDOWN_SEC:
+        with LOCK:
+            st['last_decision_ts'] = now_ts
+            st['last_action'] = f'{now_short()} ETF 재진입쿨다운 {name_of(sym)}'
+        return True
+    reason = (f'{MULTI_AI_NAMES[ai_id]} ETF5 best={sym} metric={metric:.1f}, score={score:.1f}, '
+              f'r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, vol={vol:.3f}, decision_data_end={now_text()}')
+    if ensure_live_orderbook(sym) and _multi_ai_buy(ai_id, sym, reason, ETF_LAB_ENTRY_RATIO):
+        with LOCK:
+            st['last_decision_ts'] = now_ts
+            st['last_decision_date'] = today()
+            st['decision_data_end'] = now_text()
+    return True
+
 def run_multi_paper_ais():
-    """90개 독립 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
+    """92개 독립 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS:
         _multi_ai_update(ai_id)
@@ -3300,6 +3510,9 @@ def run_multi_paper_ais():
     # V5.08: G계열은 전용 project_scanner_worker가 만든 최신 스냅샷만 소비한다.
     # worker가 늦거나 죽었을 때의 fallback은 full_market_candidate 내부에서만 수행한다.
     for ai_id in MULTI_AI_IDS:
+        if ai_id in {'E01','E02'}:
+            _run_etf_lab_account(ai_id, hhmm, now_ts)
+            continue
         if ai_id in {'V01', 'V02', 'V03'}:
             _run_verified_fixed_account(ai_id, hhmm, now_ts)
             continue
@@ -3352,6 +3565,14 @@ def run_multi_paper_ais():
         ratios = {'G01': 0.90, 'G02': 0.90, 'G03': 0.90, 'G04': 0.90, 'G05': 0.90, 'W15': 0.3, 'R12': 0.35, 'R13': 0.4, 'L01': 0.7, 'L02': 0.55, 'L03': 0.65, 'L04': 0.5, 'L05': 0.35}
         ratio = ratios.get(parent, 0.7)
         project_type = _project_state().get('shared_candidate', {}).get('signal_type', '') if family == 'G' else ''
+        if family == 'G':
+            allow, guard_reason = _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, project_type)
+            if not allow:
+                with LOCK:
+                    st['last_decision_ts'] = now_ts
+                    st['last_action'] = f'{now_short()} PROJECT 진입차단 {guard_reason} {name_of(sym)}'
+                project_write_candidate_event(ai_id, sym, metric, f'ENTRY_BLOCK {guard_reason} score={score:.1f} r3={r3:.2f} r10={r10:.2f} high={from_high:.2f}', 'ENTRY_BLOCK')
+                continue
         reason = f'{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, universe={MULTI_AI_UNIVERSE[ai_id]}, parent={parent}, mode={mode}, project_type={project_type}, metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%, decision_data_end={now_text()}'
         if _multi_ai_buy(ai_id, sym, reason, ratio):
             with LOCK:
@@ -3813,7 +4034,7 @@ def write_logs():
     # 실계좌 포트폴리오/스윙 로그는 데이터·가상매매 전용 빌드에서 생성하지 않는다.
 
 def finalize_all_paper_accounts():
-    """매매가 없어도 90개 계좌 모두 당일 평가·상태 파일을 남긴다."""
+    """매매가 없어도 92개 계좌 모두 당일 평가·상태 파일을 남긴다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS:
         _multi_ai_update(ai_id)
@@ -5733,7 +5954,7 @@ def maybe_send_daily_backup():
             except Exception as e:
                 verify_ok, verify_report = (False, {'failures': [str(e)]})
             if verify_ok:
-                msg = caption + '\n✅ Google Drive 업로드 성공' + '\n✅ Drive 재다운로드·CRC·26종목 390봉·호가·체결·90계좌·메타데이터 GRADE_1' + f'\n파일 크기: {size_mb:.1f} MB' + f"\nDrive 파일 ID: {result.get('id', '')}"
+                msg = caption + '\n✅ Google Drive 업로드 성공' + '\n✅ Drive 재다운로드·CRC·26종목 390봉·호가·체결·92계좌·메타데이터 GRADE_1' + f'\n파일 크기: {size_mb:.1f} MB' + f"\nDrive 파일 ID: {result.get('id', '')}"
                 buttons = [[telegram_button('Google Drive에서 보기', drive_link)]] if drive_link else []
                 send_telegram(msg, buttons, force=True)
                 with LOCK:
@@ -6772,7 +6993,7 @@ def print_core_selfcheck():
         raise RuntimeError(f'KR 종목 수 오류: {len(ALL26_SYMBOLS)}')
     if len(US_SYMBOLS) != 14:
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
-    if len(MULTI_AI_IDS) != 90:
+    if len(MULTI_AI_IDS) != 92:
         raise RuntimeError(f'가상계좌 수 오류: {len(MULTI_AI_IDS)}')
 if __name__ == '__main__':
     print_core_selfcheck()
