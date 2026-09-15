@@ -27,9 +27,9 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_12_TUESDAY_GUARDED_SURGE_ETF_LAB'
+OPERATING_VERSION = 'OPERATING_V5_13_US_SEMI_REVERSAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
-RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
+RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_2_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
@@ -85,6 +85,35 @@ GOOGLE_OAUTH_STATE_EXPIRES_AT = 0.0
 PAPER_ONLY_MODE = True
 ENABLE_REAL_ORDER = False
 US_REAL_ORDER_ENABLED = False
+
+# V5.13: US semiconductor 3x ETF reversal PAPER LAB.
+# Existing US market-data collector is the single data source; this engine never calls Toss APIs directly.
+US_SEMI_PAPER_ENABLED = os.environ.get('US_SEMI_PAPER_ENABLED', 'true').lower() == 'true'
+US_SEMI_PAPER_IDS = ['U01', 'U02']
+US_SEMI_PAPER_NAMES = {
+    'U01': 'US 반도체3X 역추세 반등 +5% 목표익절',
+    'U02': 'US 반도체3X 역추세 반등 +2% 이후 추적청산',
+}
+US_SEMI_SYMBOLS = ('SOXL', 'SOXS')
+US_SEMI_START_CASH = int(float(os.environ.get('US_SEMI_START_CASH', '10000000')))
+US_SEMI_ENTRY_RATIO = max(0.10, min(0.95, float(os.environ.get('US_SEMI_ENTRY_RATIO', '0.90'))))
+US_SEMI_RESEARCH_KST_START = os.environ.get('US_SEMI_RESEARCH_KST_START', '09:00')
+US_SEMI_EXTREME_MOVE_PCT = abs(float(os.environ.get('US_SEMI_EXTREME_MOVE_PCT', '8.0')))
+US_SEMI_PAIR_SPREAD_PCT = abs(float(os.environ.get('US_SEMI_PAIR_SPREAD_PCT', '10.0')))
+US_SEMI_MOM3_MIN_PCT = float(os.environ.get('US_SEMI_MOM3_MIN_PCT', '0.20'))
+US_SEMI_MOM5_MIN_PCT = float(os.environ.get('US_SEMI_MOM5_MIN_PCT', '0.35'))
+US_SEMI_MOM10_MIN_PCT = float(os.environ.get('US_SEMI_MOM10_MIN_PCT', '0.50'))
+US_SEMI_TURN_LOOKBACK_MIN = max(3, int(os.environ.get('US_SEMI_TURN_LOOKBACK_MIN', '5')))
+US_SEMI_RELATIVE_WEAKEN_PCT = float(os.environ.get('US_SEMI_RELATIVE_WEAKEN_PCT', '0.20'))
+US_SEMI_VOLUME_RATIO_MIN = float(os.environ.get('US_SEMI_VOLUME_RATIO_MIN', '1.20'))
+US_SEMI_U01_TP_PCT = float(os.environ.get('US_SEMI_U01_TP_PCT', '5.0'))
+US_SEMI_U02_TRAIL_START_PCT = float(os.environ.get('US_SEMI_U02_TRAIL_START_PCT', '2.0'))
+US_SEMI_U02_TRAIL_DRAW_PCT = abs(float(os.environ.get('US_SEMI_U02_TRAIL_DRAW_PCT', '0.70')))
+US_SEMI_HARD_SL_PCT = -abs(float(os.environ.get('US_SEMI_HARD_SL_PCT', '3.0')))
+US_SEMI_MAX_TRADES_PER_SESSION = max(1, int(os.environ.get('US_SEMI_MAX_TRADES_PER_SESSION', '2')))
+US_SEMI_REENTRY_COOLDOWN_SEC = max(60, int(os.environ.get('US_SEMI_REENTRY_COOLDOWN_SEC', '900')))
+US_SEMI_DECISION_COOLDOWN_SEC = max(30, int(os.environ.get('US_SEMI_DECISION_COOLDOWN_SEC', '60')))
+US_SEMI_FEE_SIDE_PCT = max(0.0, float(os.environ.get('US_SEMI_FEE_SIDE_PCT', '0.10')))
 ENABLE_PAPER_AUTO = os.environ.get('ENABLE_PAPER_AUTO', 'true').lower() == 'true'
 REFRESH_SEC = int(os.environ.get('REFRESH_SEC', '30'))
 MAX_BUY_RATIO = float(os.environ.get('MAX_BUY_RATIO', '0.70'))
@@ -922,7 +951,7 @@ def save_state():
     """상태를 원자적으로 저장하고 직전 정상본을 .bak로 보존한다."""
     try:
         with LOCK:
-            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {})}
+            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {}), 'us_semi_paper': S.get('us_semi_paper', {})}
         if os.path.isfile(STATE_PATH):
             try:
                 with open(STATE_PATH, 'r', encoding='utf-8') as f:
@@ -983,6 +1012,9 @@ def load_state():
             kr_done = data.get('kr_backup_completed')
             if isinstance(kr_done, dict):
                 S['kr_backup_completed'] = kr_done
+            us_semi = data.get('us_semi_paper')
+            if isinstance(us_semi, dict):
+                S['us_semi_paper'] = us_semi
             if S['paper'].get('start_cash', 0) <= 0:
                 S['paper'] = {'start_cash': VIRTUAL_BASE_CASH, 'cash': VIRTUAL_BASE_CASH, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': VIRTUAL_BASE_CASH, 'profit_rate': 0, 'last_action': '초기 1천만원'}
     except Exception as e:
@@ -3746,6 +3778,302 @@ def capture_orderbook_and_trades(symbols=None):
         if newest is not None:
             state['last_trade_timestamp'][sym] = newest.isoformat()
 
+
+def _us_semi_default(ai_id):
+    return {
+        'id': ai_id, 'name': US_SEMI_PAPER_NAMES.get(ai_id, ai_id),
+        'start_cash': US_SEMI_START_CASH, 'cash': US_SEMI_START_CASH,
+        'position': None, 'realized_pl': 0.0, 'asset': US_SEMI_START_CASH,
+        'profit_rate': 0.0, 'trades': [], 'last_action': '초기화',
+        'last_decision_ts': 0.0, 'last_exit_ts': 0.0, 'trade_count': 0,
+        'trade_date': '', 'peak_asset': US_SEMI_START_CASH, 'mdd_pct': 0.0,
+    }
+
+def ensure_us_semi_paper_states():
+    with LOCK:
+        root = S.setdefault('us_semi_paper', {})
+        for ai_id in US_SEMI_PAPER_IDS:
+            cur = root.get(ai_id)
+            if not isinstance(cur, dict):
+                root[ai_id] = _us_semi_default(ai_id)
+            else:
+                for k, v in _us_semi_default(ai_id).items():
+                    cur.setdefault(k, v)
+                cur['name'] = US_SEMI_PAPER_NAMES.get(ai_id, ai_id)
+
+def us_semi_paper_dir():
+    path = os.path.join(us_day_dir(), 'paper_us_semi')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def us_semi_log_path():
+    return os.path.join(us_semi_paper_dir(), f'us_semi_reversal_{us_trade_date_from_calendar()}.csv')
+
+def us_semi_state_path(ai_id):
+    return os.path.join(us_semi_paper_dir(), f'paper_account_state_{ai_id}_{us_trade_date_from_calendar()}.json')
+
+def _us_session_bounds():
+    """Official regular-session timestamps are the anchor. Premarket begins 5h30m before 09:30 ET regular open,
+    so DST is inherited from the official regular_start timestamp rather than hard-coded KST clocks."""
+    refresh_us_market_calendar(False)
+    cal = S.setdefault('us_market_data_capture', {}).get('calendar', {})
+    regular_start = _parse_iso(cal.get('regular_start'))
+    regular_end = _parse_iso(cal.get('regular_end'))
+    if not cal.get('is_business_day') or not regular_start or not regular_end:
+        return (None, None, None)
+    return (regular_start - timedelta(hours=5, minutes=30), regular_start, regular_end)
+
+def us_market_session_status():
+    pre_start, reg_start, reg_end = _us_session_bounds()
+    if not pre_start:
+        return ('CLOSED', None, None, None)
+    n = now_kst()
+    if pre_start <= n < reg_start:
+        return ('PREMARKET', pre_start, reg_start, reg_end)
+    if reg_start <= n <= reg_end:
+        return ('REGULAR', pre_start, reg_start, reg_end)
+    return ('CLOSED', pre_start, reg_start, reg_end)
+
+def _read_us_candles(sym, limit=240):
+    rows = _read_csv_rows(us_data_path('candles_1m', sym))
+    out = []
+    for r in rows[-max(limit * 2, limit):]:
+        dt = parse_api_datetime(r.get('timestamp'))
+        close = to_float(r.get('close', 0))
+        if dt and close > 0:
+            out.append({
+                'dt': dt, 'close': close, 'high': to_float(r.get('high', close)),
+                'low': to_float(r.get('low', close)), 'volume': to_float(r.get('volume', 0))
+            })
+    out.sort(key=lambda x: x['dt'])
+    return out[-limit:]
+
+def _us_return(candles, minutes):
+    if len(candles) < minutes + 1:
+        return 0.0
+    return pct(candles[-1]['close'], candles[-1-minutes]['close'])
+
+def _us_session_open_return(candles, session_start):
+    valid = [x for x in candles if x['dt'] >= session_start]
+    if not valid:
+        return 0.0
+    return pct(valid[-1]['close'], valid[0]['close'])
+
+def _us_volume_ratio(candles, short=3, base=20):
+    if len(candles) < max(short, base):
+        return 0.0
+    recent = sum(x['volume'] for x in candles[-short:]) / short
+    baseline_rows = candles[-base:-short] or candles[-base:]
+    baseline = sum(x['volume'] for x in baseline_rows) / max(1, len(baseline_rows))
+    return recent / baseline if baseline > 0 else 0.0
+
+def _us_turn_stopped(candles, side):
+    """For a rebound-long candidate, require fresh lows to stop; for inverse rebound, same rule on that ETF."""
+    n = US_SEMI_TURN_LOOKBACK_MIN
+    if len(candles) < n + 3:
+        return False
+    recent = candles[-n:]
+    prior = candles[-(n+3):-n]
+    if not prior:
+        return False
+    # Entry ETF itself must stop printing lower lows and close away from its recent low.
+    prior_low = min(x['low'] for x in prior)
+    recent_low = min(x['low'] for x in recent)
+    last = recent[-1]['close']
+    return recent_low >= prior_low and last > recent_low
+
+def _us_pair_features():
+    session, pre_start, reg_start, reg_end = us_market_session_status()
+    if session not in {'PREMARKET', 'REGULAR'}:
+        return {'ok': False, 'block': 'SESSION_CLOSED', 'session': session}
+    start = pre_start if session == 'PREMARKET' else reg_start
+    pair = {}
+    for sym in US_SEMI_SYMBOLS:
+        c = _read_us_candles(sym)
+        if len(c) < 21:
+            return {'ok': False, 'block': f'INSUFFICIENT_CANDLES_{sym}', 'session': session}
+        pair[sym] = {
+            'candles': c, 'price': c[-1]['close'], 'move': _us_session_open_return(c, start),
+            'm3': _us_return(c, 3), 'm5': _us_return(c, 5), 'm10': _us_return(c, 10),
+            'vol_ratio': _us_volume_ratio(c), 'turn_stopped': _us_turn_stopped(c, sym),
+        }
+    pair_spread = pair['SOXL']['move'] - pair['SOXS']['move']
+    # The more beaten-down member is the mean-reversion candidate.
+    candidate = 'SOXL' if pair['SOXL']['move'] < pair['SOXS']['move'] else 'SOXS'
+    opposite = 'SOXS' if candidate == 'SOXL' else 'SOXL'
+    c, o = pair[candidate], pair[opposite]
+    extreme = c['move'] <= -US_SEMI_EXTREME_MOVE_PCT or abs(pair_spread) >= US_SEMI_PAIR_SPREAD_PCT
+    momentum = c['m3'] >= US_SEMI_MOM3_MIN_PCT and c['m5'] >= US_SEMI_MOM5_MIN_PCT and c['m10'] >= US_SEMI_MOM10_MIN_PCT
+    relative_weakening = o['m3'] <= -US_SEMI_RELATIVE_WEAKEN_PCT or c['m3'] > o['m3']
+    volume_ok = c['vol_ratio'] >= US_SEMI_VOLUME_RATIO_MIN
+    turn_ok = bool(c['turn_stopped'])
+    ok = extreme and momentum and relative_weakening and volume_ok and turn_ok
+    blocks = []
+    if not extreme: blocks.append('NOT_EXTREME')
+    if not momentum: blocks.append('MOMENTUM_NOT_CONFIRMED')
+    if not turn_ok: blocks.append('NEW_EXTREME_STILL_UPDATING')
+    if not relative_weakening: blocks.append('OPPOSITE_ETF_NOT_WEAKENING')
+    if not volume_ok: blocks.append('VOLUME_NOT_EXPANDING')
+    return {
+        'ok': ok, 'block': '|'.join(blocks) if blocks else 'ENTRY_OK', 'session': session,
+        'candidate': candidate, 'opposite': opposite, 'pair_spread_pct': pair_spread,
+        'candidate_move_pct': c['move'], 'opposite_move_pct': o['move'],
+        'm3': c['m3'], 'm5': c['m5'], 'm10': c['m10'],
+        'opposite_m3': o['m3'], 'volume_ratio': c['vol_ratio'], 'turn_stopped': turn_ok,
+        'price': c['price'],
+    }
+
+def _us_semi_log(ai_id, event, f, pnl_pct=0.0, mfe=0.0, mae=0.0, reason=''):
+    headers = ['time_kst','trade_date','account','event','session','symbol','opposite',
+               'price','candidate_move_pct','opposite_move_pct','pair_spread_pct',
+               'm3','m5','m10','opposite_m3','turn_stopped','volume_ratio',
+               'reason','mfe_pct','mae_pct','return_pct','real_order_enabled']
+    write_row(us_semi_log_path(), headers, {
+        'time_kst': now_text(), 'trade_date': us_trade_date_from_calendar(), 'account': ai_id,
+        'event': event, 'session': f.get('session',''), 'symbol': f.get('candidate',''),
+        'opposite': f.get('opposite',''), 'price': f.get('price',0),
+        'candidate_move_pct': round(to_float(f.get('candidate_move_pct')),4),
+        'opposite_move_pct': round(to_float(f.get('opposite_move_pct')),4),
+        'pair_spread_pct': round(to_float(f.get('pair_spread_pct')),4),
+        'm3': round(to_float(f.get('m3')),4), 'm5': round(to_float(f.get('m5')),4),
+        'm10': round(to_float(f.get('m10')),4), 'opposite_m3': round(to_float(f.get('opposite_m3')),4),
+        'turn_stopped': bool(f.get('turn_stopped')), 'volume_ratio': round(to_float(f.get('volume_ratio')),4),
+        'reason': reason or f.get('block',''), 'mfe_pct': round(mfe,4), 'mae_pct': round(mae,4),
+        'return_pct': round(pnl_pct,4), 'real_order_enabled': False,
+    })
+
+def _us_semi_mark_price(sym):
+    c = _read_us_candles(sym, 5)
+    return c[-1]['close'] if c else 0.0
+
+def _us_semi_buy(ai_id, f):
+    ensure_us_semi_paper_states()
+    price = to_float(f.get('price'))
+    if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
+        return False
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        cash = to_float(st.get('cash'))
+        budget = cash * US_SEMI_ENTRY_RATIO
+        qty = int(budget / price)
+        if qty <= 0:
+            return False
+        fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
+        cost = qty * price + fee
+        if cost > cash:
+            qty = max(0, int(cash / (price * (1 + US_SEMI_FEE_SIDE_PCT/100.0))))
+            fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
+            cost = qty * price + fee
+        if qty <= 0:
+            return False
+        st['cash'] = cash - cost
+        st['position'] = {'symbol': f['candidate'], 'qty': qty, 'avg': price, 'entry_fee': fee,
+                          'entry_time': now_text(), 'peak_price': price, 'trough_price': price,
+                          'entry_features': dict(f)}
+        st['trade_count'] = to_int(st.get('trade_count')) + 1
+        st['last_decision_ts'] = time.time()
+        st['last_action'] = f"{now_short()} PAPER BUY {f['candidate']} {qty}@{price:.4f}"
+    _us_semi_log(ai_id, 'PAPER_ENTRY', f, reason=f.get('block','ENTRY_OK'))
+    return True
+
+def _us_semi_sell(ai_id, reason):
+    ensure_us_semi_paper_states()
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        pos = dict(st.get('position') or {})
+    if not pos:
+        return False
+    sym = pos['symbol']
+    price = _us_semi_mark_price(sym)
+    if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
+        return False
+    qty, avg = to_int(pos.get('qty')), to_float(pos.get('avg'))
+    entry_fee = to_float(pos.get('entry_fee'))
+    exit_fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
+    pnl = qty * (price - avg) - entry_fee - exit_fee
+    pnl_pct = (pnl / max(1e-9, qty * avg + entry_fee)) * 100.0
+    mfe = pct(to_float(pos.get('peak_price', avg)), avg)
+    mae = pct(to_float(pos.get('trough_price', avg)), avg)
+    f = dict(pos.get('entry_features') or {})
+    f.update({'candidate': sym, 'price': price, 'session': us_market_session_status()[0]})
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        st['cash'] = to_float(st.get('cash')) + qty * price - exit_fee
+        st['realized_pl'] = to_float(st.get('realized_pl')) + pnl
+        st['position'] = None
+        st['last_exit_ts'] = time.time()
+        st['last_action'] = f'{now_short()} PAPER SELL {sym} {pnl_pct:.2f}% {reason}'
+        st['trades'].append({'time': now_text(), 'symbol': sym, 'qty': qty, 'entry': avg,
+                             'exit': price, 'pnl': pnl, 'return_pct': pnl_pct,
+                             'mfe_pct': mfe, 'mae_pct': mae, 'reason': reason})
+        st['trades'] = st['trades'][-200:]
+    _us_semi_log(ai_id, 'PAPER_EXIT', f, pnl_pct, mfe, mae, reason)
+    return True
+
+def run_us_semi_paper():
+    """U01/U02 share one confirmed reversal entry signal; only exit method differs."""
+    ensure_us_semi_paper_states()
+    if not US_SEMI_PAPER_ENABLED:
+        return
+    # Research starts 09:00 KST, but PAPER entries are only possible in official-US-anchored premarket/regular sessions.
+    if now_kst().strftime('%H:%M') < US_SEMI_RESEARCH_KST_START:
+        return
+    f = _us_pair_features()
+    trade_date = us_trade_date_from_calendar()
+    for ai_id in US_SEMI_PAPER_IDS:
+        with LOCK:
+            st = S['us_semi_paper'][ai_id]
+            if st.get('trade_date') != trade_date:
+                st['trade_date'], st['trade_count'] = trade_date, 0
+            pos = dict(st.get('position') or {})
+        if pos:
+            price = _us_semi_mark_price(pos['symbol'])
+            if price <= 0:
+                continue
+            with LOCK:
+                p = S['us_semi_paper'][ai_id]['position']
+                p['peak_price'] = max(to_float(p.get('peak_price', price)), price)
+                p['trough_price'] = min(to_float(p.get('trough_price', price)), price)
+                avg, peak = to_float(p.get('avg')), to_float(p.get('peak_price'))
+            profit = pct(price, avg)
+            draw = pct(price, peak)
+            if profit <= US_SEMI_HARD_SL_PCT:
+                _us_semi_sell(ai_id, f'HARD_SL {profit:.2f}%')
+            elif ai_id == 'U01' and profit >= US_SEMI_U01_TP_PCT:
+                _us_semi_sell(ai_id, f'TP {profit:.2f}%')
+            elif ai_id == 'U02' and profit >= US_SEMI_U02_TRAIL_START_PCT and draw <= -US_SEMI_U02_TRAIL_DRAW_PCT:
+                _us_semi_sell(ai_id, f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
+            elif f.get('session') == 'CLOSED':
+                _us_semi_sell(ai_id, 'SESSION_END')
+            continue
+        if f.get('session') not in {'PREMARKET','REGULAR'}:
+            continue
+        with LOCK:
+            st = S['us_semi_paper'][ai_id]
+            last_decision = to_float(st.get('last_decision_ts'))
+            last_exit = to_float(st.get('last_exit_ts'))
+            trades = to_int(st.get('trade_count'))
+        if trades >= US_SEMI_MAX_TRADES_PER_SESSION:
+            _us_semi_log(ai_id, 'BLOCK', f, reason='MAX_TRADES')
+            continue
+        if time.time() - last_exit < US_SEMI_REENTRY_COOLDOWN_SEC:
+            continue
+        if time.time() - last_decision < US_SEMI_DECISION_COOLDOWN_SEC:
+            continue
+        with LOCK:
+            S['us_semi_paper'][ai_id]['last_decision_ts'] = time.time()
+        if not f.get('ok'):
+            _us_semi_log(ai_id, 'BLOCK', f, reason=f.get('block','NOT_CONFIRMED'))
+            continue
+        _us_semi_buy(ai_id, f)
+    # Persist per-account snapshots for backup/selfcheck.
+    for ai_id in US_SEMI_PAPER_IDS:
+        try:
+            _atomic_json_write(us_semi_state_path(ai_id), S['us_semi_paper'][ai_id])
+        except Exception as e:
+            set_error(f'{ai_id} state 저장 실패: {e}')
+
+
 def capture_us_market_data():
     """미국 정규장 전용 수집. 한국 파일·상태와 절대 섞지 않는다."""
     if not ENABLE_US_MARKET_DATA_CAPTURE:
@@ -3788,7 +4116,10 @@ def capture_us_market_data():
                 candles = _result_dict(data).get('candles', [])
                 for c in reversed(candles if isinstance(candles, list) else []):
                     ts = str(c.get('timestamp', ''))
-                    if not _completed_session_candle(ts, None, cal.get('regular_start'), cal.get('regular_end')):
+                    pre_start, reg_start, reg_end = _us_session_bounds()
+                    if not _completed_session_candle(ts, None,
+                            pre_start.isoformat() if pre_start else cal.get('regular_start'),
+                            reg_end.isoformat() if reg_end else cal.get('regular_end')):
                         continue
                     close = to_float(c.get('closePrice', 0))
                     volume = to_float(c.get('volume', 0))
@@ -6027,6 +6358,7 @@ def loop():
     """DATA+PAPER ONLY 핵심 루프: KR/US 데이터 수집 + 가상매매 + 원본보존/백업만 수행한다. 실주문/추천 실행 없음."""
     load_state()
     ensure_multi_ai_states()
+    ensure_us_semi_paper_states()
     save_state()
     counter = 0
     initialized = False
@@ -6045,8 +6377,9 @@ def loop():
                 if ENABLE_US_MARKET_DATA_CAPTURE:
                     try:
                         capture_us_market_data()
+                        run_us_semi_paper()
                     except Exception as e:
-                        set_error(f'주말 미국 데이터 수집 오류: {e}')
+                        set_error(f'주말 미국 데이터/PAPER 오류: {e}')
                     try:
                         maybe_send_us_backup()
                     except Exception as e:
@@ -6074,8 +6407,9 @@ def loop():
                 set_error(f'한국 데이터 수집 오류: {e}')
             try:
                 capture_us_market_data()
+                run_us_semi_paper()
             except Exception as e:
-                set_error(f'미국 데이터 수집 오류: {e}')
+                set_error(f'미국 데이터/PAPER 오류: {e}')
             calc_wma_all()
             calc_scores()
             write_logs()
@@ -6757,7 +7091,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path == '/rescue_today':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -6801,7 +7135,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS)}계좌</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS)}계좌 (KR {len(MULTI_AI_IDS)} + US {len(US_SEMI_PAPER_IDS)})</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
@@ -6955,7 +7289,7 @@ def acquire_single_instance_lock():
 def print_core_selfcheck():
     print('[CORE DATA/PAPER/BACKUP FROZEN]', flush=True)
     print('version=', OPERATING_VERSION, flush=True)
-    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS), flush=True)
+    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS), '(KR=', len(MULTI_AI_IDS), 'US=', len(US_SEMI_PAPER_IDS), ')', flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
     print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
     print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
@@ -6994,7 +7328,11 @@ def print_core_selfcheck():
     if len(US_SYMBOLS) != 14:
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
     if len(MULTI_AI_IDS) != 92:
-        raise RuntimeError(f'가상계좌 수 오류: {len(MULTI_AI_IDS)}')
+        raise RuntimeError(f'KR 가상계좌 수 오류: {len(MULTI_AI_IDS)}')
+    if len(US_SEMI_PAPER_IDS) != 2:
+        raise RuntimeError(f'US U계열 가상계좌 수 오류: {len(US_SEMI_PAPER_IDS)}')
+    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) != 94:
+        raise RuntimeError(f'전체 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS)}')
 if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
