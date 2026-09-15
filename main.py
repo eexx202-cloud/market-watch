@@ -1,5 +1,5 @@
 # OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
-# V5.12: KR/US 데이터 수집 + 92 가상계좌(G급등주 + E ETF LAB 포함) + 검증 + 백업/Drive 전용.
+# V5.14: 기존 KR 92 PAPER 유지 + SOXL/SOXS 거의 24시간 감시 + U01/U02 반전 PAPER + 세션별 로그.
 # V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_13_US_SEMI_REVERSAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_14_US_SEMI_24H_REVERSAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_2_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -114,6 +114,13 @@ US_SEMI_MAX_TRADES_PER_SESSION = max(1, int(os.environ.get('US_SEMI_MAX_TRADES_P
 US_SEMI_REENTRY_COOLDOWN_SEC = max(60, int(os.environ.get('US_SEMI_REENTRY_COOLDOWN_SEC', '900')))
 US_SEMI_DECISION_COOLDOWN_SEC = max(30, int(os.environ.get('US_SEMI_DECISION_COOLDOWN_SEC', '60')))
 US_SEMI_FEE_SIDE_PCT = max(0.0, float(os.environ.get('US_SEMI_FEE_SIDE_PCT', '0.10')))
+# V5.14: 미국주식 거의 24시간 PAPER 감시. 실제 데이터가 들어오는 세션만 활성화한다.
+US_SEMI_24H_WATCH = os.environ.get('US_SEMI_24H_WATCH', 'true').lower() == 'true'
+US_SEMI_EXTENDED_CANDLE_SEC = max(30, int(os.environ.get('US_SEMI_EXTENDED_CANDLE_SEC', '60')))
+US_SEMI_EXTENDED_ORDERFLOW_SEC = max(30, int(os.environ.get('US_SEMI_EXTENDED_ORDERFLOW_SEC', '60')))
+US_SEMI_STALE_DATA_SEC = max(90, int(os.environ.get('US_SEMI_STALE_DATA_SEC', '240')))
+US_SEMI_AFTER_HOURS = os.environ.get('US_SEMI_AFTER_HOURS', 'true').lower() == 'true'
+US_SEMI_OVERNIGHT = os.environ.get('US_SEMI_OVERNIGHT', 'true').lower() == 'true'
 ENABLE_PAPER_AUTO = os.environ.get('ENABLE_PAPER_AUTO', 'true').lower() == 'true'
 REFRESH_SEC = int(os.environ.get('REFRESH_SEC', '30'))
 MAX_BUY_RATIO = float(os.environ.get('MAX_BUY_RATIO', '0.70'))
@@ -3813,8 +3820,7 @@ def us_semi_state_path(ai_id):
     return os.path.join(us_semi_paper_dir(), f'paper_account_state_{ai_id}_{us_trade_date_from_calendar()}.json')
 
 def _us_session_bounds():
-    """Official regular-session timestamps are the anchor. Premarket begins 5h30m before 09:30 ET regular open,
-    so DST is inherited from the official regular_start timestamp rather than hard-coded KST clocks."""
+    """Regular-session timestamps remain the official anchor used by legacy code."""
     refresh_us_market_calendar(False)
     cal = S.setdefault('us_market_data_capture', {}).get('calendar', {})
     regular_start = _parse_iso(cal.get('regular_start'))
@@ -3823,16 +3829,33 @@ def _us_session_bounds():
         return (None, None, None)
     return (regular_start - timedelta(hours=5, minutes=30), regular_start, regular_end)
 
-def us_market_session_status():
+def _us_extended_bounds():
+    """Nearly-24h research window: overnight -> premarket -> regular -> after-hours."""
     pre_start, reg_start, reg_end = _us_session_bounds()
-    if not pre_start:
-        return ('CLOSED', None, None, None)
+    if not reg_start or not reg_end:
+        return (None, None, None, None, None)
+    overnight_start = reg_start - timedelta(hours=13, minutes=30)
+    after_end = reg_end + timedelta(hours=4)
+    return (overnight_start, pre_start, reg_start, reg_end, after_end)
+
+def us_market_session_status():
+    overnight_start, pre_start, reg_start, reg_end, after_end = _us_extended_bounds()
+    if not overnight_start:
+        return ('CLOSED', None, None, None, None, None)
     n = now_kst()
+    if US_SEMI_OVERNIGHT and overnight_start <= n < pre_start:
+        return ('OVERNIGHT', overnight_start, pre_start, reg_start, reg_end, after_end)
     if pre_start <= n < reg_start:
-        return ('PREMARKET', pre_start, reg_start, reg_end)
+        return ('PREMARKET', overnight_start, pre_start, reg_start, reg_end, after_end)
     if reg_start <= n <= reg_end:
-        return ('REGULAR', pre_start, reg_start, reg_end)
-    return ('CLOSED', pre_start, reg_start, reg_end)
+        return ('REGULAR', overnight_start, pre_start, reg_start, reg_end, after_end)
+    if US_SEMI_AFTER_HOURS and reg_end < n <= after_end:
+        return ('AFTER_HOURS', overnight_start, pre_start, reg_start, reg_end, after_end)
+    return ('CLOSED', overnight_start, pre_start, reg_start, reg_end, after_end)
+
+def _us_session_start_for_features(session, overnight_start, pre_start, reg_start, reg_end):
+    return {'OVERNIGHT': overnight_start, 'PREMARKET': pre_start,
+            'REGULAR': reg_start, 'AFTER_HOURS': reg_end}.get(session)
 
 def _read_us_candles(sym, limit=240):
     rows = _read_csv_rows(us_data_path('candles_1m', sym))
@@ -3883,15 +3906,18 @@ def _us_turn_stopped(candles, side):
     return recent_low >= prior_low and last > recent_low
 
 def _us_pair_features():
-    session, pre_start, reg_start, reg_end = us_market_session_status()
-    if session not in {'PREMARKET', 'REGULAR'}:
+    session, overnight_start, pre_start, reg_start, reg_end, after_end = us_market_session_status()
+    if session not in {'OVERNIGHT', 'PREMARKET', 'REGULAR', 'AFTER_HOURS'}:
         return {'ok': False, 'block': 'SESSION_CLOSED', 'session': session}
-    start = pre_start if session == 'PREMARKET' else reg_start
+    start = _us_session_start_for_features(session, overnight_start, pre_start, reg_start, reg_end)
     pair = {}
     for sym in US_SEMI_SYMBOLS:
         c = _read_us_candles(sym)
         if len(c) < 21:
             return {'ok': False, 'block': f'INSUFFICIENT_CANDLES_{sym}', 'session': session}
+        age_sec = max(0.0, (now_kst() - c[-1]['dt']).total_seconds())
+        if age_sec > US_SEMI_STALE_DATA_SEC:
+            return {'ok': False, 'block': f'STALE_DATA_{sym}_{int(age_sec)}s', 'session': session}
         pair[sym] = {
             'candles': c, 'price': c[-1]['close'], 'move': _us_session_open_return(c, start),
             'm3': _us_return(c, 3), 'm5': _us_return(c, 5), 'm10': _us_return(c, 10),
@@ -3968,7 +3994,7 @@ def _us_semi_buy(ai_id, f):
             return False
         st['cash'] = cash - cost
         st['position'] = {'symbol': f['candidate'], 'qty': qty, 'avg': price, 'entry_fee': fee,
-                          'entry_time': now_text(), 'peak_price': price, 'trough_price': price,
+                          'entry_time': now_text(), 'peak_price': price, 'trough_price': price, 'trailing_armed': False,
                           'entry_features': dict(f)}
         st['trade_count'] = to_int(st.get('trade_count')) + 1
         st['last_decision_ts'] = time.time()
@@ -4015,7 +4041,7 @@ def run_us_semi_paper():
     ensure_us_semi_paper_states()
     if not US_SEMI_PAPER_ENABLED:
         return
-    # Research starts 09:00 KST, but PAPER entries are only possible in official-US-anchored premarket/regular sessions.
+    # Research starts 09:00 KST; entry is allowed only when active-session SOXL/SOXS data is fresh.
     if now_kst().strftime('%H:%M') < US_SEMI_RESEARCH_KST_START:
         return
     f = _us_pair_features()
@@ -4035,18 +4061,21 @@ def run_us_semi_paper():
                 p['peak_price'] = max(to_float(p.get('peak_price', price)), price)
                 p['trough_price'] = min(to_float(p.get('trough_price', price)), price)
                 avg, peak = to_float(p.get('avg')), to_float(p.get('peak_price'))
+                profit_now = pct(price, avg)
+                if ai_id == 'U02' and profit_now >= US_SEMI_U02_TRAIL_START_PCT:
+                    p['trailing_armed'] = True
+                trailing_armed = bool(p.get('trailing_armed', False))
             profit = pct(price, avg)
             draw = pct(price, peak)
             if profit <= US_SEMI_HARD_SL_PCT:
                 _us_semi_sell(ai_id, f'HARD_SL {profit:.2f}%')
             elif ai_id == 'U01' and profit >= US_SEMI_U01_TP_PCT:
                 _us_semi_sell(ai_id, f'TP {profit:.2f}%')
-            elif ai_id == 'U02' and profit >= US_SEMI_U02_TRAIL_START_PCT and draw <= -US_SEMI_U02_TRAIL_DRAW_PCT:
+            elif ai_id == 'U02' and trailing_armed and draw <= -US_SEMI_U02_TRAIL_DRAW_PCT:
                 _us_semi_sell(ai_id, f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
-            elif f.get('session') == 'CLOSED':
-                _us_semi_sell(ai_id, 'SESSION_END')
+            # 세션이 바뀌었다는 이유만으로 청산하지 않고 거의 24시간 연속 감시한다.
             continue
-        if f.get('session') not in {'PREMARKET','REGULAR'}:
+        if f.get('session') not in {'OVERNIGHT','PREMARKET','REGULAR','AFTER_HOURS'}:
             continue
         with LOCK:
             st = S['us_semi_paper'][ai_id]
@@ -4075,23 +4104,26 @@ def run_us_semi_paper():
 
 
 def capture_us_market_data():
-    """미국 정규장 전용 수집. 한국 파일·상태와 절대 섞지 않는다."""
+    """정규장=기존 US 전체, 정규장 밖 활성세션=SOXL/SOXS만 수집해 429 부담을 제한한다."""
     if not ENABLE_US_MARKET_DATA_CAPTURE:
         return
-    opened, reason = us_regular_market_open_now()
     state = S.setdefault('us_market_data_capture', {})
-    if not opened:
-        state['status'] = reason
+    session, overnight_start, pre_start, reg_start, reg_end, after_end = us_market_session_status()
+    if session == 'CLOSED':
+        state['status'] = 'US_EXTENDED_CLOSED'
         return
+    state['status'] = session
+    active_us_symbols = list(US_SYMBOLS) if session == 'REGULAR' else list(US_SEMI_SYMBOLS)
     cal = state.get('calendar', {})
     now_ts = time.time()
     candle_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'estimated_trade_value', 'currency']
     ob_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'api_timestamp', 'best_ask', 'best_bid', 'spread', 'ask_total_volume', 'bid_total_volume', 'asks_json', 'bids_json']
     tr_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'price', 'volume', 'trade_value', 'currency']
-    if now_ts - to_float(state.get('last_price_ts', 0)) >= US_ORDERFLOW_SEC:
+    price_sec = US_ORDERFLOW_SEC if session == 'REGULAR' else US_SEMI_EXTENDED_ORDERFLOW_SEC
+    if now_ts - to_float(state.get('last_price_ts', 0)) >= price_sec:
         req = now_kst()
         t0 = time.time()
-        code, data = api_get('/api/v1/prices', params={'symbols': ','.join(US_SYMBOLS)}, timeout=10)
+        code, data = api_get('/api/v1/prices', params={'symbols': ','.join(active_us_symbols)}, timeout=10)
         rec = now_kst()
         latency = round((time.time() - t0) * 1000, 3)
         if code == 200:
@@ -4101,12 +4133,13 @@ def capture_us_market_data():
                 if not isinstance(item, dict):
                     continue
                 sym = str(item.get('symbol', '')).upper()
-                if sym not in US_SYMBOLS:
+                if sym not in active_us_symbols:
                     continue
                 write_row(us_data_path('prices', sym), headers, {'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': item.get('timestamp', ''), 'last_price': item.get('lastPrice', 0), 'currency': item.get('currency', 'USD')})
         state['last_price_ts'] = now_ts
-    if now_ts - to_float(state.get('last_candle_ts', 0)) >= US_CANDLE_SEC:
-        for sym in US_SYMBOLS:
+    candle_sec = US_CANDLE_SEC if session == 'REGULAR' else US_SEMI_EXTENDED_CANDLE_SEC
+    if now_ts - to_float(state.get('last_candle_ts', 0)) >= candle_sec:
+        for sym in active_us_symbols:
             req = now_kst()
             t0 = time.time()
             code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': 200, 'adjusted': True}, timeout=10)
@@ -4116,18 +4149,19 @@ def capture_us_market_data():
                 candles = _result_dict(data).get('candles', [])
                 for c in reversed(candles if isinstance(candles, list) else []):
                     ts = str(c.get('timestamp', ''))
-                    pre_start, reg_start, reg_end = _us_session_bounds()
+                    overnight_start2, pre_start2, reg_start2, reg_end2, after_end2 = _us_extended_bounds()
                     if not _completed_session_candle(ts, None,
-                            pre_start.isoformat() if pre_start else cal.get('regular_start'),
-                            reg_end.isoformat() if reg_end else cal.get('regular_end')):
+                            overnight_start2.isoformat() if overnight_start2 else cal.get('regular_start'),
+                            after_end2.isoformat() if after_end2 else cal.get('regular_end')):
                         continue
                     close = to_float(c.get('closePrice', 0))
                     volume = to_float(c.get('volume', 0))
                     write_row_unique(us_data_path('candles_1m', sym), candle_headers, {'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': ts, 'open': c.get('openPrice', 0), 'high': c.get('highPrice', 0), 'low': c.get('lowPrice', 0), 'close': c.get('closePrice', 0), 'volume': c.get('volume', 0), 'estimated_trade_value': round(close * volume, 4), 'currency': c.get('currency', 'USD')}, ['symbol', 'timestamp'])
             _market_data_request_gap()
         state['last_candle_ts'] = now_ts
-    if now_ts - to_float(state.get('last_orderflow_ts', 0)) >= US_ORDERFLOW_SEC:
-        for sym in US_SYMBOLS:
+    orderflow_sec = US_ORDERFLOW_SEC if session == 'REGULAR' else US_SEMI_EXTENDED_ORDERFLOW_SEC
+    if now_ts - to_float(state.get('last_orderflow_ts', 0)) >= orderflow_sec:
+        for sym in active_us_symbols:
             req = now_kst()
             t0 = time.time()
             code, data = api_get('/api/v1/orderbook', params={'symbol': sym}, timeout=8)
@@ -4169,7 +4203,7 @@ def capture_us_market_data():
     if now_ts - to_float(state.get('last_metadata_ts', 0)) >= US_METADATA_REFRESH_SEC:
         daily_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'currency']
         meta_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'stock_http', 'warning_http', 'limits_http', 'stock_json', 'warning_json', 'limits_json']
-        for sym in US_SYMBOLS:
+        for sym in active_us_symbols:
             req = now_kst()
             t0 = time.time()
             code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1d', 'count': 200, 'adjusted': True}, timeout=12)
