@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_14_US_SEMI_24H_REVERSAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_16_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_2_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -290,9 +290,10 @@ US_CANDLE_SEC = max(60, int(os.environ.get('US_CANDLE_SEC', '60')))
 US_ORDERFLOW_SEC = max(30, int(os.environ.get('US_ORDERFLOW_SEC', '60')))
 US_METADATA_REFRESH_SEC = max(3600, int(os.environ.get('US_METADATA_REFRESH_SEC', '21600')))
 US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))
-TOSS_OPENAPI_SPEC_VERSION = '1.2.13'
+TOSS_OPENAPI_SPEC_VERSION = 'LATEST_DOCS_2026-09-15'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
-TOSS_MARKET_DATA_TRANSPORT = 'REST_POLLING'  # 공식 1.2.13: WebSocket은 추후 지원 예정
+TOSS_OPENAPI_ASYNCAPI_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json'  # 공식 WebSocket source of truth
+TOSS_MARKET_DATA_TRANSPORT = 'REST_POLLING_WS_AVAILABLE'  # 현재 구현은 REST 폴링. Toss 공식 API는 실시간 체결/호가 WebSocket도 지원.
 MARKET_MODE = 'KR_US_PAPER_ONLY'
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_START_MIN', '2')))
 KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_END_MIN', '15')))
@@ -1939,7 +1940,7 @@ def _quote_field(item, keys, default=0.0):
 
 def _scan_full_market_universe_impl(force=False):
     """토스 전체시장 랭킹 후보를 현재가로 보강한다.
-    REST 폴링 전용이며(공식 1.2.13 WebSocket 미지원), 중복 스레드 호출은 전역 lock으로 직렬화한다.
+    현재 이 수집기는 REST 폴링을 사용하며, 중복 스레드 호출은 전역 lock으로 직렬화한다. Toss 공식 API는 WebSocket 실시간 체결/호가도 지원하지만 본 PAPER 수집기는 안정성을 위해 REST를 유지한다.
     """
     state = S.setdefault('full_market', {})
     if not ENABLE_FULL_MARKET_SCANNER:
@@ -2554,44 +2555,98 @@ def _project_disk_usage():
         return {'total': 0, 'used': 0, 'free': 0, 'used_pct': 0.0, 'error': str(e)}
 
 def project_storage_housekeeping(force=False):
-    # Drive 재다운로드 검증까지 끝난 거래일만 로컬에서 지운다. 미검증 데이터는 절대 삭제하지 않는다.
+    """Drive 검증이 끝난 오래된 KR/US 로컬 데이터만 정리한다.
+
+    안전 원칙:
+    - Google Drive 검증 전 데이터는 절대 삭제하지 않는다.
+    - 기본 PROJECT_LOCAL_KEEP_DAYS(3일) 동안은 서버에도 유지한다.
+    - KR: kr_backup_completed[date].drive_reverified=True 만 삭제 가능.
+    - US: us_backup_completed[date].drive_reverified=True 또는
+          검증된 기존 Drive 백업을 복구 확인한 restored_from_drive=True 만 삭제 가능.
+    - Google Drive 파일은 건드리지 않고 서버 로컬 원본/로컬 ZIP만 삭제한다.
+    """
     st = _project_state()
     if not force and time.time() - to_float(st.get('last_housekeeping_ts', 0)) < 3600:
         return []
     st['last_housekeeping_ts'] = time.time()
-    usage = _project_disk_usage()
-    st['storage'] = usage
+    st['storage'] = _project_disk_usage()
+
     removed = []
     cutoff = now_kst().date() - timedelta(days=PROJECT_LOCAL_KEEP_DAYS)
-    completed = S.setdefault('kr_backup_completed', {})
+    kr_completed = S.setdefault('kr_backup_completed', {})
+    us_completed = S.setdefault('us_backup_completed', {})
+
+    def _old_enough(date_text):
+        try:
+            return datetime.strptime(str(date_text), '%Y-%m-%d').date() <= cutoff
+        except Exception:
+            return False
+
+    def _remove_file(path):
+        if os.path.isfile(path):
+            os.remove(path)
+            removed.append(path)
+
+    def _remove_dir(path):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            removed.append(path)
+
     try:
-        for name in os.listdir(LOG_ROOT):
-            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', name):
-                continue
-            try:
-                d = datetime.strptime(name, '%Y-%m-%d').date()
-            except Exception:
-                continue
-            if d > cutoff:
-                continue
-            info = completed.get(name, {})
-            if not isinstance(info, dict) or not info.get('drive_reverified'):
-                continue
-            path = os.path.join(LOG_ROOT, name)
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-                removed.append(path)
-            z = os.path.join(BACKUP_ROOT, 'KR', f'backup_KR_{name}.zip')
-            if os.path.isfile(z):
-                os.remove(z)
-                removed.append(z)
+        # KR: 기존 날짜 폴더 + 정식/RAW_RESCUE 로컬 ZIP.
+        if os.path.isdir(LOG_ROOT):
+            for name in os.listdir(LOG_ROOT):
+                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', name) or not _old_enough(name):
+                    continue
+                info = kr_completed.get(name, {})
+                if not isinstance(info, dict) or not info.get('drive_reverified'):
+                    continue
+                _remove_dir(os.path.join(LOG_ROOT, name))
+                _remove_file(os.path.join(BACKUP_ROOT, 'KR', f'backup_KR_{name}.zip'))
+                _remove_file(os.path.join(BACKUP_ROOT, 'KR', f'backup_KR_RAW_RESCUE_{name}.zip'))
+
+        # US: /LOG_ROOT/US/YYYY-MM-DD + 정식/RAW_RESCUE 로컬 ZIP.
+        # restored_from_drive 는 find_verified_existing_us_backup_on_drive()의
+        # 재다운로드/내부검증 성공 뒤에만 기록되므로 안전한 삭제 승인으로 취급한다.
+        us_root = os.path.join(LOG_ROOT, 'US')
+        if os.path.isdir(us_root):
+            for name in os.listdir(us_root):
+                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', name) or not _old_enough(name):
+                    continue
+                info = us_completed.get(name, {})
+                verified = isinstance(info, dict) and (
+                    bool(info.get('drive_reverified')) or bool(info.get('restored_from_drive'))
+                )
+                if not verified:
+                    continue
+                _remove_dir(os.path.join(us_root, name))
+                _remove_file(os.path.join(BACKUP_ROOT, 'US', f'backup_US_{name}.zip'))
+                _remove_file(os.path.join(BACKUP_ROOT, 'US', f'backup_US_RAW_RESCUE_{name}.zip'))
+
     except Exception as e:
         set_error(f'PROJECT 저장공간 정리 오류: {e}')
+
     usage2 = _project_disk_usage()
     st['storage'] = usage2
-    st['last_removed'] = removed[-20:]
-    if usage2.get('used_pct',0) >= PROJECT_STORAGE_CRITICAL_PCT:
-        set_error(f"저장공간 CRITICAL {usage2.get('used_pct',0):.1f}% / 미검증 데이터 자동삭제 금지")
+    st['last_removed'] = removed[-40:]
+    st['last_housekeeping_summary'] = {
+        'checked_at': now_text(),
+        'keep_days': PROJECT_LOCAL_KEEP_DAYS,
+        'removed_count': len(removed),
+        'kr_drive_verified_dates': sum(
+            1 for v in kr_completed.values()
+            if isinstance(v, dict) and v.get('drive_reverified')
+        ),
+        'us_drive_verified_dates': sum(
+            1 for v in us_completed.values()
+            if isinstance(v, dict) and (v.get('drive_reverified') or v.get('restored_from_drive'))
+        ),
+    }
+    if usage2.get('used_pct', 0) >= PROJECT_STORAGE_CRITICAL_PCT:
+        set_error(
+            f"저장공간 CRITICAL {usage2.get('used_pct',0):.1f}% / "
+            "Drive 미검증 데이터 자동삭제 금지"
+        )
     return removed
 
 def full_market_candidate(ai_id):
@@ -6358,7 +6413,7 @@ def maybe_send_daily_backup():
 
 def project_scanner_worker():
     """공식 KR 캘린더 기반 전용 REST 스캐너.
-    Open API 1.2.13은 WebSocket이 아직 미지원이므로 랭킹+현재가를 폴링한다.
+    현재 구현은 랭킹+현재가를 REST 폴링한다. Toss 공식 API의 WebSocket 지원 여부와 무관하게 이 PAPER 스캐너는 기존 REST 경로를 유지한다.
     """
     global PROJECT_SCANNER_HEARTBEAT_TS
     while True:
@@ -6418,6 +6473,10 @@ def loop():
                         maybe_send_us_backup()
                     except Exception as e:
                         set_error(f'주말 미국 백업 오류: {e}')
+                try:
+                    project_storage_housekeeping(False)
+                except Exception as e:
+                    set_error(f'주말 저장공간 관리 오류: {e}')
                 set_status_once('WEEKEND_PAUSE', '한국 주말 휴무 / 미국 데이터·백업만 운영' if us_open_weekend else '한국 주말 휴무 / 미국 백업만 확인', 1800)
                 time.sleep(max(10, REFRESH_SEC))
                 continue
