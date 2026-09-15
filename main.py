@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_16_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_17_TOSS_US_CYCLE_FINAL_PAPER_ONLY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_2_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -289,7 +289,9 @@ US_SYMBOLS = [x.strip().upper() for x in os.environ.get('US_SYMBOLS', 'SPY,QQQ,T
 US_CANDLE_SEC = max(60, int(os.environ.get('US_CANDLE_SEC', '60')))
 US_ORDERFLOW_SEC = max(30, int(os.environ.get('US_ORDERFLOW_SEC', '60')))
 US_METADATA_REFRESH_SEC = max(3600, int(os.environ.get('US_METADATA_REFRESH_SEC', '21600')))
-US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))
+US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))  # legacy compatibility; V5.17 US final backup uses extended-session close
+US_AFTER_HOURS_MINUTES = max(0, int(os.environ.get('US_AFTER_HOURS_MINUTES', '230')))  # Toss screen: regular close -> after-market close = 3h50m
+US_CYCLE_GAP_MINUTES = max(0, int(os.environ.get('US_CYCLE_GAP_MINUTES', '10')))  # after-market 08:50 -> next day-market 09:00 (DST example)
 TOSS_OPENAPI_SPEC_VERSION = 'LATEST_DOCS_2026-09-15'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
 TOSS_OPENAPI_ASYNCAPI_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json'  # 공식 WebSocket source of truth
@@ -3885,13 +3887,24 @@ def _us_session_bounds():
     return (regular_start - timedelta(hours=5, minutes=30), regular_start, regular_end)
 
 def _us_extended_bounds():
-    """Nearly-24h research window: overnight -> premarket -> regular -> after-hours."""
+    """Toss US trading cycle anchored to the official regular-session calendar.
+
+    Current DST example shown by Toss:
+      DAY MARKET 09:00~16:50, gap 10m,
+      PREMARKET 17:00~22:30,
+      REGULAR 22:30~05:00,
+      AFTER MARKET 05:00~08:50, gap 10m -> next DAY MARKET 09:00.
+
+    Internally the legacy name OVERNIGHT is retained for compatibility, but it
+    represents Toss DAY MARKET. DST/holiday shifts follow the official
+    regular_start/regular_end calendar anchors instead of hard-coded KST dates.
+    """
     pre_start, reg_start, reg_end = _us_session_bounds()
     if not reg_start or not reg_end:
         return (None, None, None, None, None)
-    overnight_start = reg_start - timedelta(hours=13, minutes=30)
-    after_end = reg_end + timedelta(hours=4)
-    return (overnight_start, pre_start, reg_start, reg_end, after_end)
+    day_market_start = reg_start - timedelta(hours=13, minutes=30)
+    after_end = reg_end + timedelta(minutes=US_AFTER_HOURS_MINUTES)
+    return (day_market_start, pre_start, reg_start, reg_end, after_end)
 
 def us_market_session_status():
     overnight_start, pre_start, reg_start, reg_end, after_end = _us_extended_bounds()
@@ -6043,7 +6056,7 @@ def _create_us_backup_zip_unlocked():
     manifest = {
         'created_at_kst': now_text(), 'version': OPERATING_VERSION,
         'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'market': 'US',
-        'session': 'REGULAR_ONLY', 'trade_date': trade_date,
+        'session': 'REGULAR_GRADE1_PLUS_EXTENDED_SOXL_SOXS', 'trade_date': trade_date,
         'regular_start': str(S.setdefault('us_market_data_capture', {}).get('calendar', {}).get('regular_start', '')),
         'regular_end': str(S.setdefault('us_market_data_capture', {}).get('calendar', {}).get('regular_end', '')),
         'symbols': US_SYMBOLS, 'included_files': count, 'uncompressed_bytes': size,
@@ -6082,8 +6095,11 @@ def us_backup_zip_path(trade_date=None):
     return os.path.join(BACKUP_ROOT, 'US', f'backup_US_{trade_date}.zip')
 
 def us_backup_ready_status(now_value=None):
-    """공식 US 캘린더 기준 가장 최근 완료 정규장을 백업 대상으로 선택한다.
-    과거 12시간 제한은 두지 않아 재시작/인증장애 뒤에도 복구할 수 있다.
+    """가장 최근 완료 정규장의 거래일을 잡되, 최종 백업은 Toss 애프터마켓 종료 뒤에만 허용한다.
+
+    DST 예시: 정규장 22:30~05:00 -> 애프터마켓 05:00~08:50.
+    따라서 해당 거래일의 최종 US 백업 ready_at은 08:50이다.
+    다음 DAY MARKET은 09:00이므로 10분 공백에서 ZIP/Drive 검증을 수행할 수 있다.
     """
     nowv = now_value or now_kst()
     cal, code = _latest_completed_us_calendar(nowv)
@@ -6091,7 +6107,6 @@ def us_backup_ready_status(now_value=None):
     if not cal:
         return (False, f'US_CALENDAR_NO_COMPLETED_SESSION_HTTP_{code}', '', None, None, None)
     state['calendar'] = cal
-    state['status'] = 'READY_FOR_BACKUP'
     trade_date = str(cal.get('date', '') or '')
     start = _parse_iso(cal.get('regular_start'))
     end = _parse_iso(cal.get('regular_end'))
@@ -6100,14 +6115,21 @@ def us_backup_ready_status(now_value=None):
     session_minutes = int((end - start).total_seconds() // 60)
     if session_minutes <= 0 or session_minutes > 1440:
         return (False, f'US_REGULAR_SESSION_MINUTES_INVALID_{session_minutes}', trade_date, start, end, None)
-    ready_at = end + timedelta(minutes=US_BACKUP_DELAY_MIN)
+
+    after_end = end + timedelta(minutes=US_AFTER_HOURS_MINUTES)
+    ready_at = after_end
+    state['final_session_end'] = after_end.isoformat()
+    state['next_cycle_expected_at'] = (after_end + timedelta(minutes=US_CYCLE_GAP_MINUTES)).isoformat()
+
     if nowv < ready_at:
-        return (False, 'US_REGULAR_NOT_FINISHED', trade_date, start, end, ready_at)
+        state['status'] = 'COLLECTING_US_FULL_CYCLE'
+        return (False, 'US_EXTENDED_SESSION_NOT_FINISHED', trade_date, start, end, ready_at)
+
+    state['status'] = 'READY_FOR_BACKUP'
     return (True, 'OK', trade_date, start, end, ready_at)
 
-
 def create_us_backup_zip():
-    """완료된 미국 거래일만 백업한다. 현재 미국 정규장 중에는 캘린더/파일 경합 방지를 위해 생성하지 않는다."""
+    """Toss 애프터마켓까지 완료된 미국 거래일만 최종 백업한다."""
     active, _ = us_regular_market_open_now()
     if active:
         raise RuntimeError('US_CURRENT_REGULAR_SESSION_ACTIVE')
@@ -6138,7 +6160,7 @@ def _us_backup_failure_should_notify(trade_date, signature):
 def maybe_send_us_backup():
     if not ENABLE_US_MARKET_DATA_CAPTURE:
         return
-    # 정규장 수집이 최우선. 이전 거래일 백업 재시도는 현재 미국 정규장 중에는 하지 않는다.
+    # 미국 데이터 수집이 우선이며, 최종 백업은 us_backup_ready_status()가 애프터마켓 종료 후에만 허용한다.
     active, _ = us_regular_market_open_now()
     if active:
         return
@@ -6162,7 +6184,7 @@ def maybe_send_us_backup():
                 with LOCK:
                     completed_map[trade_date] = {'completed_at': now_text(), 'grade': existing_report.get('grade', 'GRADE_1'), 'file_name': str(existing.get('name', '')), 'file_id': str(existing.get('id', '')), 'restored_from_drive': True}
                 save_state()
-                send_telegram(f"🇺🇸 미국 정규장 백업 {existing_report.get('grade', 'GRADE_1')}\n거래일: {trade_date}\n✅ Drive 기존 정상백업 재다운로드·내부검증 완료\n중복 업로드 없음\n실주문: 차단", force=True)
+                send_telegram(f"🇺🇸 미국 거래일 최종 백업 {existing_report.get('grade', 'GRADE_1')}\n거래일: {trade_date}\n✅ Drive 기존 정상백업 재다운로드·내부검증 완료\n중복 업로드 없음\n실주문: 차단", force=True)
                 return
         except Exception as e:
             set_error(f'미국 Drive 기존백업 사전검증 오류: {e}')
@@ -6205,11 +6227,11 @@ def maybe_send_us_backup():
         signature = 'US_LOCAL_BACKUP:' + str(e)[:900]
         if _us_backup_failure_should_notify(trade_date, signature):
             rescue_note = (f"\n✅ 미국 RAW_RESCUE 로컬 보존: {os.path.basename(rescue_path)}" if rescue_path else f"\n⚠️ 미국 RAW_RESCUE 생성 실패: {rescue_err}")
-            send_telegram(f'🇺🇸 미국시장 정식 백업 생성/검증 실패\n거래일: {trade_date}\n오류: {str(e)[:1200]}' + rescue_note + raw_drive_note + '\n정식 GRADE 성공본은 만들지 않으며 RAW 원본은 보존합니다.', force=True)
+            send_telegram(f'🇺🇸 미국 거래일 정식 백업 생성/검증 실패\n거래일: {trade_date}\n오류: {str(e)[:1200]}' + rescue_note + raw_drive_note + '\n정식 GRADE 성공본은 만들지 않으며 RAW 원본은 보존합니다.', force=True)
         return
     grade = quality.get('grade', 'FAILED')
     acceptable = bool(quality.get('backfill_ok')) and grade in {'GRADE_1', 'GRADE_1_WITH_VERIFIED_SOURCE_GAPS'}
-    msg = f'🇺🇸 미국 정규장 백업 {grade}\n거래일: {trade_date}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단'
+    msg = f'🇺🇸 미국 거래일 최종 백업 {grade}\n거래일: {trade_date}\n종목: {len(US_SYMBOLS)}개\n실주문: 차단'
     if not acceptable:
         failures = quality.get('failures', []) or quality.get('backfill_failures', [])
         msg += '\n❌ 품질검사 미통과 - Drive 업로드 보류'
