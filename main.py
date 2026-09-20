@@ -1,5 +1,5 @@
 # OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
-# V5.14: 기존 KR 92 PAPER 유지 + SOXL/SOXS 거의 24시간 감시 + U01/U02 반전 PAPER + 세션별 로그.
+# V5.21: V5.20 기반 - U03 SOXL -5% 장중20%/종가80% 분할스윙 + U04 시장레짐(BULL/PANIC/BEAR/CHOP) 적응형 PAPER.
 # V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -27,9 +27,9 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_17_TOSS_US_CYCLE_FINAL_PAPER_ONLY'
+OPERATING_VERSION = 'OPERATING_V5_21_TOSS_US_ADAPTIVE_U04_PAPER'
 DATA_PAPER_BACKUP_ONLY = True
-RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_2_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
+RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_4_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
@@ -89,10 +89,13 @@ US_REAL_ORDER_ENABLED = False
 # V5.13: US semiconductor 3x ETF reversal PAPER LAB.
 # Existing US market-data collector is the single data source; this engine never calls Toss APIs directly.
 US_SEMI_PAPER_ENABLED = os.environ.get('US_SEMI_PAPER_ENABLED', 'true').lower() == 'true'
-US_SEMI_PAPER_IDS = ['U01', 'U02']
+US_SEMI_INTRADAY_IDS = ['U01', 'U02']
+US_SEMI_PAPER_IDS = ['U01', 'U02', 'U03', 'U04']
 US_SEMI_PAPER_NAMES = {
     'U01': 'US 반도체3X 역추세 반등 +5% 목표익절',
     'U02': 'US 반도체3X 역추세 반등 +2% 이후 추적청산',
+    'U03': 'US SOXL -5% 급락 20/80 분할 스윙',
+    'U04': 'US SOXL/SOXS 시장레짐 적응형(BULL/PANIC/BEAR/CHOP)',
 }
 US_SEMI_SYMBOLS = ('SOXL', 'SOXS')
 US_SEMI_START_CASH = int(float(os.environ.get('US_SEMI_START_CASH', '10000000')))
@@ -114,6 +117,25 @@ US_SEMI_MAX_TRADES_PER_SESSION = max(1, int(os.environ.get('US_SEMI_MAX_TRADES_P
 US_SEMI_REENTRY_COOLDOWN_SEC = max(60, int(os.environ.get('US_SEMI_REENTRY_COOLDOWN_SEC', '900')))
 US_SEMI_DECISION_COOLDOWN_SEC = max(30, int(os.environ.get('US_SEMI_DECISION_COOLDOWN_SEC', '60')))
 US_SEMI_FEE_SIDE_PCT = max(0.0, float(os.environ.get('US_SEMI_FEE_SIDE_PCT', '0.10')))
+# U03: 2025/2026 공통 연구 규칙. 전년도 일봉을 이어서 지표를 계산하고, 종가 확정 후 PAPER 체결한다.
+US_REGIME_ENTRY_RATIO = max(0.10, min(1.0, float(os.environ.get('US_REGIME_ENTRY_RATIO', '1.0'))))
+US_REGIME_SOXL_DROP_PCT = -abs(float(os.environ.get('US_REGIME_SOXL_DROP_PCT', '5.0')))
+US_REGIME_MA_WINDOW = max(10, int(os.environ.get('US_REGIME_MA_WINDOW', '20')))
+US_REGIME_MOM_WINDOW = max(5, int(os.environ.get('US_REGIME_MOM_WINDOW', '15')))
+US_REGIME_MOM_MAX_PCT = -abs(float(os.environ.get('US_REGIME_MOM_MAX_PCT', '10.0')))
+US_REGIME_DD_WINDOW = max(10, int(os.environ.get('US_REGIME_DD_WINDOW', '20')))
+US_REGIME_DD_MAX_PCT = -abs(float(os.environ.get('US_REGIME_DD_MAX_PCT', '15.0')))
+US_REGIME_SOXL_REBOUND_MIN_PCT = abs(float(os.environ.get('US_REGIME_SOXL_REBOUND_MIN_PCT', '7.0')))
+US_REGIME_SOXS_DROP_PCT = -abs(float(os.environ.get('US_REGIME_SOXS_DROP_PCT', '5.0')))
+# V5.21 U03/U04 분할·적응형 PAPER 파라미터. 모두 PAPER 연구값이며 실주문에는 사용하지 않는다.
+US_U03_TOUCH_PCT = -abs(float(os.environ.get('US_U03_TOUCH_PCT', '5.0')))
+US_U03_TOUCH_RATIO = max(0.05, min(0.50, float(os.environ.get('US_U03_TOUCH_RATIO', '0.20'))))
+US_U03_CLOSE_ADD_CASH_RATIO = max(0.0, min(1.0, float(os.environ.get('US_U03_CLOSE_ADD_CASH_RATIO', '1.0'))))
+US_U04_BULL_PULLBACK_PCT = -abs(float(os.environ.get('US_U04_BULL_PULLBACK_PCT', '3.0')))
+US_U04_BULL_ENTRY_RATIO = max(0.10, min(1.0, float(os.environ.get('US_U04_BULL_ENTRY_RATIO', '0.80'))))
+US_U04_BEAR_ENTRY_RATIO = max(0.10, min(1.0, float(os.environ.get('US_U04_BEAR_ENTRY_RATIO', '0.60'))))
+US_U04_PANIC_TOUCH_RATIO = max(0.05, min(0.50, float(os.environ.get('US_U04_PANIC_TOUCH_RATIO', '0.20'))))
+US_U04_PANIC_CLOSE_ADD_CASH_RATIO = max(0.0, min(1.0, float(os.environ.get('US_U04_PANIC_CLOSE_ADD_CASH_RATIO', '1.0'))))
 # V5.14: 미국주식 거의 24시간 PAPER 감시. 실제 데이터가 들어오는 세션만 활성화한다.
 US_SEMI_24H_WATCH = os.environ.get('US_SEMI_24H_WATCH', 'true').lower() == 'true'
 US_SEMI_EXTENDED_CANDLE_SEC = max(30, int(os.environ.get('US_SEMI_EXTENDED_CANDLE_SEC', '60')))
@@ -3851,6 +3873,8 @@ def _us_semi_default(ai_id):
         'profit_rate': 0.0, 'trades': [], 'last_action': '초기화',
         'last_decision_ts': 0.0, 'last_exit_ts': 0.0, 'trade_count': 0,
         'trade_date': '', 'peak_asset': US_SEMI_START_CASH, 'mdd_pct': 0.0,
+        'last_daily_decision_date': '', 'last_daily_signal': '', 'last_daily_features': {},
+        'last_regime': 'UNKNOWN', 'last_regime_date': '', 'same_day_entry_block': '',
     }
 
 def ensure_us_semi_paper_states():
@@ -3938,6 +3962,127 @@ def _read_us_candles(sym, limit=240):
             })
     out.sort(key=lambda x: x['dt'])
     return out[-limit:]
+
+def _us_daily_date(raw_ts):
+    text = str(raw_ts or '').strip()
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})', text)
+    if m:
+        return m.group(1)
+    dt = parse_api_datetime(text)
+    return dt.strftime('%Y-%m-%d') if dt else ''
+
+def _read_us_daily_closes(sym, limit=220):
+    rows = _read_csv_rows(us_data_path('candles_1d', sym))
+    by_date = {}
+    for r in rows:
+        d = _us_daily_date(r.get('timestamp'))
+        close = to_float(r.get('close', 0))
+        if d and close > 0:
+            by_date[d] = {'date': d, 'close': close}
+    out = [by_date[k] for k in sorted(by_date)]
+    return out[-limit:]
+
+def _us_regime_daily_features():
+    """확정 일봉 기반 U03/U04 특징.
+    진입 레짐에 쓰는 MA/MOM/DD는 당일(cur)이 아니라 전일(prev)까지의 확정 데이터로 계산한다.
+    당일 수익률은 cur vs prev이며 AFTER_HOURS 확정종가 판단에만 사용한다.
+    """
+    long_rows = _read_us_daily_closes('SOXL', 260)
+    inv_rows = _read_us_daily_closes('SOXS', 260)
+    inv_map = {x['date']: x['close'] for x in inv_rows}
+    common = [dict(x, soxs=inv_map[x['date']]) for x in long_rows if x['date'] in inv_map]
+    need = max(US_REGIME_MA_WINDOW + 2, US_REGIME_DD_WINDOW + 2, US_REGIME_MOM_WINDOW + 3)
+    if len(common) < need:
+        return {'ok': False, 'block': f'INSUFFICIENT_DAILY_{len(common)}'}
+    i = len(common) - 1
+    cur, prev = common[i], common[i-1]
+    r_soxl = pct(cur['close'], prev['close'])
+    r_soxs = pct(cur['soxs'], prev['soxs'])
+
+    ma_slice = common[i-US_REGIME_MA_WINDOW:i]          # prev 포함, cur 제외
+    ma_prev = sum(x['close'] for x in ma_slice) / max(1, len(ma_slice))
+    ma2_slice = common[i-1-US_REGIME_MA_WINDOW:i-1]     # prev2 포함, prev 제외
+    ma_prev2 = sum(x['close'] for x in ma2_slice) / max(1, len(ma2_slice))
+    mom_base = common[i-1-US_REGIME_MOM_WINDOW]['close']
+    mom_prev = pct(prev['close'], mom_base)
+    dd_slice = common[i-US_REGIME_DD_WINDOW:i]
+    peak_prev = max(x['close'] for x in dd_slice)
+    dd_prev = pct(prev['close'], peak_prev)
+
+    if prev['close'] > ma_prev and ma_prev > ma_prev2 and mom_prev > 0:
+        prev_regime = 'BULL_TREND'
+    elif prev['close'] < ma_prev and mom_prev <= US_REGIME_MOM_MAX_PCT and dd_prev <= US_REGIME_DD_MAX_PCT:
+        prev_regime = 'BEAR_TREND'
+    else:
+        prev_regime = 'CHOP'
+
+    regime_short = prev_regime == 'BEAR_TREND'
+    soxl_close_entry = r_soxl <= US_REGIME_SOXL_DROP_PCT
+    soxs_entry = (regime_short and r_soxl >= US_REGIME_SOXL_REBOUND_MIN_PCT and r_soxs <= US_REGIME_SOXS_DROP_PCT)
+    candidate = 'SOXL' if soxl_close_entry else ('SOXS' if soxs_entry else '')
+    signal = 'SOXL_DROP_CLOSE' if soxl_close_entry else ('SOXS_REGIME_BUY' if soxs_entry else 'NO_ENTRY')
+    return {
+        'ok': True, 'block': signal, 'session': 'DAILY_CLOSE', 'trade_date': cur['date'],
+        'candidate': candidate, 'opposite': 'SOXS' if candidate == 'SOXL' else ('SOXL' if candidate == 'SOXS' else ''),
+        'price': cur['close'] if candidate == 'SOXL' else (cur['soxs'] if candidate == 'SOXS' else 0.0),
+        'soxl_close': cur['close'], 'soxs_close': cur['soxs'],
+        'soxl_day_pct': r_soxl, 'soxs_day_pct': r_soxs,
+        'prev_soxl_close': prev['close'], 'prev_ma20': ma_prev, 'prev_ma20_prior': ma_prev2,
+        'prev_mom15_pct': mom_prev, 'prev_dd20_pct': dd_prev,
+        'prev_regime': prev_regime, 'regime_short': regime_short,
+        'entry_ratio': US_REGIME_ENTRY_RATIO,
+    }
+
+
+def _us_latest_completed_regime():
+    """현재 시점에서 알 수 있는 가장 최근 완료 일봉만으로 다음 장의 레짐을 분류한다."""
+    long_rows = _read_us_daily_closes('SOXL', 260)
+    inv_rows = _read_us_daily_closes('SOXS', 260)
+    inv_map = {x['date']: x['close'] for x in inv_rows}
+    common = [dict(x, soxs=inv_map[x['date']]) for x in long_rows if x['date'] in inv_map]
+    trade_date = us_trade_date_from_calendar()
+    # 정규장 중 파일에 미완성 당일봉이 섞이는 경우를 방지한다.
+    if common and common[-1]['date'] == trade_date and us_market_session_status()[0] in {'OVERNIGHT','PREMARKET','REGULAR'}:
+        common = common[:-1]
+    need = max(US_REGIME_MA_WINDOW + 2, US_REGIME_DD_WINDOW + 1, US_REGIME_MOM_WINDOW + 2)
+    if len(common) < need:
+        return {'ok': False, 'regime': 'UNKNOWN', 'block': f'INSUFFICIENT_DAILY_{len(common)}'}
+    i = len(common) - 1
+    cur, prev = common[i], common[i-1]
+    day_ret = pct(cur['close'], prev['close'])
+    ma = sum(x['close'] for x in common[i-US_REGIME_MA_WINDOW+1:i+1]) / US_REGIME_MA_WINDOW
+    ma_prev = sum(x['close'] for x in common[i-US_REGIME_MA_WINDOW:i]) / US_REGIME_MA_WINDOW
+    mom = pct(cur['close'], common[i-US_REGIME_MOM_WINDOW]['close'])
+    peak = max(x['close'] for x in common[i-US_REGIME_DD_WINDOW+1:i+1])
+    dd = pct(cur['close'], peak)
+    if day_ret <= US_REGIME_SOXL_DROP_PCT:
+        regime = 'PANIC_DROP'
+    elif cur['close'] > ma and ma > ma_prev and mom > 0:
+        regime = 'BULL_TREND'
+    elif cur['close'] < ma and mom <= US_REGIME_MOM_MAX_PCT and dd <= US_REGIME_DD_MAX_PCT:
+        regime = 'BEAR_TREND'
+    else:
+        regime = 'CHOP'
+    return {
+        'ok': True, 'regime': regime, 'date': cur['date'], 'soxl_close': cur['close'], 'soxs_close': cur['soxs'],
+        'day_ret': day_ret, 'ma20': ma, 'ma20_prev': ma_prev, 'mom15_pct': mom, 'dd20_pct': dd,
+    }
+
+def _us_regime_log(ai_id, event, f, reason=''):
+    headers = ['time_kst','trade_date','account','event','symbol','price','soxl_close','soxs_close',
+               'soxl_day_pct','soxs_day_pct','prev_soxl_close','prev_ma20','prev_mom15_pct','prev_dd20_pct',
+               'regime_short','signal','reason','paper_only']
+    path = os.path.join(us_semi_paper_dir(), f'us_regime_adaptive_{us_trade_date_from_calendar()}.csv')
+    write_row(path, headers, {
+        'time_kst': now_text(), 'trade_date': f.get('trade_date',''), 'account': ai_id, 'event': event,
+        'symbol': f.get('candidate',''), 'price': round(to_float(f.get('price')), 6),
+        'soxl_close': round(to_float(f.get('soxl_close')), 6), 'soxs_close': round(to_float(f.get('soxs_close')), 6),
+        'soxl_day_pct': round(to_float(f.get('soxl_day_pct')), 4), 'soxs_day_pct': round(to_float(f.get('soxs_day_pct')), 4),
+        'prev_soxl_close': round(to_float(f.get('prev_soxl_close')), 6), 'prev_ma20': round(to_float(f.get('prev_ma20')), 6),
+        'prev_mom15_pct': round(to_float(f.get('prev_mom15_pct')), 4), 'prev_dd20_pct': round(to_float(f.get('prev_dd20_pct')), 4),
+        'regime_short': bool(f.get('regime_short')), 'signal': f.get('block',''), 'reason': reason or f.get('block',''),
+        'paper_only': True,
+    })
 
 def _us_return(candles, minutes):
     if len(candles) < minutes + 1:
@@ -4040,6 +4185,37 @@ def _us_semi_mark_price(sym):
     c = _read_us_candles(sym, 5)
     return c[-1]['close'] if c else 0.0
 
+
+def update_us_semi_paper_asset(ai_id, save=False):
+    """U01/U02/U03/U04 PAPER 계좌를 최신 수집가격으로 시가평가하고 수익률/MDD를 갱신한다."""
+    ensure_us_semi_paper_states()
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        cash = to_float(st.get('cash', 0))
+        pos = dict(st.get('position') or {})
+        start = max(1.0, to_float(st.get('start_cash', US_SEMI_START_CASH)))
+    asset = cash
+    if pos:
+        sym = str(pos.get('symbol', ''))
+        qty = to_int(pos.get('qty'))
+        mark = _us_semi_mark_price(sym)
+        if mark <= 0:
+            mark = to_float(pos.get('avg', 0))
+        asset += qty * mark
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        st['asset'] = round(asset, 4)
+        st['profit_rate'] = round((asset / start - 1.0) * 100.0, 6)
+        peak = max(to_float(st.get('peak_asset', start)), asset)
+        st['peak_asset'] = round(peak, 4)
+        dd = ((asset / peak) - 1.0) * 100.0 if peak > 0 else 0.0
+        st['mdd_pct'] = round(min(to_float(st.get('mdd_pct', 0.0)), dd), 6)
+        out = st['asset']
+    if save:
+        save_state()
+    return out
+
+
 def _us_semi_buy(ai_id, f):
     ensure_us_semi_paper_states()
     price = to_float(f.get('price'))
@@ -4048,7 +4224,8 @@ def _us_semi_buy(ai_id, f):
     with LOCK:
         st = S['us_semi_paper'][ai_id]
         cash = to_float(st.get('cash'))
-        budget = cash * US_SEMI_ENTRY_RATIO
+        entry_ratio = max(0.10, min(1.0, to_float(f.get('entry_ratio', US_SEMI_ENTRY_RATIO))))
+        budget = cash * entry_ratio
         qty = int(budget / price)
         if qty <= 0:
             return False
@@ -4070,7 +4247,94 @@ def _us_semi_buy(ai_id, f):
     _us_semi_log(ai_id, 'PAPER_ENTRY', f, reason=f.get('block','ENTRY_OK'))
     return True
 
-def _us_semi_sell(ai_id, reason):
+def _us_semi_buy_ratio(ai_id, symbol, price, cash_ratio, reason, entry_features=None, allow_add=False, stage=1, strategy=''):
+    """PAPER 전용 비율매수/추가매수.
+    cash_ratio는 현재 가용현금 비율이다. U03 1차는 0.20, 종가확인은 남은 현금 1.00을 사용한다.
+    """
+    ensure_us_semi_paper_states()
+    symbol = str(symbol or '').upper()
+    price = to_float(price)
+    cash_ratio = max(0.0, min(1.0, to_float(cash_ratio)))
+    if symbol not in US_SEMI_SYMBOLS or price <= 0 or cash_ratio <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
+        return False
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        old = dict(st.get('position') or {})
+        if old and (not allow_add or str(old.get('symbol')) != symbol):
+            return False
+        cash = to_float(st.get('cash'))
+        budget = cash * cash_ratio
+        qty = int(budget / (price * (1 + US_SEMI_FEE_SIDE_PCT / 100.0)))
+        if qty <= 0:
+            return False
+        fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
+        cost = qty * price + fee
+        if cost > cash:
+            return False
+        if old:
+            old_qty = to_int(old.get('qty'))
+            old_avg = to_float(old.get('avg'))
+            new_qty = old_qty + qty
+            new_avg = ((old_qty * old_avg) + (qty * price)) / max(1, new_qty)
+            old['qty'] = new_qty
+            old['avg'] = new_avg
+            old['entry_fee'] = to_float(old.get('entry_fee')) + fee
+            old['peak_price'] = max(to_float(old.get('peak_price', price)), price)
+            old['trough_price'] = min(to_float(old.get('trough_price', price)), price)
+            old['entry_stage'] = max(to_int(old.get('entry_stage', 1)), int(stage))
+            old['last_add_time'] = now_text()
+            old['last_add_reason'] = reason
+            if strategy:
+                old['strategy'] = strategy
+            if entry_features:
+                old.setdefault('entry_features', {}).update(dict(entry_features))
+            st['position'] = old
+            event = 'PAPER_ADD'
+        else:
+            trade_date = us_trade_date_from_calendar()
+            st['position'] = {
+                'symbol': symbol, 'qty': qty, 'avg': price, 'entry_fee': fee,
+                'entry_time': now_text(), 'first_entry_date': trade_date,
+                'peak_price': price, 'trough_price': price, 'trailing_armed': False,
+                'entry_stage': int(stage), 'strategy': strategy or ai_id,
+                'entry_reason': reason, 'entry_features': dict(entry_features or {}),
+            }
+            st['trade_count'] = to_int(st.get('trade_count')) + 1
+            event = 'PAPER_ENTRY'
+        st['cash'] = cash - cost
+        st['last_decision_ts'] = time.time()
+        st['last_action'] = f'{now_short()} {event} {symbol} {qty}@{price:.4f} {reason}'
+    f = dict(entry_features or {})
+    f.update({'candidate': symbol, 'price': price, 'block': reason, 'session': us_market_session_status()[0]})
+    _us_semi_log(ai_id, event, f, reason=reason)
+    return True
+
+
+def _us_intraday_prev_close():
+    rows = _read_us_daily_closes('SOXL', 5)
+    if not rows:
+        return 0.0
+    trade_date = us_trade_date_from_calendar()
+    # 당일봉이 이미 기록된 경우에는 직전 거래일 종가를 사용한다.
+    if rows[-1]['date'] == trade_date and len(rows) >= 2:
+        return to_float(rows[-2]['close'])
+    return to_float(rows[-1]['close'])
+
+
+def _us_touch_feature(symbol='SOXL'):
+    price = _us_semi_mark_price(symbol)
+    prev_close = _us_intraday_prev_close() if symbol == 'SOXL' else 0.0
+    if symbol == 'SOXS':
+        rows = _read_us_daily_closes('SOXS', 5)
+        trade_date = us_trade_date_from_calendar()
+        if rows:
+            prev_close = to_float(rows[-2]['close'] if rows[-1]['date'] == trade_date and len(rows) >= 2 else rows[-1]['close'])
+    move = pct(price, prev_close) if price > 0 and prev_close > 0 else 0.0
+    return {'candidate': symbol, 'price': price, 'prev_close': prev_close, 'intraday_pct': move,
+            'session': us_market_session_status()[0], 'trade_date': us_trade_date_from_calendar()}
+
+
+def _us_semi_sell(ai_id, reason, price_override=0.0):
     ensure_us_semi_paper_states()
     with LOCK:
         st = S['us_semi_paper'][ai_id]
@@ -4078,7 +4342,7 @@ def _us_semi_sell(ai_id, reason):
     if not pos:
         return False
     sym = pos['symbol']
-    price = _us_semi_mark_price(sym)
+    price = to_float(price_override) if to_float(price_override) > 0 else _us_semi_mark_price(sym)
     if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
         return False
     qty, avg = to_int(pos.get('qty')), to_float(pos.get('avg'))
@@ -4104,17 +4368,231 @@ def _us_semi_sell(ai_id, reason):
     _us_semi_log(ai_id, 'PAPER_EXIT', f, pnl_pct, mfe, mae, reason)
     return True
 
+
+
+def _refresh_us_regime_daily_after_close():
+    """U03 전용: AFTER_HOURS 진입 직후 SOXL/SOXS 당일 일봉을 1회 강제 갱신한다.
+    6시간 메타데이터 주기 때문에 당일 종가 신호가 하루 늦어지는 문제를 막는다.
+    두 종목 모두 최신 일봉 날짜가 미국 캘린더 trade_date와 같을 때만 True.
+    """
+    expected = us_trade_date_from_calendar()
+    if not expected:
+        return False
+    state = S.setdefault('us_market_data_capture', {})
+    # 이미 오늘 성공 검증을 끝냈다면 파일 날짜를 한 번 더 확인하고 재사용한다.
+    if state.get('u03_daily_refresh_date') == expected:
+        ok_cached = True
+        for sym in US_SEMI_SYMBOLS:
+            rows = _read_us_daily_closes(sym, 3)
+            if not rows or rows[-1].get('date') != expected:
+                ok_cached = False
+                break
+        if ok_cached:
+            return True
+
+    daily_headers = ['requested_at','received_at','saved_at','latency_ms','symbol','timestamp','open','high','low','close','volume','currency']
+    success = True
+    for sym in US_SEMI_SYMBOLS:
+        req = now_kst()
+        t0 = time.time()
+        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1d', 'count': 240, 'adjusted': True}, timeout=12)
+        rec = now_kst()
+        latency = round((time.time() - t0) * 1000, 3)
+        if code != 200:
+            success = False
+            set_error(f'U03 {sym} 당일 일봉 강제갱신 실패 HTTP_{code}')
+            _market_data_request_gap()
+            continue
+        candles = _result_dict(data).get('candles', [])
+        rows = []
+        for c in reversed(candles if isinstance(candles, list) else []):
+            if not isinstance(c, dict):
+                continue
+            rows.append({'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': c.get('timestamp',''), 'open': c.get('openPrice',0), 'high': c.get('highPrice',0), 'low': c.get('lowPrice',0), 'close': c.get('closePrice',0), 'volume': c.get('volume',0), 'currency': c.get('currency','USD')})
+        if rows:
+            _rewrite_csv(us_data_path('candles_1d', sym), daily_headers, rows)
+        _market_data_request_gap()
+        chk = _read_us_daily_closes(sym, 3)
+        if not chk or chk[-1].get('date') != expected:
+            success = False
+            got = chk[-1].get('date') if chk else 'NONE'
+            set_error(f'U03 {sym} 당일종가 미확정 expected={expected} got={got}')
+    if success:
+        state['u03_daily_refresh_date'] = expected
+        state['u03_daily_refresh_at'] = now_text()
+    return success
+
+def run_us_regime_paper():
+    """U03: SOXL -5% 장중 20% -> 종가도 -5% 이하면 남은 현금 추가.
+    진입일 당일에는 음봉 청산하지 않고, 다음 거래일부터 첫 음봉 종가에 전량 청산한다.
+    """
+    ai_id = 'U03'
+    ensure_us_semi_paper_states()
+    session = us_market_session_status()[0]
+    trade_date = us_trade_date_from_calendar()
+
+    # 1) 정규장 장중 -5% 터치: 20% 선매수. 실제 수집가격으로만 PAPER 체결한다.
+    if session == 'REGULAR':
+        with LOCK:
+            st = S['us_semi_paper'][ai_id]
+            pos = dict(st.get('position') or {})
+            blocked = st.get('same_day_entry_block') == trade_date
+        if not pos and not blocked:
+            tf = _us_touch_feature('SOXL')
+            if tf.get('prev_close', 0) > 0 and to_float(tf.get('intraday_pct')) <= US_U03_TOUCH_PCT:
+                _us_semi_buy_ratio(ai_id, 'SOXL', tf['price'], US_U03_TOUCH_RATIO,
+                                   'U03_TOUCH_MINUS_5', tf, allow_add=False, stage=1, strategy='U03_20_80')
+        return
+
+    # 2) 종가 판단은 확정 일봉이 생긴 AFTER_HOURS에서 하루 1회.
+    if session != 'AFTER_HOURS':
+        return
+    if not _refresh_us_regime_daily_after_close():
+        return
+    f = _us_regime_daily_features()
+    if not f.get('ok'):
+        return
+    d = f.get('trade_date', '')
+    if not d:
+        return
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        if st.get('last_daily_decision_date') == d:
+            return
+        st['last_daily_decision_date'] = d
+        st['last_daily_signal'] = f.get('block','')
+        st['last_daily_features'] = dict(f)
+        pos = dict(st.get('position') or {})
+
+    if pos:
+        sym = str(pos.get('symbol',''))
+        day_pct = to_float(f.get('soxl_day_pct' if sym == 'SOXL' else 'soxs_day_pct'))
+        close_px = to_float(f.get('soxl_close' if sym == 'SOXL' else 'soxs_close'))
+        first_date = str(pos.get('first_entry_date',''))
+        stage = to_int(pos.get('entry_stage', 1))
+        # 진입 당일: 종가도 -5% 이하이면 남은 현금을 모두 추가하여 20/80 구조를 완성한다.
+        if first_date == d:
+            if sym == 'SOXL' and stage == 1 and to_float(f.get('soxl_day_pct')) <= US_REGIME_SOXL_DROP_PCT:
+                added = _us_semi_buy_ratio(ai_id, 'SOXL', close_px, US_U03_CLOSE_ADD_CASH_RATIO,
+                                           'U03_CLOSE_CONFIRM_ADD', f, allow_add=True, stage=2, strategy='U03_20_80')
+                _us_regime_log(ai_id, 'PAPER_ADD' if added else 'ADD_FAIL', dict(f, candidate='SOXL', price=close_px), 'U03_CLOSE_CONFIRM_ADD')
+            else:
+                _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), 'ENTRY_DAY_NO_EXIT')
+            return
+        # 다음 거래일부터 첫 음봉 종가 청산.
+        if day_pct < 0:
+            sold = _us_semi_sell(ai_id, f'DAILY_FIRST_NEGATIVE {day_pct:.2f}%', price_override=close_px)
+            with LOCK:
+                S['us_semi_paper'][ai_id]['same_day_entry_block'] = d
+            _us_regime_log(ai_id, 'PAPER_EXIT' if sold else 'EXIT_FAIL', dict(f, candidate=sym, price=close_px), f'FIRST_NEGATIVE {day_pct:.2f}%')
+        else:
+            _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), f'POSITIVE_CLOSE {day_pct:.2f}%')
+        return
+
+    # 장중 터치를 관측하지 못한 날은 종가만 보고 가상의 20% 체결을 만들지 않는다.
+    _us_regime_log(ai_id, 'WAIT', f, 'NO_INTRADAY_TOUCH_POSITION')
+
+
+def run_us_adaptive_paper():
+    """U04 시장상태 적응형 PAPER.
+    - 당일 SOXL -5% 터치가 최우선(PANIC): 20% 선매수, 종가확인 시 남은 현금 추가.
+    - 전일까지 BULL: SOXL -3% 눌림에 80% PAPER 진입.
+    - 전일까지 BEAR: 종가에서 SOXL +7% & SOXS -5%일 때 SOXS 60% 진입.
+    - CHOP: 신규진입 없음.
+    모든 보유는 진입 다음 거래일부터 첫 음봉 종가 청산한다.
+    """
+    ai_id = 'U04'
+    ensure_us_semi_paper_states()
+    session = us_market_session_status()[0]
+    trade_date = us_trade_date_from_calendar()
+
+    if session == 'REGULAR':
+        with LOCK:
+            st = S['us_semi_paper'][ai_id]
+            pos = dict(st.get('position') or {})
+            blocked = st.get('same_day_entry_block') == trade_date
+        if pos or blocked:
+            return
+        reg = _us_latest_completed_regime()
+        with LOCK:
+            S['us_semi_paper'][ai_id]['last_regime'] = reg.get('regime','UNKNOWN')
+            S['us_semi_paper'][ai_id]['last_regime_date'] = reg.get('date','')
+        tf = _us_touch_feature('SOXL')
+        move = to_float(tf.get('intraday_pct'))
+        # 현재 당일 급락은 전일 레짐보다 우선한다.
+        if tf.get('prev_close', 0) > 0 and move <= US_U03_TOUCH_PCT:
+            _us_semi_buy_ratio(ai_id, 'SOXL', tf['price'], US_U04_PANIC_TOUCH_RATIO,
+                               'U04_PANIC_TOUCH', dict(tf, regime='PANIC_DROP'), False, 1, 'U04_PANIC_20_80')
+        elif reg.get('ok') and reg.get('regime') == 'BULL_TREND' and move <= US_U04_BULL_PULLBACK_PCT:
+            _us_semi_buy_ratio(ai_id, 'SOXL', tf['price'], US_U04_BULL_ENTRY_RATIO,
+                               'U04_BULL_PULLBACK', dict(tf, regime='BULL_TREND'), False, 1, 'U04_BULL_PULLBACK')
+        return
+
+    if session != 'AFTER_HOURS':
+        return
+    if not _refresh_us_regime_daily_after_close():
+        return
+    f = _us_regime_daily_features()
+    if not f.get('ok'):
+        return
+    d = f.get('trade_date','')
+    with LOCK:
+        st = S['us_semi_paper'][ai_id]
+        if st.get('last_daily_decision_date') == d:
+            return
+        st['last_daily_decision_date'] = d
+        st['last_daily_features'] = dict(f)
+        st['last_regime'] = f.get('prev_regime','UNKNOWN')
+        st['last_regime_date'] = d
+        pos = dict(st.get('position') or {})
+
+    if pos:
+        sym = str(pos.get('symbol',''))
+        close_px = to_float(f.get('soxl_close' if sym == 'SOXL' else 'soxs_close'))
+        day_pct = to_float(f.get('soxl_day_pct' if sym == 'SOXL' else 'soxs_day_pct'))
+        first_date = str(pos.get('first_entry_date',''))
+        stage = to_int(pos.get('entry_stage',1))
+        strat = str(pos.get('strategy',''))
+        if first_date == d:
+            if sym == 'SOXL' and strat == 'U04_PANIC_20_80' and stage == 1 and to_float(f.get('soxl_day_pct')) <= US_REGIME_SOXL_DROP_PCT:
+                added = _us_semi_buy_ratio(ai_id, 'SOXL', close_px, US_U04_PANIC_CLOSE_ADD_CASH_RATIO,
+                                           'U04_PANIC_CLOSE_ADD', dict(f, regime='PANIC_DROP'), True, 2, 'U04_PANIC_20_80')
+                _us_regime_log(ai_id, 'PAPER_ADD' if added else 'ADD_FAIL', dict(f, candidate='SOXL', price=close_px), 'U04_PANIC_CLOSE_ADD')
+            else:
+                _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), 'ENTRY_DAY_NO_EXIT')
+            return
+        if day_pct < 0:
+            sold = _us_semi_sell(ai_id, f'U04_DAILY_FIRST_NEGATIVE {day_pct:.2f}%', price_override=close_px)
+            with LOCK:
+                S['us_semi_paper'][ai_id]['same_day_entry_block'] = d
+            _us_regime_log(ai_id, 'PAPER_EXIT' if sold else 'EXIT_FAIL', dict(f, candidate=sym, price=close_px), f'U04_FIRST_NEGATIVE {day_pct:.2f}%')
+        else:
+            _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), f'U04_POSITIVE_CLOSE {day_pct:.2f}%')
+        return
+
+    # 현금일 때 BEAR 레짐의 기존 SOXS 보조조건만 종가 진입 허용.
+    if f.get('prev_regime') == 'BEAR_TREND' and f.get('candidate') == 'SOXS':
+        ff = dict(f, entry_ratio=US_U04_BEAR_ENTRY_RATIO, regime='BEAR_TREND')
+        bought = _us_semi_buy_ratio(ai_id, 'SOXS', to_float(f.get('soxs_close')), US_U04_BEAR_ENTRY_RATIO,
+                                    'U04_BEAR_SOXS', ff, False, 1, 'U04_BEAR_SOXS')
+        _us_regime_log(ai_id, 'PAPER_ENTRY' if bought else 'ENTRY_FAIL', ff, 'U04_BEAR_SOXS')
+    else:
+        _us_regime_log(ai_id, 'WAIT', f, f"U04_CASH_{f.get('prev_regime','UNKNOWN')}")
+
 def run_us_semi_paper():
-    """U01/U02 share one confirmed reversal entry signal; only exit method differs."""
+    """U01/U02 분봉 역추세 + U03 20/80 급락스윙 + U04 시장레짐 적응형 PAPER."""
     ensure_us_semi_paper_states()
     if not US_SEMI_PAPER_ENABLED:
         return
-    # Research starts 09:00 KST; entry is allowed only when active-session SOXL/SOXS data is fresh.
+    # U03/U04는 분봉 역추세와 분리해 각자의 스윙/레짐 규칙으로 처리한다.
+    run_us_regime_paper()
+    run_us_adaptive_paper()
+    # U01/U02 연구는 기존대로 09:00 KST 이후의 활성 세션에서만 수행한다.
     if now_kst().strftime('%H:%M') < US_SEMI_RESEARCH_KST_START:
         return
     f = _us_pair_features()
     trade_date = us_trade_date_from_calendar()
-    for ai_id in US_SEMI_PAPER_IDS:
+    for ai_id in US_SEMI_INTRADAY_IDS:
         with LOCK:
             st = S['us_semi_paper'][ai_id]
             if st.get('trade_date') != trade_date:
@@ -4166,6 +4644,7 @@ def run_us_semi_paper():
     # Persist per-account snapshots for backup/selfcheck.
     for ai_id in US_SEMI_PAPER_IDS:
         try:
+            update_us_semi_paper_asset(ai_id, save=False)
             _atomic_json_write(us_semi_state_path(ai_id), S['us_semi_paper'][ai_id])
         except Exception as e:
             set_error(f'{ai_id} state 저장 실패: {e}')
@@ -4477,7 +4956,7 @@ def finalize_all_paper_accounts():
         os.makedirs(os.path.dirname(state_path), exist_ok=True)
         state_tmp = state_path + '.tmp'
         with open(state_tmp, 'w', encoding='utf-8') as f:
-            json.dump({'saved_at': now_text(), 'date': today(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'start_cash': int(to_float(st.get('start_cash', MULTI_AI_START_CASH))), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 6), 'positions': st.get('positions', {}), 'last_action': st.get('last_action', '초기화'), 'paper_only': True, 'real_order': False}, f, ensure_ascii=False, indent=2)
+            json.dump({'saved_at': now_text(), 'date': today(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'start_cash': int(to_float(st.get('start_cash', MULTI_AI_START_CASH))), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 6), 'realized_pl': int(to_float(st.get('realized_pl', 0))), 'peak_asset': int(to_float(st.get('peak_asset', MULTI_AI_START_CASH))), 'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6), 'trade_count': len(st.get('trades', [])) if isinstance(st.get('trades', []), list) else 0, 'positions': st.get('positions', {}), 'last_action': st.get('last_action', '초기화'), 'paper_only': True, 'real_order': False}, f, ensure_ascii=False, indent=2)
         os.replace(state_tmp, state_path)
         path = multi_ai_path(ai_id)
         existing = _read_csv_rows(path)
@@ -7188,6 +7667,134 @@ def arcpro_status_snapshot():
                       'partial_ratio': ARC_PAPER_PARTIAL_RATIO, 'fee_side_pct': ARC_PAPER_KRX_COMMISSION_PCT, 'sell_tax_pct': ARC_PAPER_SELL_TAX_PCT, 'arc_signal_fresh_max_sec': ARC_SIGNAL_FRESH_MAX_SEC}
         }
 
+
+def _multi_ai_update_for_summary(ai_id):
+    """실시간 가격이 모두 있을 때만 KR PAPER 계좌를 재평가한다.
+    가격이 아직 없는 재시작/휴장 상황에서는 마지막 저장 asset을 보존한다.
+    """
+    ensure_multi_ai_states()
+    with LOCK:
+        st = S['paper_ais'][ai_id]
+        positions = dict(st.get('positions', {}))
+        prices = dict(S.get('prices', {}))
+        cash = to_float(st.get('cash', 0))
+        start = max(1.0, to_float(st.get('start_cash', MULTI_AI_START_CASH)))
+    if positions and any(to_float(prices.get(sym, 0)) <= 0 for sym in positions):
+        return False
+    asset = cash
+    for sym, pos in positions.items():
+        asset += to_float(pos.get('qty', 0)) * to_float(prices.get(sym, 0))
+    with LOCK:
+        st = S['paper_ais'][ai_id]
+        st['asset'] = int(round(asset))
+        st['profit_rate'] = round((asset / start - 1.0) * 100.0, 6)
+        peak = max(to_float(st.get('peak_asset', start)), asset)
+        st['peak_asset'] = peak
+        dd = ((asset / peak) - 1.0) * 100.0 if peak > 0 else 0.0
+        st['mdd_pct'] = min(to_float(st.get('mdd_pct', 0)), dd)
+    return True
+
+
+def paper_summary_snapshot():
+    """KR 92 + US 4 PAPER 계좌를 한 번에 시가평가/집계한다."""
+    ensure_multi_ai_states()
+    ensure_us_semi_paper_states()
+
+    for ai_id in MULTI_AI_IDS:
+        try:
+            _multi_ai_update_for_summary(ai_id)
+        except Exception as e:
+            set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
+
+    for ai_id in US_SEMI_PAPER_IDS:
+        try:
+            update_us_semi_paper_asset(ai_id, save=False)
+        except Exception as e:
+            set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
+
+    accounts = []
+    with LOCK:
+        for ai_id in MULTI_AI_IDS:
+            st = S['paper_ais'][ai_id]
+            trades = st.get('trades', []) if isinstance(st.get('trades', []), list) else []
+            positions = json.loads(json.dumps(st.get('positions', {})))
+            accounts.append({
+                'id': ai_id,
+                'market': 'KR',
+                'name': st.get('name', ai_id),
+                'start_cash': int(to_float(st.get('start_cash', MULTI_AI_START_CASH))),
+                'cash': int(to_float(st.get('cash', 0))),
+                'asset': int(to_float(st.get('asset', 0))),
+                'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
+                'realized_pl': int(to_float(st.get('realized_pl', 0))),
+                'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6),
+                'trade_count': len(trades),
+                'positions': positions,
+                'position_count': len(positions),
+                'last_action': st.get('last_action', ''),
+                'paper_only': True,
+            })
+
+        for ai_id in US_SEMI_PAPER_IDS:
+            st = S['us_semi_paper'][ai_id]
+            pos = json.loads(json.dumps(st.get('position')))
+            accounts.append({
+                'id': ai_id,
+                'market': 'US',
+                'name': st.get('name', ai_id),
+                'start_cash': int(to_float(st.get('start_cash', US_SEMI_START_CASH))),
+                'cash': round(to_float(st.get('cash', 0)), 4),
+                'asset': round(to_float(st.get('asset', 0)), 4),
+                'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
+                'realized_pl': round(to_float(st.get('realized_pl', 0)), 4),
+                'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6),
+                'trade_count': to_int(st.get('trade_count', 0)),
+                'closed_trade_count': len(st.get('trades', [])) if isinstance(st.get('trades', []), list) else 0,
+                'positions': {} if not pos else {str(pos.get('symbol', 'POSITION')): pos},
+                'position_count': 0 if not pos else 1,
+                'last_action': st.get('last_action', ''),
+                'paper_only': True,
+            })
+
+    accounts.sort(key=lambda x: (to_float(x.get('profit_rate', 0)), to_float(x.get('asset', 0))), reverse=True)
+    for i, row in enumerate(accounts, 1):
+        row['rank'] = i
+
+    kr = [x for x in accounts if x['market'] == 'KR']
+    us = [x for x in accounts if x['market'] == 'US']
+
+    def _stats(rows):
+        rates = [to_float(x.get('profit_rate', 0)) for x in rows]
+        if not rates:
+            return {'count': 0, 'average_profit_rate': 0, 'best': None, 'worst': None,
+                    'positive': 0, 'negative': 0, 'zero': 0}
+        ranked = sorted(rows, key=lambda x: to_float(x.get('profit_rate', 0)), reverse=True)
+        return {
+            'count': len(rows),
+            'average_profit_rate': round(sum(rates) / len(rates), 6),
+            'best': {'id': ranked[0]['id'], 'profit_rate': ranked[0]['profit_rate']},
+            'worst': {'id': ranked[-1]['id'], 'profit_rate': ranked[-1]['profit_rate']},
+            'positive': sum(1 for r in rates if r > 0),
+            'negative': sum(1 for r in rates if r < 0),
+            'zero': sum(1 for r in rates if r == 0),
+        }
+
+    return {
+        'ok': True,
+        'version': OPERATING_VERSION,
+        'generated_at_kst': now_text(),
+        'paper_only': True,
+        'real_order_enabled': bool(ENABLE_REAL_ORDER or US_REAL_ORDER_ENABLED),
+        'account_count': len(accounts),
+        'kr': _stats(kr),
+        'us': _stats(us),
+        'overall': _stats(accounts),
+        'us_accounts': us,
+        'ranking': accounts,
+    }
+
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -7207,6 +7814,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+        if path in ('/paper_summary', '/paper_results'):
+            try:
+                return self.json_response(paper_summary_snapshot())
+            except Exception as e:
+                return self.json_response({'ok': False, 'error': str(e), 'version': OPERATING_VERSION}, status=500)
         if path == '/rescue_today':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -7444,9 +8056,9 @@ def print_core_selfcheck():
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
     if len(MULTI_AI_IDS) != 92:
         raise RuntimeError(f'KR 가상계좌 수 오류: {len(MULTI_AI_IDS)}')
-    if len(US_SEMI_PAPER_IDS) != 2:
+    if len(US_SEMI_PAPER_IDS) != 4:
         raise RuntimeError(f'US U계열 가상계좌 수 오류: {len(US_SEMI_PAPER_IDS)}')
-    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) != 94:
+    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) != 96:
         raise RuntimeError(f'전체 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS)}')
 if __name__ == '__main__':
     print_core_selfcheck()
