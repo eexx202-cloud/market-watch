@@ -1,4 +1,5 @@
 # OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
+# V5.22: 한국 급등 V1 고정검증 + 실시간 호가 기반 동적 PAPER 체결/부분익절/수익보호/호가스냅샷. 실주문 OFF.
 # V5.21: V5.20 기반 - U03 SOXL -5% 장중20%/종가80% 분할스윙 + U04 시장레짐(BULL/PANIC/BEAR/CHOP) 적응형 PAPER.
 # V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
 # 실주문/실계좌/뉴스/매수후보 엔진 없음. 백업 실패가 수집 원본을 삭제하거나 중단시키지 않는다.
@@ -27,7 +28,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_21_TOSS_US_ADAPTIVE_U04_PAPER'
+OPERATING_VERSION = 'OPERATING_V5_24_KR_US_MARKET_SPLIT_FINAL_PAPER'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_4_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -117,6 +118,48 @@ US_SEMI_MAX_TRADES_PER_SESSION = max(1, int(os.environ.get('US_SEMI_MAX_TRADES_P
 US_SEMI_REENTRY_COOLDOWN_SEC = max(60, int(os.environ.get('US_SEMI_REENTRY_COOLDOWN_SEC', '900')))
 US_SEMI_DECISION_COOLDOWN_SEC = max(30, int(os.environ.get('US_SEMI_DECISION_COOLDOWN_SEC', '60')))
 US_SEMI_FEE_SIDE_PCT = max(0.0, float(os.environ.get('US_SEMI_FEE_SIDE_PCT', '0.10')))
+
+
+# V5.24: 미국 급등 전용 PAPER. 데이마켓/애프터마켓은 신규진입하지 않고,
+# PREMARKET / REGULAR을 완전히 독립 운영한다. 성공 기준은 '당일 상승률'이 아니라
+# PAPER 평균체결가 이후 +2% 도달 여부다. 기존 U01~U04는 그대로 보존한다.
+US_SURGE_PAPER_ENABLED = os.environ.get('US_SURGE_PAPER_ENABLED', 'true').lower() == 'true'
+US_SURGE_PAPER_IDS = ['UP01', 'UP02', 'UR01', 'UR02']
+US_SURGE_PAPER_NAMES = {
+    'UP01': 'US급등 PREMARKET 하루최대2회 +2%보호/추적',
+    'UP02': 'US급등 PREMARKET 하루최대5회 +2%보호/추적',
+    'UR01': 'US급등 REGULAR 하루최대2회 +2%보호/추적',
+    'UR02': 'US급등 REGULAR 하루최대5회 +2%보호/추적',
+}
+US_SURGE_SESSION_BY_ID = {'UP01':'PREMARKET','UP02':'PREMARKET','UR01':'REGULAR','UR02':'REGULAR'}
+US_SURGE_MAX_TRADES_BY_ID = {'UP01':2,'UP02':5,'UR01':2,'UR02':5}
+US_SURGE_START_CASH = int(float(os.environ.get('US_SURGE_START_CASH', '10000000')))
+US_SURGE_ENTRY_RATIO = max(0.10, min(0.95, float(os.environ.get('US_SURGE_ENTRY_RATIO', '0.90'))))
+US_SURGE_SCAN_SEC = max(30, int(os.environ.get('US_SURGE_SCAN_SEC', '60')))
+US_SURGE_RANKING_COUNT = max(20, min(100, int(os.environ.get('US_SURGE_RANKING_COUNT', '60'))))
+US_SURGE_ANALYZE_TOP_N = max(5, min(25, int(os.environ.get('US_SURGE_ANALYZE_TOP_N', '12'))))
+US_SURGE_MIN_PRICE_USD = max(0.5, float(os.environ.get('US_SURGE_MIN_PRICE_USD', '1.0')))
+US_SURGE_MIN_TURNOVER_USD_PRE = max(0.0, float(os.environ.get('US_SURGE_MIN_TURNOVER_USD_PRE', '2000000')))
+US_SURGE_MIN_TURNOVER_USD_REG = max(0.0, float(os.environ.get('US_SURGE_MIN_TURNOVER_USD_REG', '5000000')))
+# 아래 모멘텀값은 수익보장 기준이 아니라 PAPER 연구 시작값이다. PRE/REGULAR을 독립 조정한다.
+US_SURGE_PRE_MIN_R10_PCT = float(os.environ.get('US_SURGE_PRE_MIN_R10_PCT', '3.0'))
+US_SURGE_PRE_MAX_R3_PCT = float(os.environ.get('US_SURGE_PRE_MAX_R3_PCT', '2.0'))
+US_SURGE_PRE_MIN_VOL_RATIO = float(os.environ.get('US_SURGE_PRE_MIN_VOL_RATIO', '1.5'))
+US_SURGE_REG_MIN_R10_PCT = float(os.environ.get('US_SURGE_REG_MIN_R10_PCT', '2.0'))
+US_SURGE_REG_MAX_R3_PCT = float(os.environ.get('US_SURGE_REG_MAX_R3_PCT', '1.5'))
+US_SURGE_REG_MIN_VOL_RATIO = float(os.environ.get('US_SURGE_REG_MIN_VOL_RATIO', '1.3'))
+US_SURGE_HARD_SL_PCT = -abs(float(os.environ.get('US_SURGE_HARD_SL_PCT', '1.20')))
+US_SURGE_PROTECT_START_PCT = float(os.environ.get('US_SURGE_PROTECT_START_PCT', '2.0'))
+US_SURGE_PROTECT_FLOOR_PCT = float(os.environ.get('US_SURGE_PROTECT_FLOOR_PCT', '0.50'))
+US_SURGE_TRAIL_START_PCT = float(os.environ.get('US_SURGE_TRAIL_START_PCT', '2.50'))
+US_SURGE_TRAIL_DRAW_PCT = abs(float(os.environ.get('US_SURGE_TRAIL_DRAW_PCT', '0.90')))
+US_SURGE_REENTRY_COOLDOWN_SEC = max(60, int(os.environ.get('US_SURGE_REENTRY_COOLDOWN_SEC', '600')))
+US_SURGE_FEE_SIDE_PCT = max(0.0, float(os.environ.get('US_SURGE_FEE_SIDE_PCT', '0.10')))
+US_SURGE_MAX_BUY_SLIPPAGE_PCT = max(0.01, float(os.environ.get('US_SURGE_MAX_BUY_SLIPPAGE_PCT', '0.35')))
+US_SURGE_MAX_SELL_SLIPPAGE_PCT = max(0.01, float(os.environ.get('US_SURGE_MAX_SELL_SLIPPAGE_PCT', '0.50')))
+US_SURGE_DEPTH_USAGE_RATIO = max(0.05, min(1.0, float(os.environ.get('US_SURGE_DEPTH_USAGE_RATIO', '0.25'))))
+US_SURGE_MIN_FILL_RATIO = max(0.10, min(1.0, float(os.environ.get('US_SURGE_MIN_FILL_RATIO', '0.50'))))
+US_SURGE_MAX_LEVELS = max(1, min(20, int(os.environ.get('US_SURGE_MAX_LEVELS', '10'))))
 # U03: 2025/2026 공통 연구 규칙. 전년도 일봉을 이어서 지표를 계산하고, 종가 확정 후 PAPER 체결한다.
 US_REGIME_ENTRY_RATIO = max(0.10, min(1.0, float(os.environ.get('US_REGIME_ENTRY_RATIO', '1.0'))))
 US_REGIME_SOXL_DROP_PCT = -abs(float(os.environ.get('US_REGIME_SOXL_DROP_PCT', '5.0')))
@@ -155,11 +198,11 @@ MULTI_AI_MAX_POSITION_RATIO = float(os.environ.get('MULTI_AI_MAX_POSITION_RATIO'
 MULTI_AI_DECISION_COOLDOWN_SEC = int(os.environ.get('MULTI_AI_DECISION_COOLDOWN_SEC', '180'))
 RESEARCH_BASE_NAMES = {1: '연구고정 오전추세', 2: '연구고정 오전역추세', 3: '연구고정 오전돌파', 4: '연구고정 오전눌림', 5: '연구고정 09:15', 6: '연구고정 10:00', 7: '연구고정 11:00', 8: '연구고정 오후추세', 9: '연구고정 오후역추세', 10: '연구고정 오후돌파', 11: '연구고정 2구간', 12: '연구고정 저노출', 13: '연구고정 관망강화', 14: '연구고정 추적청산', 15: '연구고정 오버나이트'}
 WALK_BASE_NAMES = {1: '순방향 누적수익 1위', 2: '순방향 누적 상위3 분산', 3: '순방향 최근3일 1위', 4: '순방향 최근5일 1위', 5: '순방향 최근7일 1위', 6: '순방향 최근10일 1위', 7: '순방향 최근5일 위험조정', 8: '순방향 최근10일 위험조정', 9: '순방향 최소MDD', 10: '순방향 승률우선', 11: '순방향 수익MDD 혼합', 12: '순방향 50·30·20', 13: '순방향 단기역추세', 14: '순방향 지연추세', 15: '순방향 현금관망'}
-MULTI_AI_IDS = [f'RI{i:02d}' for i in range(1, 16)] + [f'RE{i:02d}' for i in range(1, 16)] + [f'WI{i:02d}' for i in range(1, 16)] + [f'WE{i:02d}' for i in range(1, 16)] + [f'G{i:02d}' for i in range(1, 6)] + [f'C{i:02d}' for i in range(1, 6)] + [f'L{i:02d}' for i in range(1, 6)] + [f'V{i:02d}' for i in range(1, 16)] + ['E01','E02']
-MULTI_AI_NAMES = {**{f'RI{i:02d}': f'1그룹 포함형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'RE{i:02d}': f'1그룹 제외형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WI{i:02d}': f'2그룹 포함형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WE{i:02d}': f'2그룹 제외형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, 'G01': '급등LAB 고정 TP1.0 SL0.5', 'G02': '급등LAB 고정 TP1.4 SL0.7', 'G03': '급등LAB 고정 TP2.0 SL0.7', 'G04': '급등LAB 고정 TP2.5 SL0.8', 'G05': '급등LAB 자동 변동성적응', 'E01': 'ETF LAB +1.4% 성공후 당일종료', 'E02': 'ETF LAB 추적청산', 'C01': '조합 오전인버스→오후레버리지', 'C02': '조합 오전인버스→오후인버스', 'C03': '조합 11:30 방향전환', 'C04': '조합 삼성·하이닉스 포함 자율', 'C05': '조합 삼성·하이닉스 제외 자율', 'L01': '학습 직전5일 최근가중 1위', 'L02': '학습 직전5일 최근가중 상위3', 'L03': '학습 직전7일 수익 1위', 'L04': '학습 직전5일 수익·MDD 균형', 'L05': '학습 비용·낙폭 방어형', 'V01': '검증 4천만원 하루2회 494310·252670', 'V02': '검증 미래변수제거 하루2회', 'V03': '검증 1억원대 삼성·하이닉스 4종목', 'V04': '일봉 삼성·하이닉스·KODEX200 MA10 완전합의', 'V05': '일봉방향 + 장중 눌림 재진입', 'V06': '일봉방향 + 같은 방향 상대강도 1위', 'V07': '삼성전자·SK하이닉스 장중 방향합의', 'V08': '관망강화 데이터·혼조 필터', 'V09': '고정 09:15 진입 60분 보유', 'V10': '고정 10:00 진입 90분 보유', 'V11': '고정 11:00 진입 90분 보유', 'V12': '11시 방향합의 90분 보유', 'V13': '오버나이트 15:10 진입 다음날 09:05 청산', 'V14': '하루 최대4회 방향추종', 'V15': '장중 방향전환·재진입 2회'}
-MULTI_AI_GROUP = {**{f'RI{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'RE{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'WI{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'WE{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET_LIVE' for i in range(1, 6)}, 'E01':'ETF_DIRECTION_LAB', 'E02':'ETF_DIRECTION_LAB', **{f'C{i:02d}': 'INTRADAY_COMBO' for i in range(1, 6)}, **{f'L{i:02d}': 'DAILY_LEARNING' for i in range(1, 6)}, **{f'V{i:02d}': 'EXPANDED_VERIFIED_RULE' for i in range(1, 16)}}
-MULTI_AI_UNIVERSE = {**{f'RI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'RE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'E01':'ETF5', 'E02':'ETF5', 'C01': 'INCLUDE_SAMSUNG_HYNIX', 'C02': 'INCLUDE_SAMSUNG_HYNIX', 'C03': 'INCLUDE_SAMSUNG_HYNIX', 'C04': 'INCLUDE_SAMSUNG_HYNIX', 'C05': 'EXCLUDE_SAMSUNG_HYNIX', **{f'L{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'V01': 'VERIFIED_494310_252670', 'V02': 'VERIFIED_494310_252670', 'V03': 'VERIFIED_SAMSUNG_HYNIX_4', **{f'V{i:02d}': 'ALL26_PAPER' for i in range(4, 16)}}
-MULTI_AI_PARENT = {**{f'RI{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'RE{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'WI{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'WE{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'G{i:02d}': f'G{i:02d}' for i in range(1, 6)}, 'E01':'E01', 'E02':'E02', **{f'C{i:02d}': f'C{i:02d}' for i in range(1, 6)}, **{f'L{i:02d}': f'L{i:02d}' for i in range(1, 6)}, **{f'V{i:02d}': f'V{i:02d}' for i in range(1, 16)}}
+MULTI_AI_IDS = [f'RI{i:02d}' for i in range(1, 16)] + [f'RE{i:02d}' for i in range(1, 16)] + [f'WI{i:02d}' for i in range(1, 16)] + [f'WE{i:02d}' for i in range(1, 16)] + [f'G{i:02d}' for i in range(1, 7)] + [f'C{i:02d}' for i in range(1, 6)] + [f'L{i:02d}' for i in range(1, 6)] + [f'V{i:02d}' for i in range(1, 16)] + ['E01','E02']
+MULTI_AI_NAMES = {**{f'RI{i:02d}': f'1그룹 포함형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'RE{i:02d}': f'1그룹 제외형 {RESEARCH_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WI{i:02d}': f'2그룹 포함형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, **{f'WE{i:02d}': f'2그룹 제외형 {WALK_BASE_NAMES[i]}' for i in range(1, 16)}, 'G01': '급등LAB 고정 TP1.0 SL0.5', 'G02': '급등LAB 고정 TP1.4 SL0.7', 'G03': '급등LAB 고정 TP2.0 SL0.7', 'G04': '급등LAB 고정 TP2.5 SL0.8', 'G05': '급등V1 하루최대2회 +1%보호 +1.5%절반익절 +2%추적', 'G06': '급등V1 다회진입 최대5회 +1%보호 +1.5%절반익절 +2%추적', 'E01': 'ETF LAB +1.4% 성공후 당일종료', 'E02': 'ETF LAB 추적청산', 'C01': '조합 오전인버스→오후레버리지', 'C02': '조합 오전인버스→오후인버스', 'C03': '조합 11:30 방향전환', 'C04': '조합 삼성·하이닉스 포함 자율', 'C05': '조합 삼성·하이닉스 제외 자율', 'L01': '학습 직전5일 최근가중 1위', 'L02': '학습 직전5일 최근가중 상위3', 'L03': '학습 직전7일 수익 1위', 'L04': '학습 직전5일 수익·MDD 균형', 'L05': '학습 비용·낙폭 방어형', 'V01': '검증 4천만원 하루2회 494310·252670', 'V02': '검증 미래변수제거 하루2회', 'V03': '검증 1억원대 삼성·하이닉스 4종목', 'V04': '일봉 삼성·하이닉스·KODEX200 MA10 완전합의', 'V05': '일봉방향 + 장중 눌림 재진입', 'V06': '일봉방향 + 같은 방향 상대강도 1위', 'V07': '삼성전자·SK하이닉스 장중 방향합의', 'V08': '관망강화 데이터·혼조 필터', 'V09': '고정 09:15 진입 60분 보유', 'V10': '고정 10:00 진입 90분 보유', 'V11': '고정 11:00 진입 90분 보유', 'V12': '11시 방향합의 90분 보유', 'V13': '오버나이트 15:10 진입 다음날 09:05 청산', 'V14': '하루 최대4회 방향추종', 'V15': '장중 방향전환·재진입 2회'}
+MULTI_AI_GROUP = {**{f'RI{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'RE{i:02d}': 'RESEARCH_FIXED' for i in range(1, 16)}, **{f'WI{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'WE{i:02d}': 'WALK_FORWARD' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET_LIVE' for i in range(1, 7)}, 'E01':'ETF_DIRECTION_LAB', 'E02':'ETF_DIRECTION_LAB', **{f'C{i:02d}': 'INTRADAY_COMBO' for i in range(1, 6)}, **{f'L{i:02d}': 'DAILY_LEARNING' for i in range(1, 6)}, **{f'V{i:02d}': 'EXPANDED_VERIFIED_RULE' for i in range(1, 16)}}
+MULTI_AI_UNIVERSE = {**{f'RI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'RE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WI{i:02d}': 'INCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'WE{i:02d}': 'EXCLUDE_SAMSUNG_HYNIX' for i in range(1, 16)}, **{f'G{i:02d}': 'FULL_MARKET' for i in range(1, 7)}, 'E01':'ETF5', 'E02':'ETF5', 'C01': 'INCLUDE_SAMSUNG_HYNIX', 'C02': 'INCLUDE_SAMSUNG_HYNIX', 'C03': 'INCLUDE_SAMSUNG_HYNIX', 'C04': 'INCLUDE_SAMSUNG_HYNIX', 'C05': 'EXCLUDE_SAMSUNG_HYNIX', **{f'L{i:02d}': 'FULL_MARKET' for i in range(1, 6)}, 'V01': 'VERIFIED_494310_252670', 'V02': 'VERIFIED_494310_252670', 'V03': 'VERIFIED_SAMSUNG_HYNIX_4', **{f'V{i:02d}': 'ALL26_PAPER' for i in range(4, 16)}}
+MULTI_AI_PARENT = {**{f'RI{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'RE{i:02d}': f'R{i:02d}' for i in range(1, 16)}, **{f'WI{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'WE{i:02d}': f'W{i:02d}' for i in range(1, 16)}, **{f'G{i:02d}': f'G{i:02d}' for i in range(1, 7)}, 'E01':'E01', 'E02':'E02', **{f'C{i:02d}': f'C{i:02d}' for i in range(1, 6)}, **{f'L{i:02d}': f'L{i:02d}' for i in range(1, 6)}, **{f'V{i:02d}': f'V{i:02d}' for i in range(1, 16)}}
 ENABLE_FULL_MARKET_SCANNER = os.environ.get('ENABLE_FULL_MARKET_SCANNER', 'true').lower() == 'true'
 FULL_MARKET_SCAN_INTERVAL_SEC = int(os.environ.get('FULL_MARKET_SCAN_INTERVAL_SEC', '60'))
 FULL_MARKET_TOP_N = int(os.environ.get('FULL_MARKET_TOP_N', '80'))
@@ -202,6 +245,33 @@ PROJECT_G_PROFIT_HARD_GIVEBACK_PCT = float(os.environ.get('PROJECT_G_PROFIT_HARD
 PROJECT_G_FIRST_ENTRY_HIGH_GAP_PCT = float(os.environ.get('PROJECT_G_FIRST_ENTRY_HIGH_GAP_PCT', '-0.80'))
 PROJECT_G_MAX_CHASE_CHANGE_PCT = float(os.environ.get('PROJECT_G_MAX_CHASE_CHANGE_PCT', '15.0'))
 PROJECT_G_REENTRY_METRIC_IMPROVE = float(os.environ.get('PROJECT_G_REENTRY_METRIC_IMPROVE', '3.0'))
+# V5.22 한국 급등 V1: 9/18~9/23 PAPER 연구에서 잡힌 '10분 지속강세 + 최근 3분 비과열' 가설을
+# 운영 중 임의변경하지 않고 검증하기 위한 고정 진입/청산/유동성 파라미터.
+PROJECT_G_V1_MIN_R10_PCT = float(os.environ.get('PROJECT_G_V1_MIN_R10_PCT', '3.0'))
+PROJECT_G_V1_MAX_R3_PCT = float(os.environ.get('PROJECT_G_V1_MAX_R3_PCT', '1.2'))
+PROJECT_G_V1_MIN_FROM_LOW_PCT = float(os.environ.get('PROJECT_G_V1_MIN_FROM_LOW_PCT', '3.0'))
+PROJECT_G_V1_MIN_BASE_SCORE = float(os.environ.get('PROJECT_G_V1_MIN_BASE_SCORE', '70.0'))
+PROJECT_G_V1_MIN_FROM_HIGH_PCT = float(os.environ.get('PROJECT_G_V1_MIN_FROM_HIGH_PCT', '-0.8'))
+PROJECT_G_MAX_DAILY_ENTRIES = max(1, min(5, int(os.environ.get('PROJECT_G_MAX_DAILY_ENTRIES', '2'))))
+# V5.23 비교계좌: G05는 하루 최대 2회, G06은 같은 V1 규칙으로 하루 최대 5회까지 허용해 진입횟수 효과만 비교한다.
+PROJECT_G_COMPARE_MAX_DAILY_ENTRIES = max(PROJECT_G_MAX_DAILY_ENTRIES + 1, min(10, int(os.environ.get('PROJECT_G_COMPARE_MAX_DAILY_ENTRIES', '5'))))
+# G05를 주전 V1 청산계좌로 사용: +1% 수익보호, +1.5% 절반익절, +2% 이후 추적.
+PROJECT_G_V1_HARD_SL_PCT = -abs(float(os.environ.get('PROJECT_G_V1_HARD_SL_PCT', '0.80')))
+PROJECT_G_V1_PROTECT_ARM_PCT = abs(float(os.environ.get('PROJECT_G_V1_PROTECT_ARM_PCT', '1.00')))
+PROJECT_G_V1_PROTECT_FLOOR_PCT = float(os.environ.get('PROJECT_G_V1_PROTECT_FLOOR_PCT', '0.25'))
+PROJECT_G_V1_PARTIAL_TP_PCT = abs(float(os.environ.get('PROJECT_G_V1_PARTIAL_TP_PCT', '1.50')))
+PROJECT_G_V1_PARTIAL_RATIO = max(0.10, min(0.90, float(os.environ.get('PROJECT_G_V1_PARTIAL_RATIO', '0.50'))))
+PROJECT_G_V1_TRAIL_START_PCT = abs(float(os.environ.get('PROJECT_G_V1_TRAIL_START_PCT', '2.00')))
+PROJECT_G_V1_TRAIL_DRAW_PCT = abs(float(os.environ.get('PROJECT_G_V1_TRAIL_DRAW_PCT', '0.70')))
+# 실전형 PAPER 체결: 호가 깊이 일부만 사용하고 허용 슬리피지 안에서만 주문금액을 자동 축소한다.
+PROJECT_G_TARGET_POSITION_RATIO = max(0.10, min(1.0, float(os.environ.get('PROJECT_G_TARGET_POSITION_RATIO', '1.0'))))
+PROJECT_G_MAX_ENTRY_SLIPPAGE_PCT = max(0.01, float(os.environ.get('PROJECT_G_MAX_ENTRY_SLIPPAGE_PCT', '0.25')))
+PROJECT_G_MAX_EXIT_SLIPPAGE_PCT = max(0.01, float(os.environ.get('PROJECT_G_MAX_EXIT_SLIPPAGE_PCT', '0.35')))
+PROJECT_G_MAX_DEPTH_USAGE_RATIO = max(0.05, min(1.0, float(os.environ.get('PROJECT_G_MAX_DEPTH_USAGE_RATIO', '0.30'))))
+PROJECT_G_ORDERBOOK_LEVELS = max(1, min(20, int(os.environ.get('PROJECT_G_ORDERBOOK_LEVELS', '5'))))
+PROJECT_G_MIN_FILL_RATIO = max(0.05, min(1.0, float(os.environ.get('PROJECT_G_MIN_FILL_RATIO', '0.25'))))
+PROJECT_G_MIN_ORDER_NOTIONAL_KRW = max(100000, int(float(os.environ.get('PROJECT_G_MIN_ORDER_NOTIONAL_KRW', '1000000'))))
+PROJECT_G_LIQUIDITY_SNAPSHOT_ENABLED = os.environ.get('PROJECT_G_LIQUIDITY_SNAPSHOT_ENABLED', 'true').lower() == 'true'
 # V5.12 ETF 전용 PAPER LAB. 기존 G계열과 자금/손익/로그를 완전히 분리한다.
 ETF_LAB_SYMBOLS = ['122630','252670','233740','251340','494310']
 ETF_LAB_START = os.environ.get('ETF_LAB_START', '09:00')
@@ -255,7 +325,8 @@ PROJECT_G_EXIT_PROFILES = {
     'G02': {'name': '고정 TP1.4 SL0.7', 'tp': 1.4, 'sl': -0.7, 'trail_start': 999.0, 'trail': -99.0},
     'G03': {'name': '고정 TP2.0 SL0.7', 'tp': 2.0, 'sl': -0.7, 'trail_start': 999.0, 'trail': -99.0},
     'G04': {'name': '고정 TP2.5 SL0.8', 'tp': 2.5, 'sl': -0.8, 'trail_start': 999.0, 'trail': -99.0},
-    'G05': {'name': '자동 변동성적응', 'tp': None, 'sl': None, 'trail_start': 1.0, 'trail': -0.55},
+    'G05': {'name': 'V1 하루최대2회 +1%보호 +1.5%절반익절 +2%추적', 'tp': None, 'sl': PROJECT_G_V1_HARD_SL_PCT, 'trail_start': PROJECT_G_V1_TRAIL_START_PCT, 'trail': -PROJECT_G_V1_TRAIL_DRAW_PCT},
+    'G06': {'name': 'V1 다회진입 최대5회 +1%보호 +1.5%절반익절 +2%추적', 'tp': None, 'sl': PROJECT_G_V1_HARD_SL_PCT, 'trail_start': PROJECT_G_V1_TRAIL_START_PCT, 'trail': -PROJECT_G_V1_TRAIL_DRAW_PCT},
 }
 ENABLE_TOSS_MARKET_DATA_CAPTURE = os.environ.get('ENABLE_TOSS_MARKET_DATA_CAPTURE', 'true').lower() == 'true'
 MARKET_DATA_CANDLE_SEC = int(os.environ.get('MARKET_DATA_CANDLE_SEC', '60'))
@@ -732,6 +803,9 @@ def project_market_snapshot_path():
 
 def project_candidate_event_path():
     return os.path.join(project_research_dir(), f'candidate_events_{today()}.csv')
+
+def project_orderbook_snapshot_path():
+    return os.path.join(project_research_dir(), f'project_orderbook_{today()}.csv')
 
 def project_daily_summary_path():
     return os.path.join(project_research_dir(), f'project_summary_{today()}.json')
@@ -1892,7 +1966,7 @@ def load_full_market_universe(force=False):
     """토스 랭킹 API로 현재 시장 후보군을 자동 구성한다.
 
     전체 상장종목 마스터를 빈 symbols로 요청하지 않는다.
-    시장 거래대금·거래량·상승·하락 랭킹을 합쳐 G01~G05 후보군으로 사용한다.
+    시장 거래대금·거래량·상승·하락 랭킹을 합쳐 G01~G06 후보군으로 사용한다.
     """
     state = S.setdefault('full_market', {})
     now_ts = time.time()
@@ -2294,8 +2368,9 @@ def _project_daily_stats(ai_id):
     for r in sells_chrono:
         pl = to_float(r.get('pl',0)); cumulative += pl; peak = max(peak, cumulative)
         streak = streak + 1 if pl < 0 else 0
+    buys = [r for r in rows if _project_is_buy_action(r.get('action'))]
     return {
-        'sell_count': len(sells), 'realized_pl': realized, 'realized_pct': realized / start_cash * 100.0,
+        'buy_count': len(buys), 'sell_count': len(sells), 'realized_pl': realized, 'realized_pct': realized / start_cash * 100.0,
         'peak_realized_pl': peak, 'peak_realized_pct': peak / start_cash * 100.0,
         'giveback_pct': max(0.0, (peak - cumulative) / start_cash * 100.0),
         'loss_streak': streak, 'last_sell_ts': _project_row_epoch(sells_chrono[-1]) if sells_chrono else 0.0,
@@ -2306,6 +2381,9 @@ def _project_allow_new_entry(ai_id):
     if not PROJECT_PAPER_LAB_ENABLED or not str(ai_id).startswith('G'):
         return True
     ds = _project_daily_stats(ai_id)
+    daily_limit = PROJECT_G_COMPARE_MAX_DAILY_ENTRIES if _multi_ai_parent_id(ai_id) == 'G06' else PROJECT_G_MAX_DAILY_ENTRIES
+    if ds.get('buy_count', 0) >= daily_limit:
+        return False
     # 하루 손실 한도만 하드 스톱. 수익이 났다고 좋은 기회를 자동으로 닫지 않는다.
     if ds['realized_pct'] <= PROJECT_DAILY_MAX_LOSS_PCT:
         return False
@@ -2325,7 +2403,21 @@ def _project_symbol_reentry_state(ai_id, sym):
     last = sells[-1] if sells else None
     return {'cycles': len(sells), 'last': last, 'last_ts': _project_row_epoch(last) if last else 0.0, 'last_pl': to_float(last.get('pl',0)) if last else 0.0}
 
-def _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, signal_type=''):
+def _project_v1_candidate_ok(score, r3, r10, from_high, from_low):
+    """한국 급등 V1 고정 진입필터. 종목명/당일상승률이 아니라 진입 직전 지속강도만 본다."""
+    if score < PROJECT_G_V1_MIN_BASE_SCORE:
+        return (False, f'BASE_SCORE {score:.1f}<{PROJECT_G_V1_MIN_BASE_SCORE:.1f}')
+    if r10 < PROJECT_G_V1_MIN_R10_PCT:
+        return (False, f'R10 {r10:.2f}<{PROJECT_G_V1_MIN_R10_PCT:.2f}')
+    if r3 > PROJECT_G_V1_MAX_R3_PCT:
+        return (False, f'R3_OVERHEAT {r3:.2f}>{PROJECT_G_V1_MAX_R3_PCT:.2f}')
+    if from_low < PROJECT_G_V1_MIN_FROM_LOW_PCT:
+        return (False, f'FROM_LOW {from_low:.2f}<{PROJECT_G_V1_MIN_FROM_LOW_PCT:.2f}')
+    if from_high < PROJECT_G_V1_MIN_FROM_HIGH_PCT:
+        return (False, f'NOT_NEAR_HIGH {from_high:.2f}<{PROJECT_G_V1_MIN_FROM_HIGH_PCT:.2f}')
+    return (True, 'OK')
+
+def _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, from_low=0.0, signal_type=''):
     """좋은 기회는 계속 허용하되 반복추격/수익반납/연속손실만 억제한다."""
     if not str(ai_id).startswith('G'):
         return (True, 'NON_G')
@@ -2334,6 +2426,9 @@ def _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, signal_t
     # 08~09시는 연구/후보수집만. 실제 신규진입은 entry window가 09:00부터이며 이중 방어한다.
     if _project_session_label() in {'PREMARKET','PREMARKET_AUCTION'}:
         return (False, 'PREMARKET_WATCH_ONLY')
+    v1_ok, v1_reason = _project_v1_candidate_ok(score, r3, r10, from_high, from_low)
+    if not v1_ok:
+        return (False, 'V1_' + v1_reason)
     if r10 < PROJECT_G_MIN_R10_PCT:
         return (False, f'R10_WEAK {r10:.2f}<{PROJECT_G_MIN_R10_PCT:.2f}')
     ds = _project_daily_stats(ai_id)
@@ -2496,7 +2591,7 @@ def _project_strategy_report(ai_id):
 
 
 def generate_project_daily_report(force=False):
-    """장마감 연구리포트. 수익뿐 아니라 프리마켓→정규장 전이, 놓친 급등, G01~G05 청산차이를 남긴다."""
+    """장마감 연구리포트. 수익뿐 아니라 프리마켓→정규장 전이, 놓친 급등, G01~G06 청산차이를 남긴다."""
     if not PROJECT_REPORT_ENABLED or not PROJECT_RESEARCH_SAVE_ENABLED:
         return None
     hhmm = now_kst().strftime('%H:%M')
@@ -2674,7 +2769,7 @@ def project_storage_housekeeping(force=False):
     return removed
 
 def full_market_candidate(ai_id):
-    """G01~G05는 같은 시점의 같은 진입후보를 공유하고 청산법만 달리한다.
+    """G01~G06는 같은 시점의 같은 진입후보를 공유하고 청산법만 달리한다.
     후보는 PREMARKET_CONTINUATION과 REGULAR_SURGE 두 경로를 동시에 경쟁시킨다.
     """
     st = _project_state()
@@ -2694,6 +2789,10 @@ def full_market_candidate(ai_id):
         ps, r3, r10, from_high, from_low, sigtype, feat = _project_candidate_score(base_score, sym, q)
         if sigtype == 'PREMARKET_FADE_AVOID':
             continue
+        if _project_session_label() in {'OPEN_FAST', 'REGULAR'}:
+            v1_ok, _v1_reason = _project_v1_candidate_ok(base_score, r3, r10, from_high, from_low)
+            if not v1_ok:
+                continue
         scored.append((ps, sym, base_score, r3, r10, from_high, from_low,
                        min(30.0, max(to_float(q.get('turnover',0)),0.0) ** 0.5 / 20000.0), sigtype, feat))
     best = max(scored, default=(-999.0, '', 0, 0, 0, 0, 0, 0, 'NONE', {}), key=lambda x: x[0])
@@ -2752,23 +2851,26 @@ def _multi_ai_update(ai_id):
 
 def _multi_ai_record(ai_id, action, sym, price, qty, fee, pl, reason, partial=False, extras=None):
     _multi_ai_update(ai_id)
+    extra_keys = ('mfe_pct','mae_pct','hold_sec','entry_reason','target_cash','filled_gross','fill_ratio',
+                  'slippage_pct','orderbook_timestamp','levels_used','liquidity_limited','signal_price','best_price','position_ratio')
     with LOCK:
         st = S['paper_ais'][ai_id]
-        row = {'time': now_text(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'action': action, 'symbol': sym, 'name': name_of(sym), 'price': round(to_float(price), 4), 'qty': int(qty), 'fee': int(fee), 'pl': int(pl), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 4), 'reason': reason, 'partial': bool(partial), 'real_order': False, 'mfe_pct': '', 'mae_pct': '', 'hold_sec': '', 'entry_reason': ''}
+        row = {'time': now_text(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'action': action, 'symbol': sym, 'name': name_of(sym), 'price': round(to_float(price), 4), 'qty': int(qty), 'fee': int(fee), 'pl': int(pl), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 4), 'reason': reason, 'partial': bool(partial), 'real_order': False, 'mfe_pct': '', 'mae_pct': '', 'hold_sec': '', 'entry_reason': '', 'target_cash': '', 'filled_gross': '', 'fill_ratio': '', 'slippage_pct': '', 'orderbook_timestamp': '', 'levels_used': '', 'liquidity_limited': '', 'signal_price': '', 'best_price': '', 'position_ratio': ''}
         if isinstance(extras, dict):
-            for k in ('mfe_pct','mae_pct','hold_sec','entry_reason'):
+            for k in extra_keys:
                 if k in extras:
                     row[k] = extras.get(k)
         st.setdefault('trades', []).insert(0, row)
-        st['trades'] = st['trades'][:200]
+        st['trades'] = st['trades'][:300]
         st['last_action'] = f'{now_short()} {action} {name_of(sym)}'
-    write_row(multi_ai_path(ai_id), ['time', 'ai_id', 'ai_name', 'action', 'symbol', 'name', 'price', 'qty', 'fee', 'pl', 'cash', 'asset', 'profit_rate', 'reason', 'partial', 'real_order', 'mfe_pct', 'mae_pct', 'hold_sec', 'entry_reason'], row)
+    headers = ['time', 'ai_id', 'ai_name', 'action', 'symbol', 'name', 'price', 'qty', 'fee', 'pl', 'cash', 'asset', 'profit_rate', 'reason', 'partial', 'real_order', 'mfe_pct', 'mae_pct', 'hold_sec', 'entry_reason', 'target_cash', 'filled_gross', 'fill_ratio', 'slippage_pct', 'orderbook_timestamp', 'levels_used', 'liquidity_limited', 'signal_price', 'best_price', 'position_ratio']
+    write_row(multi_ai_path(ai_id), headers, row)
     save_state()
 
 def _multi_ai_buy(ai_id, sym, reason, ratio=None):
     if str(ai_id).startswith('G') and not _project_allow_new_entry(ai_id):
         return False
-    if not ensure_live_orderbook(sym):
+    if not ensure_live_orderbook(sym, force=True):
         return False
     gate_ok, gate_reason = market_safety_gate(sym)
     if not gate_ok:
@@ -2779,11 +2881,24 @@ def _multi_ai_buy(ai_id, sym, reason, ratio=None):
         if st.get('positions'):
             return False
         cash = int(to_float(st.get('cash', 0)))
-    use_ratio = MULTI_AI_MAX_POSITION_RATIO if ratio is None else min(MULTI_AI_MAX_POSITION_RATIO, max(0.05, ratio))
-    budget = int(cash * use_ratio)
+    is_g = str(ai_id).startswith('G')
+    max_ratio = PROJECT_G_TARGET_POSITION_RATIO if is_g else MULTI_AI_MAX_POSITION_RATIO
+    requested_ratio = max_ratio if ratio is None else max(0.05, min(max_ratio, ratio))
+    budget = int(cash * requested_ratio)
     fee_rate = MULTI_AI_FEE_SIDE_PCT / 100
-    fill = simulated_orderbook_fill(sym, 'BUY', max_cash=budget / (1 + fee_rate))
+    signal_price = to_float(S.get('prices', {}).get(sym, 0))
+    if is_g:
+        fill = simulated_orderbook_fill(
+            sym, 'BUY', max_cash=budget / (1 + fee_rate),
+            max_slippage_pct=PROJECT_G_MAX_ENTRY_SLIPPAGE_PCT,
+            depth_usage_ratio=PROJECT_G_MAX_DEPTH_USAGE_RATIO,
+            max_levels=PROJECT_G_ORDERBOOK_LEVELS,
+        )
+    else:
+        fill = simulated_orderbook_fill(sym, 'BUY', max_cash=budget / (1 + fee_rate))
     if not fill.get('ok'):
+        if is_g:
+            project_save_orderbook_snapshot(sym, 'ENTRY_REJECT_NO_FILL', ai_id, budget, fill)
         return False
     qty = int(fill.get('qty', 0))
     price = to_float(fill.get('avg_price', 0))
@@ -2797,14 +2912,36 @@ def _multi_ai_buy(ai_id, sym, reason, ratio=None):
         total = gross + fee
     if qty <= 0:
         return False
+    fill_ratio = to_float(fill.get('fill_ratio', 0.0))
+    if is_g and (gross < PROJECT_G_MIN_ORDER_NOTIONAL_KRW or fill_ratio < PROJECT_G_MIN_FILL_RATIO):
+        project_save_orderbook_snapshot(sym, 'ENTRY_REJECT_THIN', ai_id, budget, fill)
+        return False
+    liq_reason = (f' liquidity target={budget:,} gross={gross:,} fill={fill_ratio*100:.1f}% '
+                  f'slip={to_float(fill.get("slippage_pct",0)):.3f}% levels={int(fill.get("levels_used",0))}') if is_g else ''
+    reason2 = str(reason)[:1300] + liq_reason
     with LOCK:
         st = S['paper_ais'][ai_id]
         st['cash'] = cash - total
-        st['positions'][sym] = {'qty': qty, 'avg': price, 'entry_time': now_text(), 'entry_date': today(), 'entry_total_cost': total, 'entry_fee': fee, 'high_after_buy': price, 'low_after_buy': price, 'entry_reason': str(reason)[:1500]}
-    _multi_ai_record(ai_id, '가상매수', sym, price, qty, fee, 0, reason, bool(fill.get('partial')))
+        st['positions'][sym] = {
+            'qty': qty, 'avg': price, 'entry_time': now_text(), 'entry_date': today(), 'entry_total_cost': total,
+            'entry_fee': fee, 'high_after_buy': price, 'low_after_buy': price, 'entry_reason': str(reason2)[:1500],
+            'partial_taken': False, 'protect_armed': False,
+            'entry_target_cash': budget, 'entry_gross': gross, 'entry_fill_ratio': fill_ratio,
+            'entry_slippage_pct': to_float(fill.get('slippage_pct',0)), 'entry_orderbook_timestamp': str(fill.get('orderbook_timestamp','')),
+        }
+    extras = {
+        'target_cash': budget, 'filled_gross': gross, 'fill_ratio': round(fill_ratio,4),
+        'slippage_pct': round(to_float(fill.get('slippage_pct',0)),4), 'orderbook_timestamp': fill.get('orderbook_timestamp',''),
+        'levels_used': int(fill.get('levels_used',0)), 'liquidity_limited': bool(fill.get('partial')),
+        'signal_price': round(signal_price,4), 'best_price': round(to_float(fill.get('best_price',0)),4),
+        'position_ratio': round(total / max(1,cash),4),
+    }
+    if is_g:
+        project_save_orderbook_snapshot(sym, 'ENTRY_FILLED', ai_id, budget, fill)
+    _multi_ai_record(ai_id, '가상매수', sym, price, qty, fee, 0, reason2, bool(fill.get('partial')), extras)
     return True
 
-def _multi_ai_sell(ai_id, sym, reason):
+def _multi_ai_sell(ai_id, sym, reason, sell_ratio=1.0):
     ensure_multi_ai_states()
     with LOCK:
         st = S['paper_ais'][ai_id]
@@ -2818,11 +2955,27 @@ def _multi_ai_sell(ai_id, sym, reason):
         low_after_buy = min(avg, to_float(pos.get('low_after_buy', avg)) or avg)
         entry_time = str(pos.get('entry_time', ''))
         entry_reason = str(pos.get('entry_reason', ''))
+    if qty <= 0:
+        return False
+    if not ensure_live_orderbook(sym, force=True):
+        return False
     gate_ok, _ = market_safety_gate(sym)
     if not gate_ok:
         return False
-    fill = simulated_orderbook_fill(sym, 'SELL', qty=qty)
+    target_qty = qty if sell_ratio >= 0.999 else max(1, min(qty, int(qty * max(0.01, min(1.0, sell_ratio)))))
+    is_g = str(ai_id).startswith('G')
+    if is_g:
+        fill = simulated_orderbook_fill(
+            sym, 'SELL', qty=target_qty,
+            max_slippage_pct=PROJECT_G_MAX_EXIT_SLIPPAGE_PCT,
+            depth_usage_ratio=PROJECT_G_MAX_DEPTH_USAGE_RATIO,
+            max_levels=PROJECT_G_ORDERBOOK_LEVELS,
+        )
+    else:
+        fill = simulated_orderbook_fill(sym, 'SELL', qty=target_qty)
     if not fill.get('ok'):
+        if is_g:
+            project_save_orderbook_snapshot(sym, 'EXIT_REJECT_NO_FILL', ai_id, 0, fill)
         return False
     sold = int(fill.get('qty', 0))
     price = to_float(fill.get('avg_price', 0))
@@ -2850,10 +3003,16 @@ def _multi_ai_sell(ai_id, sym, reason):
     extras = {
         'mfe_pct': round(pct(high_after_buy, avg), 4) if avg > 0 else '',
         'mae_pct': round(pct(low_after_buy, avg), 4) if avg > 0 else '',
-        'hold_sec': hold_sec,
-        'entry_reason': entry_reason,
+        'hold_sec': hold_sec, 'entry_reason': entry_reason,
+        'filled_gross': gross, 'fill_ratio': round(to_float(fill.get('fill_ratio',0)),4),
+        'slippage_pct': round(to_float(fill.get('slippage_pct',0)),4), 'orderbook_timestamp': fill.get('orderbook_timestamp',''),
+        'levels_used': int(fill.get('levels_used',0)), 'liquidity_limited': bool(fill.get('partial')),
+        'signal_price': round(to_float(S.get('prices',{}).get(sym,0)),4), 'best_price': round(to_float(fill.get('best_price',0)),4),
     }
-    _multi_ai_record(ai_id, '가상매도', sym, price, sold, fee, pl, reason, remain > 0, extras)
+    action = '가상매도' if remain <= 0 and target_qty >= qty else '부분가상매도'
+    if is_g:
+        project_save_orderbook_snapshot(sym, 'EXIT_FILLED', ai_id, 0, fill)
+    _multi_ai_record(ai_id, action, sym, price, sold, fee, pl, reason, remain > 0, extras)
     return True
 
 def _multi_ai_recent_metrics(sym):
@@ -3080,7 +3239,7 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
             return f'{ai_id} ETF 당일 {ETF_LAB_FORCE_EXIT} 청산'
     elif family == 'G':
         prof = PROJECT_G_EXIT_PROFILES.get(parent, PROJECT_G_EXIT_PROFILES['G02'])
-        if parent == 'G05':
+        if parent in {'G05','G06'}:
             adaptive = _project_adaptive_exit(sym)
             tp, sl, trail_start, trail = adaptive['tp'], adaptive['sl'], adaptive['trail_start'], adaptive['trail']
         else:
@@ -3089,7 +3248,7 @@ def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
             return f'{ai_id} PROJECT 손절 {profit:.2f}% <= {sl:.2f}%'
         if tp is not None and profit >= tp:
             return f'{ai_id} PROJECT 목표익절 {profit:.2f}% >= {tp:.2f}%'
-        if parent == 'G05' and profit >= trail_start and draw <= trail:
+        if parent in {'G05','G06'} and profit >= trail_start and draw <= trail:
             return f'{ai_id} PROJECT 자동추적청산 profit={profit:.2f}% draw={draw:.2f}%'
         if hhmm >= '15:10':
             return f'{ai_id} PROJECT 당일 15:10 청산'
@@ -3612,8 +3771,46 @@ def _run_etf_lab_account(ai_id, hhmm, now_ts):
             st['decision_data_end'] = now_text()
     return True
 
+def _project_manage_g05_position(ai_id, sym, pos, hhmm):
+    """급등 V1 공통 청산(G05/G06): +1% 보호, +1.5% 절반익절, 나머지는 +2% 이후 0.7% 추적."""
+    price = to_float(S.get('prices', {}).get(sym, 0)); avg = to_float(pos.get('avg', 0))
+    if price <= 0 or avg <= 0:
+        return False
+    high = max(to_float(pos.get('high_after_buy', avg)), price)
+    low0 = to_float(pos.get('low_after_buy', avg)) or avg
+    low = min(low0, price)
+    profit = pct(price, avg); draw = pct(price, high)
+    with LOCK:
+        live = S['paper_ais'][ai_id].get('positions', {}).get(sym)
+        if isinstance(live, dict):
+            live['high_after_buy'] = high; live['low_after_buy'] = low
+            if profit >= PROJECT_G_V1_PROTECT_ARM_PCT:
+                live['protect_armed'] = True
+            protect_armed = bool(live.get('protect_armed', False))
+            partial_taken = bool(live.get('partial_taken', False))
+        else:
+            return False
+    if profit <= PROJECT_G_V1_HARD_SL_PCT:
+        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 손절 {profit:.2f}% <= {PROJECT_G_V1_HARD_SL_PCT:.2f}%')
+    if (not partial_taken) and profit >= PROJECT_G_V1_PARTIAL_TP_PCT:
+        ok = _multi_ai_sell(ai_id, sym, f'{ai_id} V1 1차익절 {profit:.2f}% >= {PROJECT_G_V1_PARTIAL_TP_PCT:.2f}%', sell_ratio=PROJECT_G_V1_PARTIAL_RATIO)
+        if ok:
+            with LOCK:
+                live = S['paper_ais'][ai_id].get('positions', {}).get(sym)
+                if isinstance(live, dict):
+                    live['partial_taken'] = True; live['protect_armed'] = True
+            save_state()
+        return ok
+    if protect_armed and profit <= PROJECT_G_V1_PROTECT_FLOOR_PCT:
+        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 수익보호 {profit:.2f}% <= {PROJECT_G_V1_PROTECT_FLOOR_PCT:.2f}%')
+    if profit >= PROJECT_G_V1_TRAIL_START_PCT and draw <= -PROJECT_G_V1_TRAIL_DRAW_PCT:
+        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 추적청산 profit={profit:.2f}% draw={draw:.2f}%')
+    if hhmm >= '15:10':
+        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 당일 15:10 청산')
+    return False
+
 def run_multi_paper_ais():
-    """92개 독립 가상계좌. 실제 주문 함수는 절대 호출하지 않는다."""
+    """독립 가상계좌들을 실행한다. 실제 주문 함수는 절대 호출하지 않는다."""
     ensure_multi_ai_states()
     for ai_id in MULTI_AI_IDS:
         _multi_ai_update(ai_id)
@@ -3646,9 +3843,12 @@ def run_multi_paper_ais():
             last_ts = to_float(st.get('last_decision_ts', 0))
         if positions:
             for sym, pos in list(positions.items()):
+                if _multi_ai_parent_id(ai_id) in {'G05','G06'}:
+                    _project_manage_g05_position(ai_id, sym, pos, hhmm)
+                    continue
                 reason = _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm)
                 if reason:
-                    ensure_live_orderbook(sym)
+                    ensure_live_orderbook(sym, force=True)
                     _multi_ai_sell(ai_id, sym, reason)
             continue
         if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC:
@@ -3680,11 +3880,11 @@ def run_multi_paper_ais():
                 st['last_decision_ts'] = now_ts
                 st['last_action'] = f'{now_short()} 호가미수신 관망 {sym}'
             continue
-        ratios = {'G01': 0.90, 'G02': 0.90, 'G03': 0.90, 'G04': 0.90, 'G05': 0.90, 'W15': 0.3, 'R12': 0.35, 'R13': 0.4, 'L01': 0.7, 'L02': 0.55, 'L03': 0.65, 'L04': 0.5, 'L05': 0.35}
+        ratios = {'G01': PROJECT_G_TARGET_POSITION_RATIO, 'G02': PROJECT_G_TARGET_POSITION_RATIO, 'G03': PROJECT_G_TARGET_POSITION_RATIO, 'G04': PROJECT_G_TARGET_POSITION_RATIO, 'G05': PROJECT_G_TARGET_POSITION_RATIO, 'G06': PROJECT_G_TARGET_POSITION_RATIO, 'W15': 0.3, 'R12': 0.35, 'R13': 0.4, 'L01': 0.7, 'L02': 0.55, 'L03': 0.65, 'L04': 0.5, 'L05': 0.35}
         ratio = ratios.get(parent, 0.7)
         project_type = _project_state().get('shared_candidate', {}).get('signal_type', '') if family == 'G' else ''
         if family == 'G':
-            allow, guard_reason = _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, project_type)
+            allow, guard_reason = _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, from_low, project_type)
             if not allow:
                 with LOCK:
                     st['last_decision_ts'] = now_ts
@@ -3698,38 +3898,82 @@ def run_multi_paper_ais():
                 st['last_decision_date'] = today()
                 st['decision_data_end'] = now_text()
 
-def simulated_orderbook_fill(sym, side, max_cash=0, qty=0):
-    """현재 호가 잔량을 위에서부터 소진해 가상 평균체결가/부분체결을 계산한다."""
+def project_save_orderbook_snapshot(sym, event, ai_id='', target_cash=0, fill=None):
+    """G 급등 PAPER 의사결정 순간의 호가를 작게 저장한다. 전 종목 틱 저장은 하지 않는다."""
+    if not PROJECT_G_LIQUIDITY_SNAPSHOT_ENABLED:
+        return
+    ob = S.setdefault('market_data_capture', {}).get('latest_orderbook', {}).get(sym, {})
+    if not isinstance(ob, dict) or not ob:
+        return
+    asks = list(ob.get('asks', []) or [])[:PROJECT_G_ORDERBOOK_LEVELS]
+    bids = list(ob.get('bids', []) or [])[:PROJECT_G_ORDERBOOK_LEVELS]
+    fill = fill if isinstance(fill, dict) else {}
+    row = {
+        'time': now_text(), 'event': str(event), 'ai_id': str(ai_id), 'symbol': str(sym), 'name': name_of(sym),
+        'api_timestamp': str(ob.get('timestamp','')), 'signal_price': to_float(S.get('prices',{}).get(sym,0)),
+        'best_ask': to_float(ob.get('best_ask',0)), 'best_bid': to_float(ob.get('best_bid',0)),
+        'target_cash': int(to_float(target_cash,0)), 'fill_qty': int(to_float(fill.get('qty',0))),
+        'fill_gross': round(to_float(fill.get('gross',0)),4), 'avg_price': round(to_float(fill.get('avg_price',0)),4),
+        'fill_ratio': round(to_float(fill.get('fill_ratio',0)),6), 'slippage_pct': round(to_float(fill.get('slippage_pct',0)),6),
+        'levels_used': int(to_float(fill.get('levels_used',0))), 'partial': bool(fill.get('partial',False)),
+        'asks_json': json.dumps(asks, ensure_ascii=False, separators=(',',':')),
+        'bids_json': json.dumps(bids, ensure_ascii=False, separators=(',',':')),
+    }
+    headers = ['time','event','ai_id','symbol','name','api_timestamp','signal_price','best_ask','best_bid','target_cash','fill_qty','fill_gross','avg_price','fill_ratio','slippage_pct','levels_used','partial','asks_json','bids_json']
+    write_row(project_orderbook_snapshot_path(), headers, row)
+
+def simulated_orderbook_fill(sym, side, max_cash=0, qty=0, max_slippage_pct=None, depth_usage_ratio=1.0, max_levels=None):
+    """현재 호가를 실제처럼 위에서부터 소진하되, PAPER에서는 표시잔량 일부와 슬리피지 한도를 적용할 수 있다."""
     ob = S.setdefault('market_data_capture', {}).get('latest_orderbook', {}).get(sym, {})
     levels = ob.get('asks' if side == 'BUY' else 'bids', []) if isinstance(ob, dict) else []
     if not isinstance(levels, list) or not levels:
-        return {'ok': False, 'reason': 'ORDERBOOK_EMPTY', 'qty': 0, 'avg_price': 0, 'gross': 0}
-    remain_cash = float(max_cash)
-    remain_qty = int(qty)
-    filled = 0
-    gross = 0.0
-    for level in levels:
+        return {'ok': False, 'reason': 'ORDERBOOK_EMPTY', 'qty': 0, 'avg_price': 0, 'gross': 0, 'fill_ratio': 0.0, 'slippage_pct': 0.0, 'levels_used': 0}
+    max_levels = len(levels) if max_levels is None else max(1, min(len(levels), int(max_levels)))
+    depth_usage_ratio = max(0.01, min(1.0, float(depth_usage_ratio)))
+    valid = []
+    for level in levels[:max_levels]:
         if not isinstance(level, dict):
             continue
-        px = to_float(level.get('price', 0))
-        avail = int(to_float(level.get('volume', 0)))
-        if px <= 0 or avail <= 0:
+        px = to_float(level.get('price', 0)); av = int(to_float(level.get('volume', 0)))
+        if px > 0 and av > 0:
+            valid.append((px, av))
+    if not valid:
+        return {'ok': False, 'reason': 'ORDERBOOK_INVALID', 'qty': 0, 'avg_price': 0, 'gross': 0, 'fill_ratio': 0.0, 'slippage_pct': 0.0, 'levels_used': 0}
+    best = valid[0][0]
+    target_qty = int(float(max_cash) // best) if side == 'BUY' else int(qty)
+    if target_qty <= 0:
+        return {'ok': False, 'reason': 'TARGET_ZERO', 'qty': 0, 'avg_price': 0, 'gross': 0, 'fill_ratio': 0.0, 'slippage_pct': 0.0, 'levels_used': 0, 'best_price': best}
+    remain_cash = float(max_cash); remain_qty = target_qty
+    filled = 0; gross = 0.0; used = 0
+    for px, raw_avail in valid:
+        impact = ((px / best) - 1.0) * 100.0 if side == 'BUY' else ((best / px) - 1.0) * 100.0
+        if max_slippage_pct is not None and impact > float(max_slippage_pct) + 1e-12:
+            break
+        avail = int(raw_avail * depth_usage_ratio)
+        if avail <= 0:
             continue
         if side == 'BUY':
-            can = min(avail, int(remain_cash // px))
+            can = min(avail, int(remain_cash // px), remain_qty)
         else:
             can = min(avail, remain_qty)
         if can <= 0:
             continue
-        filled += can
-        gross += can * px
+        used += 1; filled += can; gross += can * px
         if side == 'BUY':
             remain_cash -= can * px
-        else:
-            remain_qty -= can
-        if side == 'BUY' and remain_cash < px or (side == 'SELL' and remain_qty <= 0):
+        remain_qty -= can
+        if remain_qty <= 0:
             break
-    return {'ok': filled > 0, 'reason': 'OK' if filled > 0 else 'NO_LIQUIDITY', 'qty': filled, 'avg_price': gross / filled if filled else 0, 'gross': gross, 'partial': side == 'SELL' and filled < qty, 'orderbook_timestamp': ob.get('timestamp', '') if isinstance(ob, dict) else ''}
+    avg = gross / filled if filled else 0.0
+    slip = ((avg / best) - 1.0) * 100.0 if side == 'BUY' and avg else (((best / avg) - 1.0) * 100.0 if avg else 0.0)
+    fill_ratio = filled / max(1, target_qty)
+    return {
+        'ok': filled > 0, 'reason': 'OK' if filled >= target_qty else ('PARTIAL_LIQUIDITY' if filled > 0 else 'NO_LIQUIDITY'),
+        'qty': filled, 'target_qty': target_qty, 'avg_price': avg, 'gross': gross,
+        'partial': filled < target_qty, 'fill_ratio': fill_ratio, 'slippage_pct': slip,
+        'levels_used': used, 'best_price': best,
+        'orderbook_timestamp': ob.get('timestamp', '') if isinstance(ob, dict) else ''
+    }
 
 def _result_dict(data):
     if not isinstance(data, dict):
@@ -4579,9 +4823,299 @@ def run_us_adaptive_paper():
     else:
         _us_regime_log(ai_id, 'WAIT', f, f"U04_CASH_{f.get('prev_regime','UNKNOWN')}")
 
+
+
+def _us_surge_default(ai_id):
+    return {
+        'id': ai_id, 'name': US_SURGE_PAPER_NAMES.get(ai_id, ai_id),
+        'start_cash': US_SURGE_START_CASH, 'cash': US_SURGE_START_CASH,
+        'position': None, 'realized_pl': 0.0, 'asset': US_SURGE_START_CASH,
+        'profit_rate': 0.0, 'trades': [], 'last_action': '초기화',
+        'trade_date': '', 'trade_count': 0, 'last_exit_ts': 0.0,
+        'peak_asset': US_SURGE_START_CASH, 'mdd_pct': 0.0,
+    }
+
+
+def ensure_us_surge_states():
+    with LOCK:
+        root = S.setdefault('us_surge_paper', {})
+        for ai_id in US_SURGE_PAPER_IDS:
+            cur = root.get(ai_id)
+            if not isinstance(cur, dict):
+                root[ai_id] = _us_surge_default(ai_id)
+            else:
+                for k, v in _us_surge_default(ai_id).items():
+                    cur.setdefault(k, v)
+                cur['name'] = US_SURGE_PAPER_NAMES.get(ai_id, ai_id)
+        scan = S.setdefault('us_surge_scan', {})
+        scan.setdefault('last_scan_ts', 0.0)
+        scan.setdefault('session', '')
+        scan.setdefault('ranked', [])
+        scan.setdefault('latest_orderbook', {})
+        scan.setdefault('last_error', '')
+
+
+def us_surge_dir():
+    path = os.path.join(us_day_dir(), 'paper_us_surge')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def us_surge_state_path(ai_id):
+    return os.path.join(us_surge_dir(), f'paper_account_state_{ai_id}_{us_trade_date_from_calendar()}.json')
+
+
+def us_surge_trade_path(ai_id):
+    return os.path.join(us_surge_dir(), f'paper_us_surge_{ai_id}_{us_trade_date_from_calendar()}.csv')
+
+
+def us_surge_scan_path():
+    return os.path.join(us_surge_dir(), f'us_surge_candidates_{us_trade_date_from_calendar()}.csv')
+
+
+def _us_surge_log(ai_id, action, symbol, price=0.0, qty=0, fee=0.0, pl=0.0, reason='', extra=None):
+    ensure_us_surge_states()
+    extra = dict(extra or {})
+    st = S['us_surge_paper'][ai_id]
+    headers = ['time','trade_date','ai_id','ai_name','session','action','symbol','price','qty','fee','pl','cash','asset','profit_rate','reason','r3','r10','volume_ratio','turnover','score','target_cash','filled_gross','fill_ratio','slippage_pct','orderbook_timestamp','levels_used','mfe_pct','mae_pct','hold_sec','paper_only']
+    row = {
+        'time': now_text(), 'trade_date': us_trade_date_from_calendar(), 'ai_id': ai_id,
+        'ai_name': st.get('name', ai_id), 'session': extra.get('session', US_SURGE_SESSION_BY_ID.get(ai_id,'')),
+        'action': action, 'symbol': symbol, 'price': round(to_float(price), 6), 'qty': int(qty),
+        'fee': round(to_float(fee), 6), 'pl': round(to_float(pl), 6), 'cash': round(to_float(st.get('cash')), 4),
+        'asset': round(to_float(st.get('asset')), 4), 'profit_rate': round(to_float(st.get('profit_rate')), 6),
+        'reason': reason, 'r3': round(to_float(extra.get('r3')),4), 'r10': round(to_float(extra.get('r10')),4),
+        'volume_ratio': round(to_float(extra.get('volume_ratio')),4), 'turnover': round(to_float(extra.get('turnover')),2),
+        'score': round(to_float(extra.get('score')),4), 'target_cash': round(to_float(extra.get('target_cash')),2),
+        'filled_gross': round(to_float(extra.get('filled_gross')),2), 'fill_ratio': round(to_float(extra.get('fill_ratio')),4),
+        'slippage_pct': round(to_float(extra.get('slippage_pct')),4), 'orderbook_timestamp': extra.get('orderbook_timestamp',''),
+        'levels_used': int(to_float(extra.get('levels_used'))), 'mfe_pct': extra.get('mfe_pct',''), 'mae_pct': extra.get('mae_pct',''),
+        'hold_sec': extra.get('hold_sec',''), 'paper_only': True,
+    }
+    write_row(us_surge_trade_path(ai_id), headers, row)
+
+
+def _us_surge_rankings(session):
+    """US 랭킹에서 급등/거래대금 후보를 만든다. 이미 몇 % 올랐는지는 진입 상한으로 사용하지 않는다."""
+    merged = {}
+    for ranking_type in ('MARKET_TRADING_AMOUNT','MARKET_TRADING_VOLUME','TOP_GAINERS'):
+        duration = '1d' if ranking_type == 'TOP_GAINERS' else 'realtime'
+        params = {'type': ranking_type, 'marketCountry': 'US', 'duration': duration,
+                  'excludeInvestmentCaution': True, 'count': US_SURGE_RANKING_COUNT}
+        code, data = api_get('/api/v1/rankings', params=params, timeout=15)
+        if code != 200:
+            continue
+        _, rankings = _ranking_result(data)
+        for item in rankings:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get('symbol') or '').strip().upper()
+            if not sym:
+                continue
+            px = _ranking_last_price(item)
+            if px < US_SURGE_MIN_PRICE_USD:
+                continue
+            row = merged.setdefault(sym, {'symbol':sym,'price':px,'turnover':0.0,'volume':0.0,'change_pct':0.0,'ranks':[]})
+            row['price'] = px or row['price']
+            row['turnover'] = max(to_float(row.get('turnover')), to_float(item.get('tradingAmount')))
+            row['volume'] = max(to_float(row.get('volume')), to_float(item.get('tradingVolume')))
+            row['change_pct'] = _ranking_change_pct(item)
+            row['ranks'].append(int(to_float(item.get('rank'),9999)))
+    min_turn = US_SURGE_MIN_TURNOVER_USD_PRE if session == 'PREMARKET' else US_SURGE_MIN_TURNOVER_USD_REG
+    rows = [r for r in merged.values() if to_float(r.get('turnover')) >= min_turn]
+    rows.sort(key=lambda r: (min(r.get('ranks') or [9999]), -to_float(r.get('turnover'))))
+    return rows[:US_SURGE_ANALYZE_TOP_N]
+
+
+def _us_surge_fetch_snapshot(sym):
+    """후보 1종목의 확정 1분봉 + 실시간 호가를 즉시 가져온다."""
+    code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval':'1m','count':30,'adjusted':True}, timeout=10)
+    candles=[]
+    if code == 200:
+        raw = _result_dict(data).get('candles', [])
+        for c in reversed(raw if isinstance(raw,list) else []):
+            ts=str(c.get('timestamp','')); dt=parse_api_datetime(ts); close=to_float(c.get('closePrice'))
+            if dt and close>0 and dt < now_kst().replace(second=0,microsecond=0):
+                candles.append({'dt':dt,'close':close,'high':to_float(c.get('highPrice',close)),'low':to_float(c.get('lowPrice',close)),'volume':to_float(c.get('volume',0))})
+    code2, data2 = api_get('/api/v1/orderbook', params={'symbol':sym}, timeout=8)
+    ob={}
+    if code2 == 200:
+        result=_result_dict(data2); asks=result.get('asks',[]) if isinstance(result.get('asks',[]),list) else []; bids=result.get('bids',[]) if isinstance(result.get('bids',[]),list) else []
+        ob={'timestamp':str(result.get('timestamp','')),'asks':asks,'bids':bids,'best_ask':to_float(asks[0].get('price')) if asks else 0.0,'best_bid':to_float(bids[0].get('price')) if bids else 0.0}
+        S.setdefault('us_surge_scan',{}).setdefault('latest_orderbook',{})[sym]=ob
+    return candles, ob
+
+
+def _us_surge_features(sym, session, meta=None):
+    candles, ob = _us_surge_fetch_snapshot(sym)
+    if len(candles) < 11:
+        return {'ok':False,'block':'INSUFFICIENT_CANDLES','symbol':sym,'session':session}
+    closes=[x['close'] for x in candles]
+    vols=[x['volume'] for x in candles]
+    price=closes[-1]
+    r3=pct(price, closes[-4]); r10=pct(price, closes[-11])
+    recent_base = vols[-11:-1]
+    avg_vol=sum(recent_base)/max(1,len(recent_base)); vr=vols[-1]/avg_vol if avg_vol>0 else 0.0
+    recent_high=max(x['high'] for x in candles[-10:]); pullback=pct(price,recent_high)
+    if session=='PREMARKET':
+        min_r10,max_r3,min_vr=US_SURGE_PRE_MIN_R10_PCT,US_SURGE_PRE_MAX_R3_PCT,US_SURGE_PRE_MIN_VOL_RATIO
+    else:
+        min_r10,max_r3,min_vr=US_SURGE_REG_MIN_R10_PCT,US_SURGE_REG_MAX_R3_PCT,US_SURGE_REG_MIN_VOL_RATIO
+    # 당일 상승률 자체는 제한하지 않는다. 지속 강도, 단기 과열 완화, 거래량 유지로 재가속 후보만 고른다.
+    ok = r10 >= min_r10 and r3 <= max_r3 and vr >= min_vr and pullback >= -3.0 and bool(ob.get('asks')) and bool(ob.get('bids'))
+    score = max(0.0, r10*8.0 + min(vr,5.0)*10.0 - max(0.0,r3-max_r3)*12.0 + max(-3.0,pullback)*2.0)
+    return {'ok':ok,'block':'ENTRY_OK' if ok else 'FILTER','symbol':sym,'candidate':sym,'session':session,'price':price,'r3':r3,'r10':r10,'volume_ratio':vr,'pullback_pct':pullback,'score':score,'turnover':to_float((meta or {}).get('turnover')),'day_change_pct':to_float((meta or {}).get('change_pct')),'orderbook':ob}
+
+
+def _us_surge_fill(sym, side, max_cash=0.0, qty=0, max_slip=0.35):
+    ob=S.setdefault('us_surge_scan',{}).setdefault('latest_orderbook',{}).get(sym,{})
+    levels=ob.get('asks' if side=='BUY' else 'bids',[]) if isinstance(ob,dict) else []
+    valid=[]
+    for x in (levels[:US_SURGE_MAX_LEVELS] if isinstance(levels,list) else []):
+        if isinstance(x,dict):
+            px=to_float(x.get('price')); av=int(to_float(x.get('volume'))*US_SURGE_DEPTH_USAGE_RATIO)
+            if px>0 and av>0: valid.append((px,av))
+    if not valid:
+        return {'ok':False,'reason':'ORDERBOOK_EMPTY','qty':0,'avg_price':0.0,'gross':0.0,'fill_ratio':0.0,'slippage_pct':0.0,'levels_used':0,'orderbook_timestamp':ob.get('timestamp','') if isinstance(ob,dict) else ''}
+    best=valid[0][0]; target_qty=int(max_cash//best) if side=='BUY' else int(qty)
+    remain_qty=target_qty; remain_cash=float(max_cash); filled=0; gross=0.0; used=0
+    for px,av in valid:
+        impact=((px/best)-1)*100 if side=='BUY' else ((best/px)-1)*100
+        if impact>max_slip: break
+        can=min(av,remain_qty, int(remain_cash//px) if side=='BUY' else remain_qty)
+        if can<=0: continue
+        filled+=can; gross+=can*px; remain_qty-=can; used+=1
+        if side=='BUY': remain_cash-=can*px
+        if remain_qty<=0: break
+    avg=gross/filled if filled else 0.0
+    slip=((avg/best)-1)*100 if side=='BUY' and avg else (((best/avg)-1)*100 if avg else 0.0)
+    ratio=filled/max(1,target_qty)
+    return {'ok':filled>0,'reason':'OK' if filled>=target_qty else 'PARTIAL_LIQUIDITY','qty':filled,'target_qty':target_qty,'avg_price':avg,'gross':gross,'fill_ratio':ratio,'slippage_pct':slip,'levels_used':used,'best_price':best,'orderbook_timestamp':ob.get('timestamp','') if isinstance(ob,dict) else ''}
+
+
+def _us_surge_mark(sym):
+    candles,_=_us_surge_fetch_snapshot(sym)
+    return candles[-1]['close'] if candles else 0.0
+
+
+def _us_surge_update_asset(ai_id):
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]; cash=to_float(st.get('cash')); pos=dict(st.get('position') or {}); start=max(1.0,to_float(st.get('start_cash'),US_SURGE_START_CASH))
+    asset=cash
+    if pos:
+        mark=_us_surge_mark(pos.get('symbol','')) or to_float(pos.get('avg'))
+        asset += to_int(pos.get('qty'))*mark
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]; st['asset']=asset; st['profit_rate']=(asset/start-1)*100; st['peak_asset']=max(to_float(st.get('peak_asset'),start),asset); st['mdd_pct']=min(to_float(st.get('mdd_pct'),0.0), (asset/max(1e-9,st['peak_asset'])-1)*100)
+
+
+def _us_surge_buy(ai_id, f):
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]; cash=to_float(st.get('cash')); target=cash*US_SURGE_ENTRY_RATIO
+    fill=_us_surge_fill(f['symbol'],'BUY',max_cash=target,max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT)
+    if not fill.get('ok') or to_float(fill.get('fill_ratio')) < US_SURGE_MIN_FILL_RATIO:
+        _us_surge_log(ai_id,'BLOCK',f['symbol'],reason='LIQUIDITY_OR_SLIPPAGE',extra=dict(f,**fill,target_cash=target))
+        return False
+    qty=int(fill['qty']); px=to_float(fill['avg_price']); fee=to_float(fill['gross'])*US_SURGE_FEE_SIDE_PCT/100.0; cost=to_float(fill['gross'])+fee
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]
+        if cost>to_float(st.get('cash')) or st.get('position'): return False
+        st['cash']=to_float(st.get('cash'))-cost
+        st['position']={'symbol':f['symbol'],'qty':qty,'avg':px,'entry_fee':fee,'entry_time':now_text(),'entry_ts':time.time(),'peak_price':px,'trough_price':px,'protected':False,'entry_features':dict(f)}
+        st['trade_count']=to_int(st.get('trade_count'))+1; st['last_action']=f"{now_short()} PAPER BUY {f['symbol']} {qty}@{px:.4f}"
+    _us_surge_log(ai_id,'PAPER_ENTRY',f['symbol'],px,qty,fee,0.0,'ENTRY',dict(f,**fill,target_cash=target,filled_gross=fill.get('gross')))
+    return True
+
+
+def _us_surge_sell(ai_id, reason):
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]; pos=dict(st.get('position') or {})
+    if not pos: return False
+    sym=pos['symbol']; _us_surge_fetch_snapshot(sym)
+    fill=_us_surge_fill(sym,'SELL',qty=to_int(pos.get('qty')),max_slip=US_SURGE_MAX_SELL_SLIPPAGE_PCT)
+    if not fill.get('ok'): return False
+    qty=int(fill['qty']); px=to_float(fill['avg_price']); avg=to_float(pos.get('avg')); entry_fee=to_float(pos.get('entry_fee'))*(qty/max(1,to_int(pos.get('qty')))); exit_fee=to_float(fill['gross'])*US_SURGE_FEE_SIDE_PCT/100.0; pnl=qty*(px-avg)-entry_fee-exit_fee
+    mfe=pct(to_float(pos.get('peak_price',avg)),avg); mae=pct(to_float(pos.get('trough_price',avg)),avg); hold=max(0,int(time.time()-to_float(pos.get('entry_ts'),time.time())))
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]; st['cash']=to_float(st.get('cash'))+to_float(fill['gross'])-exit_fee; st['realized_pl']=to_float(st.get('realized_pl'))+pnl; st['last_exit_ts']=time.time(); st['last_action']=f'{now_short()} PAPER SELL {sym} {reason}'
+        old_qty=to_int(pos.get('qty'))
+        if qty>=old_qty: st['position']=None
+        else:
+            pos['qty']=old_qty-qty; pos['entry_fee']=max(0.0,to_float(pos.get('entry_fee'))-entry_fee); st['position']=pos
+        st['trades'].append({'time':now_text(),'symbol':sym,'qty':qty,'entry':avg,'exit':px,'pnl':pnl,'mfe_pct':mfe,'mae_pct':mae,'reason':reason})
+    _us_surge_update_asset(ai_id)
+    _us_surge_log(ai_id,'PAPER_SELL',sym,px,qty,exit_fee,pnl,reason,dict(pos.get('entry_features') or {},**fill,filled_gross=fill.get('gross'),mfe_pct=round(mfe,4),mae_pct=round(mae,4),hold_sec=hold))
+    return True
+
+
+def _us_surge_manage_position(ai_id):
+    with LOCK:
+        st=S['us_surge_paper'][ai_id]; pos=dict(st.get('position') or {})
+    if not pos: return False
+    price=_us_surge_mark(pos['symbol'])
+    if price<=0: return True
+    with LOCK:
+        p=S['us_surge_paper'][ai_id]['position']; p['peak_price']=max(to_float(p.get('peak_price',price)),price); p['trough_price']=min(to_float(p.get('trough_price',price)),price); avg=to_float(p.get('avg')); peak=to_float(p.get('peak_price')); protected=bool(p.get('protected'))
+        profit=pct(price,avg)
+        if profit>=US_SURGE_PROTECT_START_PCT: p['protected']=True; protected=True
+    draw=pct(price,peak)
+    if profit<=US_SURGE_HARD_SL_PCT:
+        _us_surge_sell(ai_id,f'HARD_SL {profit:.2f}%')
+    elif protected and profit<=US_SURGE_PROTECT_FLOOR_PCT:
+        _us_surge_sell(ai_id,f'PROFIT_PROTECT {profit:.2f}%')
+    elif profit>=US_SURGE_TRAIL_START_PCT and draw<=-US_SURGE_TRAIL_DRAW_PCT:
+        _us_surge_sell(ai_id,f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
+    return True
+
+
+def run_us_surge_paper():
+    """미국 급등 PAPER: PREMARKET과 REGULAR을 서로 다른 계좌/필터로 독립 운영한다.
+    DAY MARKET/AFTER HOURS는 신규진입 금지. 기존 U01~U04와 자금/로그 완전 분리.
+    """
+    ensure_us_surge_states()
+    if not US_SURGE_PAPER_ENABLED: return
+    session=us_market_session_status()[0]
+    trade_date=us_trade_date_from_calendar()
+    # 포지션은 세션이 바뀌어도 관리하지만 신규진입은 PRE/REGULAR에서만 한다.
+    for ai_id in US_SURGE_PAPER_IDS:
+        with LOCK:
+            st=S['us_surge_paper'][ai_id]
+            if st.get('trade_date')!=trade_date:
+                st['trade_date']=trade_date; st['trade_count']=0
+        _us_surge_manage_position(ai_id)
+        _us_surge_update_asset(ai_id)
+    if session not in {'PREMARKET','REGULAR'}: return
+    scan=S.setdefault('us_surge_scan',{})
+    if time.time()-to_float(scan.get('last_scan_ts')) < US_SURGE_SCAN_SEC and scan.get('session')==session:
+        ranked=list(scan.get('ranked') or [])
+    else:
+        ranked=[]
+        for meta in _us_surge_rankings(session):
+            f=_us_surge_features(meta['symbol'],session,meta)
+            row=dict(meta); row.update(f); ranked.append(row)
+            write_row(us_surge_scan_path(), ['time','session','symbol','price','day_change_pct','turnover','r3','r10','volume_ratio','pullback_pct','score','eligible'], {'time':now_text(),'session':session,'symbol':meta['symbol'],'price':f.get('price',0),'day_change_pct':meta.get('change_pct',0),'turnover':meta.get('turnover',0),'r3':f.get('r3',0),'r10':f.get('r10',0),'volume_ratio':f.get('volume_ratio',0),'pullback_pct':f.get('pullback_pct',0),'score':f.get('score',0),'eligible':bool(f.get('ok'))})
+        ranked.sort(key=lambda x: (bool(x.get('ok')),to_float(x.get('score'))),reverse=True)
+        scan['last_scan_ts']=time.time(); scan['session']=session; scan['ranked']=ranked
+    eligible=[x for x in ranked if x.get('ok')]
+    if not eligible: return
+    candidate=eligible[0]
+    for ai_id in US_SURGE_PAPER_IDS:
+        if US_SURGE_SESSION_BY_ID.get(ai_id)!=session: continue
+        with LOCK:
+            st=S['us_surge_paper'][ai_id]; pos=bool(st.get('position')); trades=to_int(st.get('trade_count')); last_exit=to_float(st.get('last_exit_ts'))
+        if pos or trades>=US_SURGE_MAX_TRADES_BY_ID[ai_id] or time.time()-last_exit<US_SURGE_REENTRY_COOLDOWN_SEC: continue
+        _us_surge_buy(ai_id,candidate)
+    for ai_id in US_SURGE_PAPER_IDS:
+        try:
+            _us_surge_update_asset(ai_id); _atomic_json_write(us_surge_state_path(ai_id), S['us_surge_paper'][ai_id])
+        except Exception as e:
+            set_error(f'{ai_id} state 저장 실패: {e}')
+
 def run_us_semi_paper():
     """U01/U02 분봉 역추세 + U03 20/80 급락스윙 + U04 시장레짐 적응형 PAPER."""
     ensure_us_semi_paper_states()
+    # V5.24: 미국 급등형은 기존 SOXL/SOXS 연구와 독립 실행한다.
+    run_us_surge_paper()
     if not US_SEMI_PAPER_ENABLED:
         return
     # U03/U04는 분봉 역추세와 분리해 각자의 스윙/레짐 규칙으로 처리한다.
@@ -7696,9 +8230,10 @@ def _multi_ai_update_for_summary(ai_id):
 
 
 def paper_summary_snapshot():
-    """KR 92 + US 4 PAPER 계좌를 한 번에 시가평가/집계한다."""
+    """KR 93 + US 기존4 + US 급등4 PAPER 계좌를 한 번에 시가평가/집계한다."""
     ensure_multi_ai_states()
     ensure_us_semi_paper_states()
+    ensure_us_surge_states()
 
     for ai_id in MULTI_AI_IDS:
         try:
@@ -7709,6 +8244,11 @@ def paper_summary_snapshot():
     for ai_id in US_SEMI_PAPER_IDS:
         try:
             update_us_semi_paper_asset(ai_id, save=False)
+        except Exception as e:
+            set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
+    for ai_id in US_SURGE_PAPER_IDS:
+        try:
+            _us_surge_update_asset(ai_id)
         except Exception as e:
             set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
 
@@ -7743,6 +8283,28 @@ def paper_summary_snapshot():
                 'market': 'US',
                 'name': st.get('name', ai_id),
                 'start_cash': int(to_float(st.get('start_cash', US_SEMI_START_CASH))),
+                'cash': round(to_float(st.get('cash', 0)), 4),
+                'asset': round(to_float(st.get('asset', 0)), 4),
+                'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
+                'realized_pl': round(to_float(st.get('realized_pl', 0)), 4),
+                'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6),
+                'trade_count': to_int(st.get('trade_count', 0)),
+                'closed_trade_count': len(st.get('trades', [])) if isinstance(st.get('trades', []), list) else 0,
+                'positions': {} if not pos else {str(pos.get('symbol', 'POSITION')): pos},
+                'position_count': 0 if not pos else 1,
+                'last_action': st.get('last_action', ''),
+                'paper_only': True,
+            })
+
+        for ai_id in US_SURGE_PAPER_IDS:
+            st = S['us_surge_paper'][ai_id]
+            pos = json.loads(json.dumps(st.get('position')))
+            accounts.append({
+                'id': ai_id,
+                'market': 'US',
+                'us_session': US_SURGE_SESSION_BY_ID.get(ai_id, ''),
+                'name': st.get('name', ai_id),
+                'start_cash': int(to_float(st.get('start_cash', US_SURGE_START_CASH))),
                 'cash': round(to_float(st.get('cash', 0)), 4),
                 'asset': round(to_float(st.get('asset', 0)), 4),
                 'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
@@ -7813,7 +8375,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -7862,7 +8424,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS)}계좌 (KR {len(MULTI_AI_IDS)} + US {len(US_SEMI_PAPER_IDS)})</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)}계좌 (KR {len(MULTI_AI_IDS)} + US {len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)})</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
@@ -8016,7 +8578,7 @@ def acquire_single_instance_lock():
 def print_core_selfcheck():
     print('[CORE DATA/PAPER/BACKUP FROZEN]', flush=True)
     print('version=', OPERATING_VERSION, flush=True)
-    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS), '(KR=', len(MULTI_AI_IDS), 'US=', len(US_SEMI_PAPER_IDS), ')', flush=True)
+    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), '(KR=', len(MULTI_AI_IDS), 'US=', len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), ')', flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
     print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
     print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
@@ -8054,12 +8616,14 @@ def print_core_selfcheck():
         raise RuntimeError(f'KR 종목 수 오류: {len(ALL26_SYMBOLS)}')
     if len(US_SYMBOLS) != 14:
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
-    if len(MULTI_AI_IDS) != 92:
+    if len(MULTI_AI_IDS) != 93:
         raise RuntimeError(f'KR 가상계좌 수 오류: {len(MULTI_AI_IDS)}')
     if len(US_SEMI_PAPER_IDS) != 4:
         raise RuntimeError(f'US U계열 가상계좌 수 오류: {len(US_SEMI_PAPER_IDS)}')
-    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) != 96:
-        raise RuntimeError(f'전체 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS)}')
+    if len(US_SURGE_PAPER_IDS) != 4:
+        raise RuntimeError(f'US 급등 가상계좌 수 오류: {len(US_SURGE_PAPER_IDS)}')
+    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) != 101:
+        raise RuntimeError(f'전체 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)}')
 if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
