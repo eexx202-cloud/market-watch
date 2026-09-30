@@ -1,4 +1,5 @@
 # OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
+# V5.25: KR/US 실전 재현용 REPLAY DATA 강화. 전략 파라미터는 V5.24 그대로 유지하고 데이터 수집/재현성만 보강.
 # V5.22: 한국 급등 V1 고정검증 + 실시간 호가 기반 동적 PAPER 체결/부분익절/수익보호/호가스냅샷. 실주문 OFF.
 # V5.21: V5.20 기반 - U03 SOXL -5% 장중20%/종가80% 분할스윙 + U04 시장레짐(BULL/PANIC/BEAR/CHOP) 적응형 PAPER.
 # V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
@@ -28,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_24_KR_US_MARKET_SPLIT_FINAL_PAPER'
+OPERATING_VERSION = 'OPERATING_V5_25_KR_US_REPLAY_DATA_FINAL_PAPER'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_4_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -160,6 +161,21 @@ US_SURGE_MAX_SELL_SLIPPAGE_PCT = max(0.01, float(os.environ.get('US_SURGE_MAX_SE
 US_SURGE_DEPTH_USAGE_RATIO = max(0.05, min(1.0, float(os.environ.get('US_SURGE_DEPTH_USAGE_RATIO', '0.25'))))
 US_SURGE_MIN_FILL_RATIO = max(0.10, min(1.0, float(os.environ.get('US_SURGE_MIN_FILL_RATIO', '0.50'))))
 US_SURGE_MAX_LEVELS = max(1, min(20, int(os.environ.get('US_SURGE_MAX_LEVELS', '10'))))
+# V5.25 REPLAY DATA: 매매전략은 변경하지 않고, 당시 데이터/판단/체결 가능성을 재현하기 위한 수집 규격만 추가한다.
+US_REPLAY_DATA_ENABLED = os.environ.get('US_REPLAY_DATA_ENABLED', 'true').lower() == 'true'
+US_REPLAY_WS_ENABLED = os.environ.get('US_REPLAY_WS_ENABLED', 'true').lower() == 'true'
+US_REPLAY_CANDIDATE_BACKFILL_MIN = max(20, min(120, int(os.environ.get('US_REPLAY_CANDIDATE_BACKFILL_MIN', '30'))))
+US_REPLAY_DYNAMIC_MAX_SYMBOLS = max(10, min(50, int(os.environ.get('US_REPLAY_DYNAMIC_MAX_SYMBOLS', '35'))))
+US_REPLAY_DYNAMIC_ORDERFLOW_SEC = max(5, int(os.environ.get('US_REPLAY_DYNAMIC_ORDERFLOW_SEC', '15')))
+US_REPLAY_DYNAMIC_CANDLE_SEC = max(30, int(os.environ.get('US_REPLAY_DYNAMIC_CANDLE_SEC', '60')))
+US_REPLAY_CAPITAL_TIERS_KRW = tuple(int(x) for x in os.environ.get(
+    'US_REPLAY_CAPITAL_TIERS_KRW',
+    '10000000,50000000,100000000,300000000,1000000000,3000000000,8000000000'
+).split(',') if str(x).strip().isdigit())
+US_REPLAY_WS_URL = os.environ.get('US_REPLAY_WS_URL', 'wss://openapi-ws.tossinvest.com/ws/v1').strip()
+US_REPLAY_WS_PING_SEC = max(30, int(os.environ.get('US_REPLAY_WS_PING_SEC', '60')))
+US_REPLAY_WS_MAX_SYMBOLS = max(1, min(50, int(os.environ.get('US_REPLAY_WS_MAX_SYMBOLS', '45'))))  # trade+orderbook=2 subscriptions/symbol <= 100
+US_REPLAY_WS_THREAD = None
 # U03: 2025/2026 공통 연구 규칙. 전년도 일봉을 이어서 지표를 계산하고, 종가 확정 후 PAPER 체결한다.
 US_REGIME_ENTRY_RATIO = max(0.10, min(1.0, float(os.environ.get('US_REGIME_ENTRY_RATIO', '1.0'))))
 US_REGIME_SOXL_DROP_PCT = -abs(float(os.environ.get('US_REGIME_SOXL_DROP_PCT', '5.0')))
@@ -388,7 +404,7 @@ US_CYCLE_GAP_MINUTES = max(0, int(os.environ.get('US_CYCLE_GAP_MINUTES', '10')))
 TOSS_OPENAPI_SPEC_VERSION = 'LATEST_DOCS_2026-09-15'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
 TOSS_OPENAPI_ASYNCAPI_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json'  # 공식 WebSocket source of truth
-TOSS_MARKET_DATA_TRANSPORT = 'REST_POLLING_WS_AVAILABLE'  # 현재 구현은 REST 폴링. Toss 공식 API는 실시간 체결/호가 WebSocket도 지원.
+TOSS_MARKET_DATA_TRANSPORT = 'REST_BASE_PLUS_OPTIONAL_WS_REPLAY'  # V5.25: 기존 REST 유지 + 후보종목 WS 원본녹화(가능 시), 실패 시 REST fallback.
 MARKET_MODE = 'KR_US_PAPER_ONLY'
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_START_MIN', '2')))
 KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_END_MIN', '15')))
@@ -875,6 +891,367 @@ def us_data_path(kind, sym=''):
     suffix = f'_{sym}' if sym else ''
     return os.path.join(us_market_data_dir(), f'{kind}{suffix}_{d}.csv')
 
+def us_replay_dir():
+    path = os.path.join(us_day_dir(), 'replay')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def us_replay_path(kind):
+    return os.path.join(us_replay_dir(), f'{kind}_{us_trade_date_from_calendar()}.csv')
+
+def us_replay_ws_path():
+    return os.path.join(us_replay_dir(), f'ws_raw_{us_trade_date_from_calendar()}.jsonl')
+
+def _us_replay_state():
+    st = S.setdefault('us_replay', {})
+    st.setdefault('dynamic_watch', {})
+    st.setdefault('outcomes', {})
+    st.setdefault('fx', {})
+    st.setdefault('ws', {'status':'NOT_STARTED','last_message_at':'','last_error':'','subscribed':[]})
+    st.setdefault('last_dynamic_candle_ts', 0.0)
+    st.setdefault('last_dynamic_orderflow_ts', 0.0)
+    st.setdefault('last_seen_epoch', 0.0)
+    st.setdefault('trade_date', '')
+    return st
+
+def _us_replay_fx_usdkrw(force=False):
+    """USD 1달러당 KRW 표시환율. PAPER 자금(원화)을 미국주식 주문금액(달러)으로 변환할 때 사용한다."""
+    st = _us_replay_state()
+    fx = st.setdefault('fx', {})
+    if (not force and to_float(fx.get('rate')) > 0 and
+            time.time() - to_float(fx.get('checked_epoch')) < 55):
+        return to_float(fx.get('rate'))
+    code, data = api_get('/api/v1/exchange-rate',
+                         params={'baseCurrency':'USD','quoteCurrency':'KRW'}, timeout=8)
+    result = _result_dict(data) if code == 200 else {}
+    rate = to_float(result.get('rate'))
+    if rate > 0:
+        fx.update({'rate':rate, 'checked_epoch':time.time(),
+                   'valid_from':result.get('validFrom',''), 'valid_until':result.get('validUntil','')})
+        write_row_unique(
+            us_replay_path('fx'),
+            ['saved_at','base_currency','quote_currency','rate','valid_from','valid_until'],
+            {'saved_at':now_text(),'base_currency':'USD','quote_currency':'KRW','rate':rate,
+             'valid_from':result.get('validFrom',''),'valid_until':result.get('validUntil','')},
+            ['valid_from','rate']
+        )
+    return rate
+
+def _us_replay_reset_if_new_day():
+    st = _us_replay_state()
+    d = us_trade_date_from_calendar()
+    if st.get('trade_date') != d:
+        st['trade_date'] = d
+        st['dynamic_watch'] = {}
+        st['outcomes'] = {}
+        st['last_dynamic_candle_ts'] = 0.0
+        st['last_dynamic_orderflow_ts'] = 0.0
+        st['last_seen_epoch'] = time.time()
+
+def _us_replay_event_id(sym, session, event_time=None):
+    event_time = event_time or now_kst().isoformat()
+    raw = f'{us_trade_date_from_calendar()}|{session}|{sym}|{event_time}'
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]
+
+def _us_replay_register_candidate(f, meta=None):
+    """후보 발견 즉시 동적 추적 대상 등록. 후보는 해당 미국 거래일 끝까지 유지한다."""
+    if not US_REPLAY_DATA_ENABLED:
+        return ''
+    _us_replay_reset_if_new_day()
+    st = _us_replay_state()
+    sym = str(f.get('symbol') or f.get('candidate') or '').upper().strip()
+    if not sym:
+        return ''
+    session = str(f.get('session') or '')
+    event_time = now_kst().isoformat()
+    event_id = _us_replay_event_id(sym, session, event_time)
+    watch = st.setdefault('dynamic_watch', {})
+    if sym not in watch and len(watch) >= US_REPLAY_DYNAMIC_MAX_SYMBOLS:
+        # 가장 오래된 비보유 후보부터 밀어내되, 계좌 보유종목은 절대 제거하지 않는다.
+        held = {str((x.get('position') or {}).get('symbol','')).upper()
+                for x in S.get('us_surge_paper', {}).values() if isinstance(x, dict)}
+        removable = sorted(
+            ((k, to_float(v.get('first_seen_epoch'))) for k,v in watch.items()
+             if k not in held and isinstance(v, dict)),
+            key=lambda x: x[1]
+        )
+        if removable:
+            watch.pop(removable[0][0], None)
+    rec = watch.setdefault(sym, {
+        'symbol':sym, 'first_seen':event_time, 'first_seen_epoch':time.time(),
+        'session':session, 'event_ids':[]
+    })
+    rec['last_seen'] = event_time
+    rec['session'] = session
+    rec.setdefault('event_ids', []).append(event_id)
+    rec['event_ids'] = rec['event_ids'][-50:]
+    out = st.setdefault('outcomes', {}).setdefault(event_id, {
+        'event_id':event_id,'symbol':sym,'session':session,'signal_time':event_time,
+        'signal_price':to_float(f.get('price')),'max_price':to_float(f.get('price')),
+        'min_price':to_float(f.get('price')),'mfe_pct':0.0,'mae_pct':0.0,'last_price':to_float(f.get('price')),
+        'last_update':''
+    })
+    # 당시 판단 데이터와 사후 outcome은 파일을 분리한다.
+    row = {
+        'event_id':event_id,'saved_at':now_text(),'signal_time':event_time,'session':session,'symbol':sym,
+        'price':to_float(f.get('price')),'day_change_pct':to_float(f.get('day_change_pct')),
+        'turnover':to_float(f.get('turnover')),'r3':to_float(f.get('r3')),'r10':to_float(f.get('r10')),
+        'volume_ratio':to_float(f.get('volume_ratio')),'pullback_pct':to_float(f.get('pullback_pct')),
+        'score':to_float(f.get('score')),'eligible':bool(f.get('ok')),'decision':'ENTRY_OK' if f.get('ok') else 'REJECT',
+        'reject_reason':str(f.get('block','')) if not f.get('ok') else '',
+        'ranking_price':to_float((meta or {}).get('price')),'ranking_change_pct':to_float((meta or {}).get('change_pct')),
+        'ranking_turnover':to_float((meta or {}).get('turnover'))
+    }
+    write_row(
+        us_replay_path('signals'),
+        ['event_id','saved_at','signal_time','session','symbol','price','day_change_pct','turnover',
+         'r3','r10','volume_ratio','pullback_pct','score','eligible','decision','reject_reason',
+         'ranking_price','ranking_change_pct','ranking_turnover'],
+        row
+    )
+    return event_id
+
+def _us_replay_save_backfill(sym, count=None):
+    """후보 등록 시 확정된 과거 1분봉만 append-only 저장한다."""
+    count = max(20, min(200, int(count or US_REPLAY_CANDIDATE_BACKFILL_MIN)))
+    req = now_kst(); t0 = time.time()
+    code, data = api_get('/api/v1/candles', params={'symbol':sym,'interval':'1m','count':count,'adjusted':True}, timeout=10)
+    rec = now_kst(); latency = round((time.time()-t0)*1000,3)
+    if code != 200:
+        return False
+    rows = _result_dict(data).get('candles', [])
+    headers = ['requested_at','received_at','saved_at','latency_ms','symbol','timestamp','open','high','low','close','volume','estimated_trade_value','currency']
+    ok = False
+    for c in reversed(rows if isinstance(rows,list) else []):
+        ts = str(c.get('timestamp',''))
+        dt = parse_api_datetime(ts)
+        if not dt or dt >= now_kst().replace(second=0,microsecond=0):
+            continue
+        close = to_float(c.get('closePrice'))
+        row = {'requested_at':req.isoformat(),'received_at':rec.isoformat(),'saved_at':now_text(),'latency_ms':latency,
+               'symbol':sym,'timestamp':ts,'open':c.get('openPrice',0),'high':c.get('highPrice',0),
+               'low':c.get('lowPrice',0),'close':c.get('closePrice',0),'volume':c.get('volume',0),
+               'estimated_trade_value':round(close*to_float(c.get('volume')),4),'currency':c.get('currency','USD'),
+               'source':'CANDIDATE_BACKFILL'}
+        ok = write_row_unique(us_data_path('candles_1m',sym), headers, row, ['symbol','timestamp']) or ok
+    return ok
+
+def _us_replay_capacity(event_id, f):
+    """같은 당시 호가를 여러 자금단계에 적용. 주문 희망액이 아니라 실제 체결가능액을 기록한다."""
+    if not US_REPLAY_DATA_ENABLED or not event_id:
+        return
+    fx = _us_replay_fx_usdkrw(False)
+    if fx <= 0:
+        write_row(us_replay_path('capacity'),
+                  ['saved_at','event_id','symbol','capital_krw','target_krw','fx_usdkrw','target_usd','fill_qty',
+                   'filled_usd','filled_krw','fill_ratio','avg_price','slippage_pct','levels_used','reason'],
+                  {'saved_at':now_text(),'event_id':event_id,'symbol':f.get('symbol',''),'capital_krw':'',
+                   'target_krw':'','fx_usdkrw':'','target_usd':'','fill_qty':0,'filled_usd':0,'filled_krw':0,
+                   'fill_ratio':0,'avg_price':0,'slippage_pct':0,'levels_used':0,'reason':'FX_UNAVAILABLE'})
+        return
+    headers = ['saved_at','event_id','symbol','capital_krw','target_krw','fx_usdkrw','target_usd','fill_qty',
+               'filled_usd','filled_krw','fill_ratio','avg_price','slippage_pct','levels_used','reason']
+    for capital in US_REPLAY_CAPITAL_TIERS_KRW:
+        target_krw = float(capital) * US_SURGE_ENTRY_RATIO
+        target_usd = target_krw / fx
+        fill = _us_surge_fill(str(f.get('symbol','')),'BUY',max_cash=target_usd,max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT)
+        write_row(us_replay_path('capacity'), headers, {
+            'saved_at':now_text(),'event_id':event_id,'symbol':f.get('symbol',''),'capital_krw':capital,
+            'target_krw':round(target_krw,2),'fx_usdkrw':round(fx,6),'target_usd':round(target_usd,6),
+            'fill_qty':int(to_float(fill.get('qty'))),'filled_usd':round(to_float(fill.get('gross')),6),
+            'filled_krw':round(to_float(fill.get('gross'))*fx,2),'fill_ratio':round(to_float(fill.get('fill_ratio')),6),
+            'avg_price':round(to_float(fill.get('avg_price')),6),'slippage_pct':round(to_float(fill.get('slippage_pct')),6),
+            'levels_used':int(to_float(fill.get('levels_used'))),'reason':fill.get('reason','')
+        })
+
+def _us_replay_update_outcomes(prices_by_symbol=None):
+    if not US_REPLAY_DATA_ENABLED:
+        return
+    st = _us_replay_state()
+    prices_by_symbol = prices_by_symbol or {}
+    headers = ['saved_at','event_id','symbol','session','signal_time','signal_price','last_price',
+               'max_price','min_price','mfe_pct','mae_pct','elapsed_sec']
+    for event_id, o in list(st.setdefault('outcomes', {}).items()):
+        if not isinstance(o, dict):
+            continue
+        sym = str(o.get('symbol',''))
+        px = to_float(prices_by_symbol.get(sym))
+        if px <= 0:
+            continue
+        sig = to_float(o.get('signal_price'))
+        if sig <= 0:
+            continue
+        o['last_price'] = px
+        o['max_price'] = max(to_float(o.get('max_price'),sig), px)
+        o['min_price'] = min(to_float(o.get('min_price'),sig) or sig, px)
+        o['mfe_pct'] = pct(o['max_price'], sig)
+        o['mae_pct'] = pct(o['min_price'], sig)
+        o['last_update'] = now_text()
+        sdt = parse_api_datetime(o.get('signal_time'))
+        elapsed = int((now_kst()-sdt).total_seconds()) if sdt else ''
+        write_row(us_replay_path('outcomes'), headers, {
+            'saved_at':now_text(),'event_id':event_id,'symbol':sym,'session':o.get('session',''),
+            'signal_time':o.get('signal_time',''),'signal_price':sig,'last_price':px,
+            'max_price':o['max_price'],'min_price':o['min_price'],
+            'mfe_pct':round(o['mfe_pct'],6),'mae_pct':round(o['mae_pct'],6),'elapsed_sec':elapsed
+        })
+
+def _us_replay_dynamic_capture():
+    """후보/보유종목만 고빈도 REST 보강. 전체 미국시장에 고빈도 REST를 걸지 않아 429와 용량을 억제한다."""
+    if not US_REPLAY_DATA_ENABLED:
+        return
+    _us_replay_reset_if_new_day()
+    st = _us_replay_state()
+    watch = st.setdefault('dynamic_watch', {})
+    held = {str((x.get('position') or {}).get('symbol','')).upper()
+            for x in S.get('us_surge_paper', {}).values() if isinstance(x, dict) and x.get('position')}
+    symbols = list(dict.fromkeys([s for s in watch.keys() if s] + [s for s in held if s]))[:US_REPLAY_DYNAMIC_MAX_SYMBOLS]
+    if not symbols:
+        return
+    now_ts = time.time()
+    # 현재가: 후보 outcome을 미래참조 없이 시간순으로 누적.
+    code, data = api_get('/api/v1/prices', params={'symbols':','.join(symbols)}, timeout=10)
+    pxmap = {}
+    if code == 200:
+        for item in (data.get('result',[]) if isinstance(data,dict) else []):
+            if isinstance(item,dict):
+                sym = str(item.get('symbol','')).upper()
+                pxmap[sym] = to_float(item.get('lastPrice'))
+    _us_replay_update_outcomes(pxmap)
+    # 1분봉 연속 저장
+    if now_ts - to_float(st.get('last_dynamic_candle_ts')) >= US_REPLAY_DYNAMIC_CANDLE_SEC:
+        for sym in symbols:
+            _us_replay_save_backfill(sym, max(20, US_REPLAY_CANDIDATE_BACKFILL_MIN))
+            _market_data_request_gap()
+        st['last_dynamic_candle_ts'] = now_ts
+    # 호가/체결 연속 저장
+    if now_ts - to_float(st.get('last_dynamic_orderflow_ts')) >= US_REPLAY_DYNAMIC_ORDERFLOW_SEC:
+        ob_headers = ['requested_at','received_at','saved_at','latency_ms','symbol','api_timestamp','best_ask','best_bid','spread','ask_total_volume','bid_total_volume','asks_json','bids_json']
+        tr_headers = ['requested_at','received_at','saved_at','latency_ms','symbol','timestamp','price','volume','trade_value','currency']
+        for sym in symbols:
+            req=now_kst(); t0=time.time()
+            c,d=api_get('/api/v1/orderbook',params={'symbol':sym},timeout=8)
+            rec=now_kst(); lat=round((time.time()-t0)*1000,3)
+            if c==200:
+                r=_result_dict(d); asks=r.get('asks',[]) if isinstance(r.get('asks',[]),list) else []; bids=r.get('bids',[]) if isinstance(r.get('bids',[]),list) else []
+                ts=str(r.get('timestamp',''))
+                if ts:
+                    write_row_unique(us_data_path('orderbook',sym),ob_headers,{
+                        'requested_at':req.isoformat(),'received_at':rec.isoformat(),'saved_at':now_text(),'latency_ms':lat,'symbol':sym,'api_timestamp':ts,
+                        'best_ask':asks[0].get('price',0) if asks else 0,'best_bid':bids[0].get('price',0) if bids else 0,
+                        'spread':to_float(asks[0].get('price',0))-to_float(bids[0].get('price',0)) if asks and bids else 0,
+                        'ask_total_volume':sum(to_float(x.get('volume')) for x in asks if isinstance(x,dict)),
+                        'bid_total_volume':sum(to_float(x.get('volume')) for x in bids if isinstance(x,dict)),
+                        'asks_json':json.dumps(asks,separators=(',',':')),'bids_json':json.dumps(bids,separators=(',',':'))
+                    },['symbol','api_timestamp'])
+                    S.setdefault('us_surge_scan',{}).setdefault('latest_orderbook',{})[sym]={'timestamp':ts,'asks':asks,'bids':bids,'best_ask':to_float(asks[0].get('price')) if asks else 0,'best_bid':to_float(bids[0].get('price')) if bids else 0}
+            _market_data_request_gap()
+            req=now_kst(); t0=time.time()
+            c,d=api_get('/api/v1/trades',params={'symbol':sym,'count':50},timeout=8)
+            rec=now_kst(); lat=round((time.time()-t0)*1000,3)
+            if c==200:
+                rows=d.get('result',[]) if isinstance(d,dict) else []
+                ordered=[]
+                for t in rows if isinstance(rows,list) else []:
+                    if isinstance(t,dict) and t.get('timestamp'):
+                        dt=parse_api_datetime(t.get('timestamp'))
+                        if dt: ordered.append((dt,t))
+                for _,t in sorted(ordered,key=lambda x:x[0]):
+                    p=to_float(t.get('price')); v=to_float(t.get('volume'))
+                    write_row_unique(us_data_path('trades',sym),tr_headers,{
+                        'requested_at':req.isoformat(),'received_at':rec.isoformat(),'saved_at':now_text(),'latency_ms':lat,'symbol':sym,
+                        'timestamp':t.get('timestamp',''),'price':t.get('price',0),'volume':t.get('volume',0),
+                        'trade_value':round(p*v,4),'currency':t.get('currency','USD')
+                    },['symbol','timestamp','price','volume'])
+            _market_data_request_gap()
+        st['last_dynamic_orderflow_ts'] = now_ts
+    st['last_seen_epoch'] = time.time()
+
+def _us_replay_log_gap(kind, start_at, end_at, detail=''):
+    write_row(us_replay_path('data_gaps'),
+              ['saved_at','market','kind','start_at','end_at','recoverable_candles','recoverable_orderbook','recoverable_trades','detail'],
+              {'saved_at':now_text(),'market':'US','kind':kind,'start_at':start_at,'end_at':end_at,
+               'recoverable_candles':True,'recoverable_orderbook':False,'recoverable_trades':False,'detail':detail})
+
+def _us_replay_ws_worker():
+    """선택적 실시간 원본 녹화. websocket-client 미설치/연결 실패 시 REST 동적수집이 계속 동작한다."""
+    if not US_REPLAY_DATA_ENABLED or not US_REPLAY_WS_ENABLED:
+        return
+    try:
+        import websocket
+    except Exception as e:
+        _us_replay_state()['ws']={'status':'FALLBACK_REST','last_message_at':'','last_error':f'websocket-client unavailable: {e}','subscribed':[]}
+        return
+    while True:
+        ws = None
+        connected_at = None
+        try:
+            _us_replay_reset_if_new_day()
+            token = ensure_token()
+            if not token:
+                time.sleep(5); continue
+            st = _us_replay_state()
+            desired = list(st.setdefault('dynamic_watch', {}).keys())[:US_REPLAY_WS_MAX_SYMBOLS]
+            if not desired:
+                st['ws']['status']='WAITING_CANDIDATE'
+                time.sleep(2); continue
+            headers = [f'Authorization: Bearer {token}']
+            ws = websocket.create_connection(US_REPLAY_WS_URL, header=headers, timeout=10)
+            connected_at = now_kst().isoformat()
+            subs = [
+                {'type':'trade:us','codes':desired},
+                {'type':'orderbook:us','codes':desired},
+                {'id':'us-replay-' + uuid.uuid4().hex[:8]},
+            ]
+            ws.send(json.dumps(subs,separators=(',',':')))
+            st['ws']={'status':'CONNECTED','connected_at':connected_at,'last_message_at':'','last_error':'','subscribed':desired}
+            last_ping=time.time()
+            while True:
+                current = list(_us_replay_state().setdefault('dynamic_watch', {}).keys())[:US_REPLAY_WS_MAX_SYMBOLS]
+                if current != desired:
+                    desired=current
+                    subs=[{'type':'trade:us','codes':desired},{'type':'orderbook:us','codes':desired},{'id':'us-replay-'+uuid.uuid4().hex[:8]}]
+                    ws.send(json.dumps(subs,separators=(',',':')))
+                    st['ws']['subscribed']=desired
+                if time.time()-last_ping >= US_REPLAY_WS_PING_SEC:
+                    ws.send('PING'); last_ping=time.time()
+                try:
+                    raw=ws.recv()
+                except Exception as e:
+                    if 'timed out' in str(e).lower():
+                        continue
+                    raise
+                recv_at=now_kst().isoformat()
+                if not raw:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8', errors='replace')
+                with open(us_replay_ws_path(),'a',encoding='utf-8') as f:
+                    f.write(json.dumps({'received_at':recv_at,'raw':raw},ensure_ascii=False)+'\\n')
+                st['ws']['last_message_at']=recv_at
+        except Exception as e:
+            st=_us_replay_state()
+            end_at=now_kst().isoformat()
+            st['ws']['status']='RECONNECTING'; st['ws']['last_error']=str(e)[:500]
+            if connected_at:
+                _us_replay_log_gap('WS_DISCONNECT', connected_at, end_at, str(e)[:300])
+            time.sleep(2)
+        finally:
+            try:
+                if ws: ws.close()
+            except Exception:
+                pass
+
+def start_us_replay_ws_worker_once():
+    global US_REPLAY_WS_THREAD
+    if not US_REPLAY_DATA_ENABLED or not US_REPLAY_WS_ENABLED:
+        return False
+    if US_REPLAY_WS_THREAD and US_REPLAY_WS_THREAD.is_alive():
+        return True
+    US_REPLAY_WS_THREAD = threading.Thread(target=_us_replay_ws_worker, name='us-replay-ws', daemon=True)
+    US_REPLAY_WS_THREAD.start()
+    return True
+
 def _parse_iso(value):
     try:
         return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
@@ -1057,7 +1434,7 @@ def save_state():
     """상태를 원자적으로 저장하고 직전 정상본을 .bak로 보존한다."""
     try:
         with LOCK:
-            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {}), 'us_semi_paper': S.get('us_semi_paper', {})}
+            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {}), 'us_semi_paper': S.get('us_semi_paper', {}), 'us_surge_paper': S.get('us_surge_paper', {}), 'us_surge_scan': S.get('us_surge_scan', {}), 'us_replay': S.get('us_replay', {})}
         if os.path.isfile(STATE_PATH):
             try:
                 with open(STATE_PATH, 'r', encoding='utf-8') as f:
@@ -1121,6 +1498,15 @@ def load_state():
             us_semi = data.get('us_semi_paper')
             if isinstance(us_semi, dict):
                 S['us_semi_paper'] = us_semi
+            us_surge = data.get('us_surge_paper')
+            if isinstance(us_surge, dict):
+                S['us_surge_paper'] = us_surge
+            us_surge_scan = data.get('us_surge_scan')
+            if isinstance(us_surge_scan, dict):
+                S['us_surge_scan'] = us_surge_scan
+            us_replay = data.get('us_replay')
+            if isinstance(us_replay, dict):
+                S['us_replay'] = us_replay
             if S['paper'].get('start_cash', 0) <= 0:
                 S['paper'] = {'start_cash': VIRTUAL_BASE_CASH, 'cash': VIRTUAL_BASE_CASH, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': VIRTUAL_BASE_CASH, 'profit_rate': 0, 'last_action': '초기 1천만원'}
     except Exception as e:
@@ -4445,7 +4831,9 @@ def update_us_semi_paper_asset(ai_id, save=False):
         mark = _us_semi_mark_price(sym)
         if mark <= 0:
             mark = to_float(pos.get('avg', 0))
-        asset += qty * mark
+        fx = _us_replay_fx_usdkrw(False)
+        if fx > 0:
+            asset += qty * mark * fx
     with LOCK:
         st = S['us_semi_paper'][ai_id]
         st['asset'] = round(asset, 4)
@@ -4465,20 +4853,26 @@ def _us_semi_buy(ai_id, f):
     price = to_float(f.get('price'))
     if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
         return False
+    fx = _us_replay_fx_usdkrw(False)
+    if fx <= 0:
+        return False
     with LOCK:
         st = S['us_semi_paper'][ai_id]
         cash = to_float(st.get('cash'))
         entry_ratio = max(0.10, min(1.0, to_float(f.get('entry_ratio', US_SEMI_ENTRY_RATIO))))
-        budget = cash * entry_ratio
-        qty = int(budget / price)
+        budget_krw = cash * entry_ratio
+        budget_usd = budget_krw / fx
+        qty = int(budget_usd / price)
         if qty <= 0:
             return False
-        fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
-        cost = qty * price + fee
+        gross_krw = qty * price * fx
+        fee = gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
+        cost = gross_krw + fee
         if cost > cash:
-            qty = max(0, int(cash / (price * (1 + US_SEMI_FEE_SIDE_PCT/100.0))))
-            fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
-            cost = qty * price + fee
+            qty = max(0, int(cash / (price * fx * (1 + US_SEMI_FEE_SIDE_PCT/100.0))))
+            gross_krw = qty * price * fx
+            fee = gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
+            cost = gross_krw + fee
         if qty <= 0:
             return False
         st['cash'] = cash - cost
@@ -4507,12 +4901,17 @@ def _us_semi_buy_ratio(ai_id, symbol, price, cash_ratio, reason, entry_features=
         if old and (not allow_add or str(old.get('symbol')) != symbol):
             return False
         cash = to_float(st.get('cash'))
-        budget = cash * cash_ratio
-        qty = int(budget / (price * (1 + US_SEMI_FEE_SIDE_PCT / 100.0)))
+        fx = _us_replay_fx_usdkrw(False)
+        if fx <= 0:
+            return False
+        budget_krw = cash * cash_ratio
+        budget_usd = budget_krw / fx
+        qty = int(budget_usd / (price * (1 + US_SEMI_FEE_SIDE_PCT / 100.0)))
         if qty <= 0:
             return False
-        fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
-        cost = qty * price + fee
+        gross_krw = qty * price * fx
+        fee = gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
+        cost = gross_krw + fee
         if cost > cash:
             return False
         if old:
@@ -4590,17 +4989,22 @@ def _us_semi_sell(ai_id, reason, price_override=0.0):
     if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
         return False
     qty, avg = to_int(pos.get('qty')), to_float(pos.get('avg'))
+    fx = _us_replay_fx_usdkrw(False)
+    if fx <= 0:
+        return False
     entry_fee = to_float(pos.get('entry_fee'))
-    exit_fee = qty * price * US_SEMI_FEE_SIDE_PCT / 100.0
-    pnl = qty * (price - avg) - entry_fee - exit_fee
-    pnl_pct = (pnl / max(1e-9, qty * avg + entry_fee)) * 100.0
+    exit_gross_krw = qty * price * fx
+    exit_fee = exit_gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
+    entry_gross_krw = qty * avg * fx
+    pnl = qty * (price - avg) * fx - entry_fee - exit_fee
+    pnl_pct = (pnl / max(1e-9, entry_gross_krw + entry_fee)) * 100.0
     mfe = pct(to_float(pos.get('peak_price', avg)), avg)
     mae = pct(to_float(pos.get('trough_price', avg)), avg)
     f = dict(pos.get('entry_features') or {})
     f.update({'candidate': sym, 'price': price, 'session': us_market_session_status()[0]})
     with LOCK:
         st = S['us_semi_paper'][ai_id]
-        st['cash'] = to_float(st.get('cash')) + qty * price - exit_fee
+        st['cash'] = to_float(st.get('cash')) + exit_gross_krw - exit_fee
         st['realized_pl'] = to_float(st.get('realized_pl')) + pnl
         st['position'] = None
         st['last_exit_ts'] = time.time()
@@ -4853,6 +5257,7 @@ def ensure_us_surge_states():
         scan.setdefault('ranked', [])
         scan.setdefault('latest_orderbook', {})
         scan.setdefault('last_error', '')
+        _us_replay_state()
 
 
 def us_surge_dir():
@@ -4962,9 +5367,18 @@ def _us_surge_features(sym, session, meta=None):
     else:
         min_r10,max_r3,min_vr=US_SURGE_REG_MIN_R10_PCT,US_SURGE_REG_MAX_R3_PCT,US_SURGE_REG_MIN_VOL_RATIO
     # 당일 상승률 자체는 제한하지 않는다. 지속 강도, 단기 과열 완화, 거래량 유지로 재가속 후보만 고른다.
-    ok = r10 >= min_r10 and r3 <= max_r3 and vr >= min_vr and pullback >= -3.0 and bool(ob.get('asks')) and bool(ob.get('bids'))
+    checks = [
+        ('R10_WEAK', r10 >= min_r10),
+        ('R3_OVERHEAT', r3 <= max_r3),
+        ('VOLUME_WEAK', vr >= min_vr),
+        ('PULLBACK_TOO_DEEP', pullback >= -3.0),
+        ('ORDERBOOK_ASK_EMPTY', bool(ob.get('asks'))),
+        ('ORDERBOOK_BID_EMPTY', bool(ob.get('bids'))),
+    ]
+    failed = [name for name, passed in checks if not passed]
+    ok = not failed
     score = max(0.0, r10*8.0 + min(vr,5.0)*10.0 - max(0.0,r3-max_r3)*12.0 + max(-3.0,pullback)*2.0)
-    return {'ok':ok,'block':'ENTRY_OK' if ok else 'FILTER','symbol':sym,'candidate':sym,'session':session,'price':price,'r3':r3,'r10':r10,'volume_ratio':vr,'pullback_pct':pullback,'score':score,'turnover':to_float((meta or {}).get('turnover')),'day_change_pct':to_float((meta or {}).get('change_pct')),'orderbook':ob}
+    return {'ok':ok,'block':'ENTRY_OK' if ok else '|'.join(failed),'symbol':sym,'candidate':sym,'session':session,'price':price,'r3':r3,'r10':r10,'volume_ratio':vr,'pullback_pct':pullback,'score':score,'turnover':to_float((meta or {}).get('turnover')),'day_change_pct':to_float((meta or {}).get('change_pct')),'orderbook':ob}
 
 
 def _us_surge_fill(sym, side, max_cash=0.0, qty=0, max_slip=0.35):
@@ -5004,26 +5418,33 @@ def _us_surge_update_asset(ai_id):
     asset=cash
     if pos:
         mark=_us_surge_mark(pos.get('symbol','')) or to_float(pos.get('avg'))
-        asset += to_int(pos.get('qty'))*mark
+        fx = _us_replay_fx_usdkrw(False)
+        if fx > 0:
+            asset += to_int(pos.get('qty'))*mark*fx
     with LOCK:
         st=S['us_surge_paper'][ai_id]; st['asset']=asset; st['profit_rate']=(asset/start-1)*100; st['peak_asset']=max(to_float(st.get('peak_asset'),start),asset); st['mdd_pct']=min(to_float(st.get('mdd_pct'),0.0), (asset/max(1e-9,st['peak_asset'])-1)*100)
 
 
 def _us_surge_buy(ai_id, f):
     with LOCK:
-        st=S['us_surge_paper'][ai_id]; cash=to_float(st.get('cash')); target=cash*US_SURGE_ENTRY_RATIO
-    fill=_us_surge_fill(f['symbol'],'BUY',max_cash=target,max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT)
-    if not fill.get('ok') or to_float(fill.get('fill_ratio')) < US_SURGE_MIN_FILL_RATIO:
-        _us_surge_log(ai_id,'BLOCK',f['symbol'],reason='LIQUIDITY_OR_SLIPPAGE',extra=dict(f,**fill,target_cash=target))
+        st=S['us_surge_paper'][ai_id]; cash=to_float(st.get('cash')); target_krw=cash*US_SURGE_ENTRY_RATIO
+    fx = _us_replay_fx_usdkrw(False)
+    if fx <= 0:
+        _us_surge_log(ai_id,'BLOCK',f['symbol'],reason='FX_UNAVAILABLE',extra=dict(f,target_cash=target_krw))
         return False
-    qty=int(fill['qty']); px=to_float(fill['avg_price']); fee=to_float(fill['gross'])*US_SURGE_FEE_SIDE_PCT/100.0; cost=to_float(fill['gross'])+fee
+    target_usd = target_krw / fx
+    fill=_us_surge_fill(f['symbol'],'BUY',max_cash=target_usd,max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT)
+    if not fill.get('ok') or to_float(fill.get('fill_ratio')) < US_SURGE_MIN_FILL_RATIO:
+        _us_surge_log(ai_id,'BLOCK',f['symbol'],reason='LIQUIDITY_OR_SLIPPAGE',extra=dict(f,**fill,target_cash=target_krw))
+        return False
+    qty=int(fill['qty']); px=to_float(fill['avg_price']); gross_usd=to_float(fill['gross']); gross_krw=gross_usd*fx; fee=gross_krw*US_SURGE_FEE_SIDE_PCT/100.0; cost=gross_krw+fee
     with LOCK:
         st=S['us_surge_paper'][ai_id]
         if cost>to_float(st.get('cash')) or st.get('position'): return False
         st['cash']=to_float(st.get('cash'))-cost
         st['position']={'symbol':f['symbol'],'qty':qty,'avg':px,'entry_fee':fee,'entry_time':now_text(),'entry_ts':time.time(),'peak_price':px,'trough_price':px,'protected':False,'entry_features':dict(f)}
         st['trade_count']=to_int(st.get('trade_count'))+1; st['last_action']=f"{now_short()} PAPER BUY {f['symbol']} {qty}@{px:.4f}"
-    _us_surge_log(ai_id,'PAPER_ENTRY',f['symbol'],px,qty,fee,0.0,'ENTRY',dict(f,**fill,target_cash=target,filled_gross=fill.get('gross')))
+    _us_surge_log(ai_id,'PAPER_ENTRY',f['symbol'],px,qty,fee,0.0,'ENTRY',dict(f,**fill,target_cash=target_krw,filled_gross=gross_krw,fx_usdkrw=fx))
     return True
 
 
@@ -5034,10 +5455,13 @@ def _us_surge_sell(ai_id, reason):
     sym=pos['symbol']; _us_surge_fetch_snapshot(sym)
     fill=_us_surge_fill(sym,'SELL',qty=to_int(pos.get('qty')),max_slip=US_SURGE_MAX_SELL_SLIPPAGE_PCT)
     if not fill.get('ok'): return False
-    qty=int(fill['qty']); px=to_float(fill['avg_price']); avg=to_float(pos.get('avg')); entry_fee=to_float(pos.get('entry_fee'))*(qty/max(1,to_int(pos.get('qty')))); exit_fee=to_float(fill['gross'])*US_SURGE_FEE_SIDE_PCT/100.0; pnl=qty*(px-avg)-entry_fee-exit_fee
+    fx = _us_replay_fx_usdkrw(False)
+    if fx <= 0:
+        return False
+    qty=int(fill['qty']); px=to_float(fill['avg_price']); avg=to_float(pos.get('avg')); entry_fee=to_float(pos.get('entry_fee'))*(qty/max(1,to_int(pos.get('qty')))); exit_gross_krw=to_float(fill['gross'])*fx; exit_fee=exit_gross_krw*US_SURGE_FEE_SIDE_PCT/100.0; pnl=qty*(px-avg)*fx-entry_fee-exit_fee
     mfe=pct(to_float(pos.get('peak_price',avg)),avg); mae=pct(to_float(pos.get('trough_price',avg)),avg); hold=max(0,int(time.time()-to_float(pos.get('entry_ts'),time.time())))
     with LOCK:
-        st=S['us_surge_paper'][ai_id]; st['cash']=to_float(st.get('cash'))+to_float(fill['gross'])-exit_fee; st['realized_pl']=to_float(st.get('realized_pl'))+pnl; st['last_exit_ts']=time.time(); st['last_action']=f'{now_short()} PAPER SELL {sym} {reason}'
+        st=S['us_surge_paper'][ai_id]; st['cash']=to_float(st.get('cash'))+exit_gross_krw-exit_fee; st['realized_pl']=to_float(st.get('realized_pl'))+pnl; st['last_exit_ts']=time.time(); st['last_action']=f'{now_short()} PAPER SELL {sym} {reason}'
         old_qty=to_int(pos.get('qty'))
         if qty>=old_qty: st['position']=None
         else:
@@ -5094,6 +5518,10 @@ def run_us_surge_paper():
             f=_us_surge_features(meta['symbol'],session,meta)
             row=dict(meta); row.update(f); ranked.append(row)
             write_row(us_surge_scan_path(), ['time','session','symbol','price','day_change_pct','turnover','r3','r10','volume_ratio','pullback_pct','score','eligible'], {'time':now_text(),'session':session,'symbol':meta['symbol'],'price':f.get('price',0),'day_change_pct':meta.get('change_pct',0),'turnover':meta.get('turnover',0),'r3':f.get('r3',0),'r10':f.get('r10',0),'volume_ratio':f.get('volume_ratio',0),'pullback_pct':f.get('pullback_pct',0),'score':f.get('score',0),'eligible':bool(f.get('ok'))})
+            event_id = _us_replay_register_candidate(f, meta)
+            if event_id:
+                _us_replay_save_backfill(meta['symbol'], US_REPLAY_CANDIDATE_BACKFILL_MIN)
+                _us_replay_capacity(event_id, f)
         ranked.sort(key=lambda x: (bool(x.get('ok')),to_float(x.get('score'))),reverse=True)
         scan['last_scan_ts']=time.time(); scan['session']=session; scan['ranked']=ranked
     eligible=[x for x in ranked if x.get('ok')]
@@ -7501,6 +7929,7 @@ def loop():
                 if ENABLE_US_MARKET_DATA_CAPTURE:
                     try:
                         capture_us_market_data()
+                        _us_replay_dynamic_capture()
                         run_us_semi_paper()
                     except Exception as e:
                         set_error(f'주말 미국 데이터/PAPER 오류: {e}')
@@ -7520,6 +7949,7 @@ def loop():
                 refresh_kr_market_calendar(force=True)
                 if ENABLE_US_MARKET_DATA_CAPTURE:
                     refresh_us_market_calendar(force=True)
+                    start_us_replay_ws_worker_once()
                 load_prices()
                 calc_wma_all()
                 calc_scores()
@@ -7535,6 +7965,7 @@ def loop():
                 set_error(f'한국 데이터 수집 오류: {e}')
             try:
                 capture_us_market_data()
+                _us_replay_dynamic_capture()
                 run_us_semi_paper()
             except Exception as e:
                 set_error(f'미국 데이터/PAPER 오류: {e}')
@@ -8375,7 +8806,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
