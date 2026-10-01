@@ -1,5 +1,5 @@
 # OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
-# V5.25: KR/US 실전 재현용 REPLAY DATA 강화. 전략 파라미터는 V5.24 그대로 유지하고 데이터 수집/재현성만 보강.
+# V5.26: KR/US 수집 독립 워커·KR 당일 orderflow 검증·US 세션 경계/WS JSONL·Drive 완료판정 안정화. 전략 파라미터는 V5.24 그대로 유지.
 # V5.22: 한국 급등 V1 고정검증 + 실시간 호가 기반 동적 PAPER 체결/부분익절/수익보호/호가스냅샷. 실주문 OFF.
 # V5.21: V5.20 기반 - U03 SOXL -5% 장중20%/종가80% 분할스윙 + U04 시장레짐(BULL/PANIC/BEAR/CHOP) 적응형 PAPER.
 # V4_94: 거래일당 Drive canonical ZIP 1개 원칙 / 동일명은 같은 fileId로 갱신 / 중간 timestamp ZIP 생성 금지 / KR·US 자동백업 안정화.
@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_25_KR_US_REPLAY_DATA_FINAL_PAPER'
+OPERATING_VERSION = 'OPERATING_V5_26_KR_US_REPLAY_DATA_STABLE_PAPER'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_4_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -334,6 +334,12 @@ PROJECT_REPORT_TARGET_LEVELS = (1.4, 2.0, 3.0, 5.0)
 PROJECT_SCANNER_THREAD = None
 FULL_MARKET_SCAN_LOCK = threading.RLock()
 PROJECT_SCANNER_HEARTBEAT_TS = 0.0
+# V5.26: 데이터 수집은 매매/백업 메인 루프와 분리한다.
+# 한쪽 작업이 오래 걸려도 KR/US 원본 수집이 같이 멈추지 않도록 독립 daemon worker를 사용한다.
+KR_DATA_THREAD = None
+US_DATA_THREAD = None
+KR_DATA_WORKER_HEARTBEAT_TS = 0.0
+US_DATA_WORKER_HEARTBEAT_TS = 0.0
 
 # 같은 진입후보를 서로 다른 청산법으로 비교한다.
 PROJECT_G_EXIT_PROFILES = {
@@ -718,23 +724,40 @@ def refresh_us_market_calendar(force=False):
     today_cal = _us_calendar_info_from_payload(data, 'today')
     prev_cal = _us_calendar_info_from_payload(data, 'previousBusinessDay')
     chosen = {}
-    # 현재 정규장이라면 오늘 거래일을 우선한다.
+    # 1) 현재 정규장에 실제로 포함되는 거래일이 최우선.
     for cal in (today_cal, prev_cal):
         start = _parse_iso(cal.get('regular_start'))
         end = _parse_iso(cal.get('regular_end'))
         if start and end and start <= nowv <= end:
             chosen = cal
             break
-    # 장외에는 오늘 또는 직전 거래일 중 가장 최근 캘린더를 보존해 복구/백업에 쓴다.
+    # 2) 정규장 직후 AFTER MARKET(기본 230분)은 직전 거래일에 귀속한다.
+    #    KST 날짜가 자정 이후로 바뀌어도 미래 거래일로 성급히 넘기지 않는다.
+    if not chosen and prev_cal.get('is_business_day'):
+        prev_end = _parse_iso(prev_cal.get('regular_end'))
+        if prev_end and prev_end < nowv <= prev_end + timedelta(minutes=US_AFTER_HOURS_MINUTES):
+            chosen = prev_cal
+    # 3) 다음 거래일 DAY/PRE 구간은 그 거래일 정규장 시작을 anchor로 선택한다.
+    if not chosen and today_cal.get('is_business_day'):
+        today_start = _parse_iso(today_cal.get('regular_start'))
+        if today_start:
+            today_day_start = today_start - timedelta(hours=13, minutes=30)
+            if today_day_start <= nowv:
+                chosen = today_cal
+    # 4) 그 밖의 공백/휴장 구간은 미래 거래일이 아니라 가장 최근 종료 거래일을 보존한다.
     if not chosen:
-        candidates = []
+        completed = []
         for cal in (today_cal, prev_cal):
             end = _parse_iso(cal.get('regular_end'))
-            if end:
-                candidates.append((end, cal))
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            chosen = candidates[0][1]
+            if end and end <= nowv:
+                completed.append((end, cal))
+        if completed:
+            completed.sort(key=lambda x: x[0], reverse=True)
+            chosen = completed[0][1]
+        elif today_cal.get('is_business_day'):
+            chosen = today_cal
+        elif prev_cal.get('is_business_day'):
+            chosen = prev_cal
     state['calendar'] = chosen
     state['status'] = 'READY' if chosen.get('is_business_day') else 'MARKET_CLOSED'
     return bool(chosen)
@@ -1227,7 +1250,7 @@ def _us_replay_ws_worker():
                 if isinstance(raw, bytes):
                     raw = raw.decode('utf-8', errors='replace')
                 with open(us_replay_ws_path(),'a',encoding='utf-8') as f:
-                    f.write(json.dumps({'received_at':recv_at,'raw':raw},ensure_ascii=False)+'\\n')
+                    f.write(json.dumps({'received_at':recv_at,'raw':raw},ensure_ascii=False)+'\n')
                 st['ws']['last_message_at']=recv_at
         except Exception as e:
             st=_us_replay_state()
@@ -4440,15 +4463,29 @@ def capture_candles_1m():
             save_candles(sym, result.get('candles', []), 'INDEX')
 
 def capture_orderbook_and_trades(symbols=None):
+    """KR 정규장 호가/체결 수집.
+
+    V5.26:
+    - 당일 공식 KR 거래일과 timestamp가 일치하는 데이터만 일별 CSV에 기록한다.
+    - 전일/타일 체결을 오늘 파일로 날짜변조해 넣지 않는다.
+    - API 성공/거부/저장 건수를 상태에 남겨 selfcheck에서 즉시 확인할 수 있게 한다.
+    """
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
-        return
-    market_ok, _market_reason = regular_market_open_now()
+        return {'ok': False, 'reason': 'DISABLED'}
+    market_ok, market_reason = regular_market_open_now()
     if not market_ok:
-        return
+        return {'ok': False, 'reason': market_reason}
     state = S.setdefault('market_data_capture', {})
+    cal = state.get('calendar', {})
+    expected_date = str(cal.get('date', '') or today())
     symbols = list(dict.fromkeys(symbols or MARKET_DATA_ORDERFLOW_SYMBOLS))
     ob_headers = ['saved_at', 'symbol', 'api_timestamp', 'best_ask', 'best_bid', 'spread', 'ask_total_volume', 'bid_total_volume', 'bid_ask_ratio', 'asks_json', 'bids_json']
     tr_headers = ['saved_at', 'symbol', 'timestamp', 'price', 'volume', 'trade_value', 'currency']
+    stats = {'ok': True, 'expected_date': expected_date, 'symbols': len(symbols),
+             'api_success': 0, 'orderbook_saved': 0, 'trades_saved': 0,
+             'wrong_day_rejected': 0, 'invalid_timestamp_rejected': 0, 'http_errors': 0}
+    state['orderflow_last_attempt_at'] = now_text()
+
     for sym in symbols:
         code, data = api_get('/api/v1/orderbook', params={'symbol': sym}, timeout=8)
         if code == 200:
@@ -4456,23 +4493,50 @@ def capture_orderbook_and_trades(symbols=None):
             asks = result.get('asks', []) if isinstance(result.get('asks', []), list) else []
             bids = result.get('bids', []) if isinstance(result.get('bids', []), list) else []
             api_ts = str(result.get('timestamp', ''))
-            if api_ts:
+            api_dt = parse_api_datetime(api_ts)
+            if api_ts and api_dt is not None and api_dt.strftime('%Y-%m-%d') == expected_date:
+                stats['api_success'] += 1
                 ask_total = sum(to_float(x.get('volume', 0)) for x in asks if isinstance(x, dict))
                 bid_total = sum(to_float(x.get('volume', 0)) for x in bids if isinstance(x, dict))
                 best_ask = to_float(asks[0].get('price', 0)) if asks else 0
                 best_bid = to_float(bids[0].get('price', 0)) if bids else 0
                 state.setdefault('latest_orderbook', {})[sym] = {'timestamp': api_ts, 'best_ask': best_ask, 'best_bid': best_bid, 'asks': asks, 'bids': bids}
                 if state.setdefault('last_orderbook_timestamp', {}).get(sym) != api_ts:
-                    write_row(orderbook_path(sym), ob_headers, {'saved_at': now_text(), 'symbol': sym, 'api_timestamp': api_ts, 'best_ask': best_ask, 'best_bid': best_bid, 'spread': best_ask - best_bid if best_ask and best_bid else 0, 'ask_total_volume': int(ask_total), 'bid_total_volume': int(bid_total), 'bid_ask_ratio': round(bid_total / ask_total, 4) if ask_total else 0, 'asks_json': json.dumps(asks, ensure_ascii=False, separators=(',', ':')), 'bids_json': json.dumps(bids, ensure_ascii=False, separators=(',', ':'))})
+                    write_row(orderbook_path(sym), ob_headers, {
+                        'saved_at': now_text(), 'symbol': sym, 'api_timestamp': api_ts,
+                        'best_ask': best_ask, 'best_bid': best_bid,
+                        'spread': best_ask - best_bid if best_ask and best_bid else 0,
+                        'ask_total_volume': int(ask_total), 'bid_total_volume': int(bid_total),
+                        'bid_ask_ratio': round(bid_total / ask_total, 4) if ask_total else 0,
+                        'asks_json': json.dumps(asks, ensure_ascii=False, separators=(',', ':')),
+                        'bids_json': json.dumps(bids, ensure_ascii=False, separators=(',', ':'))
+                    })
                     state['last_orderbook_timestamp'][sym] = api_ts
-        code, data = api_get('/api/v1/trades', params={'symbol': sym, 'count': max(1, min(50, MARKET_DATA_TRADE_COUNT))}, timeout=8)
+                    stats['orderbook_saved'] += 1
+            elif api_ts and api_dt is not None:
+                stats['wrong_day_rejected'] += 1
+            else:
+                stats['invalid_timestamp_rejected'] += 1
+        else:
+            stats['http_errors'] += 1
+
+        code, data = api_get('/api/v1/trades',
+                             params={'symbol': sym, 'count': max(1, min(50, MARKET_DATA_TRADE_COUNT))},
+                             timeout=8)
         if code != 200:
+            stats['http_errors'] += 1
             continue
+        stats['api_success'] += 1
         result = data.get('result', []) if isinstance(data, dict) else []
         if not isinstance(result, list):
             continue
+
+        # last_seen은 "오늘 거래일의 정상 체결"에 대해서만 사용한다.
         last_seen = state.setdefault('last_trade_timestamp', {}).get(sym, '')
         last_seen_dt = parse_api_datetime(last_seen)
+        if last_seen_dt is not None and last_seen_dt.strftime('%Y-%m-%d') != expected_date:
+            last_seen_dt = None
+
         ordered = []
         for t in result:
             if not isinstance(t, dict):
@@ -4480,19 +4544,40 @@ def capture_orderbook_and_trades(symbols=None):
             ts = str(t.get('timestamp', ''))
             dt = parse_api_datetime(ts)
             if not ts or dt is None:
+                stats['invalid_timestamp_rejected'] += 1
+                continue
+            if dt.strftime('%Y-%m-%d') != expected_date:
+                stats['wrong_day_rejected'] += 1
                 continue
             ordered.append((dt, t))
         ordered.sort(key=lambda x: x[0])
+
         newest = last_seen_dt
         for dt, t in ordered:
             if last_seen_dt is not None and dt <= last_seen_dt:
                 continue
-            price = to_float(t.get('price', 0)); vol = to_float(t.get('volume', 0)); ts = str(t.get('timestamp', ''))
-            write_row(trades_path(sym), tr_headers, {'saved_at': now_text(), 'symbol': sym, 'timestamp': ts, 'price': price, 'volume': vol, 'trade_value': round(price * vol, 4), 'currency': t.get('currency', 'KRW')})
+            price = to_float(t.get('price', 0))
+            vol = to_float(t.get('volume', 0))
+            ts = str(t.get('timestamp', ''))
+            write_row(trades_path(sym), tr_headers, {
+                'saved_at': now_text(), 'symbol': sym, 'timestamp': ts,
+                'price': price, 'volume': vol, 'trade_value': round(price * vol, 4),
+                'currency': t.get('currency', 'KRW')
+            })
             state.setdefault('latest_trade', {})[sym] = dict(t)
             newest = dt
+            stats['trades_saved'] += 1
         if newest is not None:
             state['last_trade_timestamp'][sym] = newest.isoformat()
+
+    state['orderflow_last_stats'] = dict(stats)
+    # API가 정상 응답했고 날짜가 맞는 호가/체결 응답이 하나라도 있으면 worker는 살아있는 것으로 본다.
+    if stats['api_success'] > 0:
+        state['orderflow_last_success_at'] = now_text()
+        state['orderflow_last_success_epoch'] = time.time()
+    if stats['wrong_day_rejected'] > 0:
+        state['orderflow_wrong_day_rejected_total'] = to_int(state.get('orderflow_wrong_day_rejected_total', 0)) + stats['wrong_day_rejected']
+    return stats
 
 
 def _us_semi_default(ai_id):
@@ -5069,6 +5154,55 @@ def _refresh_us_regime_daily_after_close():
         state['u03_daily_refresh_date'] = expected
         state['u03_daily_refresh_at'] = now_text()
     return success
+
+
+def sanitize_us_semi_legacy_unit_state():
+    """구버전 USD/KRW 단위 혼용으로 불가능한 수량이 남은 PAPER 상태를 격리 후 초기화한다.
+
+    전략 판단을 재작성하지 않고, 시작자금보다 큰 원화환산 포지션처럼 물리적으로 불가능한
+    PAPER 상태만 대상으로 한다. 원본 상태는 _quarantine에 보존한다.
+    """
+    if not US_SEMI_PAPER_ENABLED:
+        return []
+    fx = _us_replay_fx_usdkrw(True)
+    if fx <= 0:
+        return []
+    ensure_us_semi_paper_states()
+    repaired = []
+    for ai_id in US_SEMI_PAPER_IDS:
+        with LOCK:
+            st = S['us_semi_paper'][ai_id]
+            pos = dict(st.get('position') or {})
+            start_cash = max(1.0, to_float(st.get('start_cash', US_SEMI_START_CASH)))
+        if not pos:
+            continue
+        qty = to_int(pos.get('qty'))
+        avg = to_float(pos.get('avg'))
+        notional_krw = qty * avg * fx
+        # 정상 로직은 수수료 포함 가용현금 이하만 매수하므로 시작자금 110% 초과 포지션은
+        # 구버전 단위혼용 상태로 판정해 미래 PAPER 결과 오염을 차단한다.
+        if qty > 0 and avg > 0 and notional_krw > start_cash * 1.10:
+            snapshot = {
+                'detected_at': now_text(), 'version': OPERATING_VERSION, 'ai_id': ai_id,
+                'fx_usdkrw': fx, 'position_notional_krw': notional_krw,
+                'reason': 'LEGACY_USD_KRW_UNIT_CONTAMINATION', 'state': st,
+            }
+            qdir = os.path.join(LOG_ROOT, '_quarantine')
+            os.makedirs(qdir, exist_ok=True)
+            qpath = os.path.join(qdir, f'us_semi_{ai_id}_legacy_unit_{int(time.time())}.json')
+            _atomic_json_write(qpath, snapshot)
+            with LOCK:
+                clean = _us_semi_default(ai_id)
+                clean['last_action'] = f'{now_short()} RESET LEGACY_USD_KRW_UNIT_CONTAMINATION'
+                clean['legacy_quarantine_file'] = qpath
+                clean['legacy_quarantine_detected_at'] = now_text()
+                S['us_semi_paper'][ai_id] = clean
+            repaired.append({'ai_id': ai_id, 'notional_krw': round(notional_krw, 2), 'quarantine': qpath})
+    if repaired:
+        save_state()
+        S.setdefault('us_market_data_capture', {})['legacy_unit_repairs'] = repaired
+    return repaired
+
 
 def run_us_regime_paper():
     """U03: SOXL -5% 장중 20% -> 종가도 -5% 이하면 남은 현금 추가.
@@ -5885,6 +6019,67 @@ def maybe_capture_toss_market_data():
     except Exception as e:
         state['errors'] = to_int(state.get('errors', 0)) + 1
         state['status'] = f'오류: {e}'; set_error(f'토스 시장데이터 수집 오류: {e}')
+
+
+def kr_market_data_worker():
+    """한국 원본 수집 전용 worker. 매매/리포트/백업 루프 지연과 분리한다."""
+    global KR_DATA_WORKER_HEARTBEAT_TS
+    while True:
+        try:
+            KR_DATA_WORKER_HEARTBEAT_TS = time.time()
+            if not is_weekend_kst():
+                refresh_kr_market_calendar(False)
+                maybe_capture_toss_market_data()
+                state = S.setdefault('market_data_capture', {})
+                state['worker_alive'] = True
+                state['worker_heartbeat_at'] = now_text()
+                # 정규장 중 orderflow 자체가 오래 멈추면 selfcheck에서 명시한다.
+                market_ok, _ = regular_market_open_now()
+                if market_ok:
+                    last_ok = to_float(state.get('orderflow_last_success_epoch', 0))
+                    if last_ok and time.time() - last_ok > max(300, CORE_ORDERFLOW_SEC * 2):
+                        state['orderflow_watchdog'] = 'KR_ORDERFLOW_STALE'
+                    elif not last_ok:
+                        state['orderflow_watchdog'] = 'KR_ORDERFLOW_WAITING_FIRST_SUCCESS'
+                    else:
+                        state['orderflow_watchdog'] = 'OK'
+                else:
+                    state['orderflow_watchdog'] = 'OUTSIDE_REGULAR'
+        except Exception as e:
+            S.setdefault('market_data_capture', {})['worker_alive'] = True
+            S.setdefault('market_data_capture', {})['worker_last_error'] = str(e)[:500]
+            set_error(f'KR DATA WORKER 오류: {e}')
+        time.sleep(2)
+
+
+def us_market_data_worker():
+    """미국 원본/REPLAY 수집 전용 worker. PAPER/백업 루프와 독립적으로 세션 전체를 수집한다."""
+    global US_DATA_WORKER_HEARTBEAT_TS
+    while True:
+        try:
+            US_DATA_WORKER_HEARTBEAT_TS = time.time()
+            refresh_us_market_calendar(False)
+            capture_us_market_data()
+            _us_replay_dynamic_capture()
+            st = S.setdefault('us_market_data_capture', {})
+            st['worker_alive'] = True
+            st['worker_heartbeat_at'] = now_text()
+        except Exception as e:
+            S.setdefault('us_market_data_capture', {})['worker_alive'] = True
+            S.setdefault('us_market_data_capture', {})['worker_last_error'] = str(e)[:500]
+            set_error(f'US DATA WORKER 오류: {e}')
+        time.sleep(2)
+
+
+def start_market_data_workers_once():
+    global KR_DATA_THREAD, US_DATA_THREAD
+    if ENABLE_TOSS_MARKET_DATA_CAPTURE and (KR_DATA_THREAD is None or not KR_DATA_THREAD.is_alive()):
+        KR_DATA_THREAD = threading.Thread(target=kr_market_data_worker, name='kr-market-data', daemon=True)
+        KR_DATA_THREAD.start()
+    if ENABLE_US_MARKET_DATA_CAPTURE and (US_DATA_THREAD is None or not US_DATA_THREAD.is_alive()):
+        US_DATA_THREAD = threading.Thread(target=us_market_data_worker, name='us-market-data', daemon=True)
+        US_DATA_THREAD.start()
+
 
 def write_logs():
     hs = ['time', 'symbol', 'name', 'price', 'high', 'low', 'wma5', 'wma20', 'wma60', 'volume_ratio', 'score', 'signal', 'market_score', 'market_label', 'news_score', 'news_label', 'rec_buy_qty', 'rec_sell_qty']
@@ -7610,8 +7805,14 @@ def maybe_send_us_backup():
         return
     completed_map = S.setdefault('us_backup_completed', {})
     done = completed_map.get(trade_date, {})
-    if isinstance(done, dict) and (done.get('drive_reverified') or done.get('restored_from_drive') or done.get('completed')):
-        return
+    if isinstance(done, dict):
+        # Drive 사용 중에는 로컬 completed만으로 성공 처리하지 않는다.
+        # 실제 Drive 재다운로드 검증 또는 기존 Drive 정상본 복구가 확인되어야 중단한다.
+        if GOOGLE_DRIVE_UPLOAD_ENABLED:
+            if done.get('drive_reverified') or done.get('restored_from_drive'):
+                return
+        elif done.get('completed'):
+            return
     attempt_key = f'US_BACKUP_ATTEMPT_{trade_date}'
     with LOCK:
         last_attempt = to_float(S['last_alert'].get(attempt_key, 0))
@@ -7928,8 +8129,12 @@ def loop():
                 # 미국 금요일 장이 한국 토요일에 열려 있으면 미국 수집/백업만 수행한다.
                 if ENABLE_US_MARKET_DATA_CAPTURE:
                     try:
-                        capture_us_market_data()
-                        _us_replay_dynamic_capture()
+                        # 평일에 시작된 독립 worker가 살아 있으면 데이터는 worker가 담당한다.
+                        # 주말 재배포 직후처럼 worker 미기동 상태에서는 기존 fallback 수집을 유지한다.
+                        if not (US_DATA_THREAD and US_DATA_THREAD.is_alive()):
+                            refresh_us_market_calendar(False)
+                            capture_us_market_data()
+                            _us_replay_dynamic_capture()
                         run_us_semi_paper()
                     except Exception as e:
                         set_error(f'주말 미국 데이터/PAPER 오류: {e}')
@@ -7954,21 +8159,23 @@ def loop():
                 calc_wma_all()
                 calc_scores()
                 start_project_scanner_worker_once()
+                start_market_data_workers_once()
+                # 구버전 PAPER 단위오염이 있으면 원본을 격리하고 미래 결과에 전파되지 않게 한다.
+                try:
+                    sanitize_us_semi_legacy_unit_state()
+                except Exception as e:
+                    set_error(f'US PAPER legacy unit 점검 오류: {e}')
                 initialized = True
             refresh_kr_market_calendar(force=False)
             load_prices()
             # V5.07: 전체시장 REST 폴링은 project_scanner_worker 한 곳에서만 담당한다.
             # 메인 루프는 스캐너 결과를 소비해 API 중복호출/429 위험을 줄인다.
+            # V5.26: KR/US 원본 수집은 독립 worker가 담당한다.
+            # 메인 루프는 PAPER 판단/리포트/백업만 수행해 수집 중단 전파를 막는다.
             try:
-                maybe_capture_toss_market_data()
-            except Exception as e:
-                set_error(f'한국 데이터 수집 오류: {e}')
-            try:
-                capture_us_market_data()
-                _us_replay_dynamic_capture()
                 run_us_semi_paper()
             except Exception as e:
-                set_error(f'미국 데이터/PAPER 오류: {e}')
+                set_error(f'미국 PAPER 오류: {e}')
             calc_wma_all()
             calc_scores()
             write_logs()
@@ -8806,7 +9013,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -8835,20 +9042,26 @@ class Handler(BaseHTTPRequestHandler):
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
                 return self.json_response({'ok': False, 'error': 'KR_MARKET_CLOSED', 'date': today()}, status=409)
-            p = backup_zip_path()
-            if not os.path.isfile(p):
-                p = create_backup_zip()
-            return self.download_file(p, os.path.basename(p), 'application/zip')
+            try:
+                p = backup_zip_path()
+                if not os.path.isfile(p):
+                    p = create_backup_zip()
+                return self.download_file(p, os.path.basename(p), 'application/zip')
+            except Exception as e:
+                return self.json_response({'ok': False, 'error': 'KR_BACKUP_VERIFY_FAILED', 'detail': str(e), 'date': today()}, status=500)
         if path == '/download_us_backup':
-            refresh_us_market_calendar(force=True)
-            ready, reason, trade_date, start, end, ready_at = us_backup_ready_status()
-            if not ready:
-                error_code = 'US_MARKET_CLOSED' if reason == 'US_MARKET_CLOSED' else 'US_BACKUP_NOT_READY'
-                return self.json_response({'ok': False, 'error': error_code, 'reason': reason, 'trade_date': trade_date, 'regular_start': start.isoformat() if start else '', 'regular_end': end.isoformat() if end else '', 'ready_at': ready_at.isoformat() if ready_at else ''}, status=409)
-            p = us_backup_zip_path(trade_date)
-            if not os.path.isfile(p):
-                p, _ = create_us_backup_zip()
-            return self.download_file(p, os.path.basename(p), 'application/zip')
+            try:
+                refresh_us_market_calendar(force=True)
+                ready, reason, trade_date, start, end, ready_at = us_backup_ready_status()
+                if not ready:
+                    error_code = 'US_MARKET_CLOSED' if reason == 'US_MARKET_CLOSED' else 'US_BACKUP_NOT_READY'
+                    return self.json_response({'ok': False, 'error': error_code, 'reason': reason, 'trade_date': trade_date, 'regular_start': start.isoformat() if start else '', 'regular_end': end.isoformat() if end else '', 'ready_at': ready_at.isoformat() if ready_at else ''}, status=409)
+                p = us_backup_zip_path(trade_date)
+                if not os.path.isfile(p):
+                    p, _ = create_us_backup_zip()
+                return self.download_file(p, os.path.basename(p), 'application/zip')
+            except Exception as e:
+                return self.json_response({'ok': False, 'error': 'US_BACKUP_VERIFY_FAILED', 'detail': str(e)}, status=500)
         if path == '/arcpro_status':
             return self.json_response(arcpro_status_snapshot())
         if path == '/health':
