@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_26_KR_US_REPLAY_DATA_STABLE_PAPER'
+OPERATING_VERSION = 'OPERATING_V5_28_GUIDE_PAPER_INTEGRATED_PAPER'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_4_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -176,6 +176,30 @@ US_REPLAY_WS_URL = os.environ.get('US_REPLAY_WS_URL', 'wss://openapi-ws.tossinve
 US_REPLAY_WS_PING_SEC = max(30, int(os.environ.get('US_REPLAY_WS_PING_SEC', '60')))
 US_REPLAY_WS_MAX_SYMBOLS = max(1, min(50, int(os.environ.get('US_REPLAY_WS_MAX_SYMBOLS', '45'))))  # trade+orderbook=2 subscriptions/symbol <= 100
 US_REPLAY_WS_THREAD = None
+
+# V5.28 자동매매 가상매매 운영가이드 v1.0 전용 비교계좌.
+# 기존 101개 PAPER 계좌와 자금/로그/전략을 완전히 분리한다.
+GUIDE_PAPER_ENABLED = os.environ.get('GUIDE_PAPER_ENABLED', 'true').lower() == 'true'
+GUIDE_PAPER_START_CASH = int(float(os.environ.get('GUIDE_PAPER_START_CASH', '10000000')))
+GUIDE_FEE_SIDE_PCT = max(0.0, float(os.environ.get('GUIDE_FEE_SIDE_PCT', '0.10')))
+GUIDE_SLIPPAGE_PCT = max(0.0, float(os.environ.get('GUIDE_SLIPPAGE_PCT', '0.05')))
+GUIDE_KR_SIGNAL_SYMBOL = os.environ.get('GUIDE_KR_SIGNAL_SYMBOL', '494310').strip()
+GUIDE_KR_LONG_SYMBOL = os.environ.get('GUIDE_KR_LONG_SYMBOL', '494310').strip()
+GUIDE_KR_INVERSE_SYMBOL = os.environ.get('GUIDE_KR_INVERSE_SYMBOL', '252670').strip()
+GUIDE_KR_SMA_WINDOW = max(2, int(os.environ.get('GUIDE_KR_SMA_WINDOW', '12')))
+GUIDE_KR_RSI_WINDOW = max(2, int(os.environ.get('GUIDE_KR_RSI_WINDOW', '2')))
+GUIDE_KR_RSI_LONG_MAX = float(os.environ.get('GUIDE_KR_RSI_LONG_MAX', '50'))
+GUIDE_KR_RSI_INVERSE_MIN = float(os.environ.get('GUIDE_KR_RSI_INVERSE_MIN', '60'))
+GUIDE_KR_EXIT_POLICY = 'NEXT_DAILY_OPPOSITE_SIGNAL_ONLY'
+GUIDE_US_SIGNAL_SYMBOL = os.environ.get('GUIDE_US_SIGNAL_SYMBOL', 'SOXL').strip().upper()
+GUIDE_US_LONG_SYMBOL = os.environ.get('GUIDE_US_LONG_SYMBOL', 'SOXL').strip().upper()
+GUIDE_US_INVERSE_SYMBOL = os.environ.get('GUIDE_US_INVERSE_SYMBOL', 'SOXS').strip().upper()
+GUIDE_US_SMA_WINDOW = max(2, int(os.environ.get('GUIDE_US_SMA_WINDOW', '15')))
+GUIDE_US_HARD_SL_PCT = -abs(float(os.environ.get('GUIDE_US_HARD_SL_PCT', '3.5')))
+GUIDE_US_TRAIL_ARM_PCT = abs(float(os.environ.get('GUIDE_US_TRAIL_ARM_PCT', '3.0')))
+GUIDE_US_TRAIL_DRAW_PCT = abs(float(os.environ.get('GUIDE_US_TRAIL_DRAW_PCT', '1.5')))
+GUIDE_US_TP_PCT = abs(float(os.environ.get('GUIDE_US_TP_PCT', '6.0')))
+GUIDE_ACCOUNT_IDS = ('GUIDE_KR01', 'GUIDE_US01')
 # U03: 2025/2026 공통 연구 규칙. 전년도 일봉을 이어서 지표를 계산하고, 종가 확정 후 PAPER 체결한다.
 US_REGIME_ENTRY_RATIO = max(0.10, min(1.0, float(os.environ.get('US_REGIME_ENTRY_RATIO', '1.0'))))
 US_REGIME_SOXL_DROP_PCT = -abs(float(os.environ.get('US_REGIME_SOXL_DROP_PCT', '5.0')))
@@ -708,59 +732,132 @@ def _latest_completed_us_calendar(now_value=None):
     completed.sort(key=lambda x: x[0], reverse=True)
     return (completed[0][1], code)
 
+def _us_calendar_cycle_bounds(cal):
+    """거래일 캘린더 1개의 Toss US 전체 사이클(DAY~AFTER) 경계를 계산한다."""
+    if not isinstance(cal, dict) or not cal.get('is_business_day'):
+        return (None, None, None, None)
+    reg_start = _parse_iso(cal.get('regular_start'))
+    reg_end = _parse_iso(cal.get('regular_end'))
+    if not reg_start or not reg_end:
+        return (None, None, None, None)
+    day_start = reg_start - timedelta(hours=13, minutes=30)
+    after_end = reg_end + timedelta(minutes=US_AFTER_HOURS_MINUTES)
+    next_cycle = after_end + timedelta(minutes=US_CYCLE_GAP_MINUTES)
+    return (day_start, reg_start, after_end, next_cycle)
+
+
+def _us_calendar_candidates(payload):
+    """한 calendar 응답에서 사용 가능한 거래일 후보를 중복 없이 꺼낸다."""
+    out = []
+    seen = set()
+    for key in ('today', 'previousBusinessDay'):
+        cal = _us_calendar_info_from_payload(payload, key)
+        d = str(cal.get('date', '') or '')
+        if d and d not in seen and cal.get('is_business_day'):
+            seen.add(d)
+            out.append(cal)
+    return out
+
+
 def refresh_us_market_calendar(force=False):
-    """공식 US market-calendar를 캐시한다. 장중 수집과 장후 복구를 모두 지원한다."""
+    """공식 US 캘린더를 현재 Toss 거래 사이클에 맞춰 선택한다.
+
+    핵심: 백업용 직전 거래일과 실시간 수집용 현재 거래일을 섞지 않는다.
+    KST 저녁 DAY/PRE가 이미 시작됐는데 API의 기본 today가 직전 거래일을 가리키면
+    다음 KST 날짜(+1) 조회까지 수행해 현재 사이클을 찾아 rollover 한다.
+    """
     state = S.setdefault('us_market_data_capture', {})
-    if not force and time.time() - to_float(state.get('calendar_checked_at', 0)) < MARKET_CALENDAR_REFRESH_SEC:
-        return bool(state.get('calendar'))
-    state['calendar_checked_at'] = time.time()
     nowv = now_kst()
+
+    # 캐시가 아직 같은 거래 사이클 안이면 재사용한다. 단, next_cycle을 지났으면 즉시 강제 갱신한다.
+    cached = state.get('calendar', {}) if isinstance(state.get('calendar', {}), dict) else {}
+    _, _, _, cached_next = _us_calendar_cycle_bounds(cached)
+    cache_fresh = time.time() - to_float(state.get('calendar_checked_at', 0)) < MARKET_CALENDAR_REFRESH_SEC
+    if not force and cache_fresh and cached and (cached_next is None or nowv < cached_next):
+        return True
+
+    state['calendar_checked_at'] = time.time()
     qdate = nowv.date().isoformat()
-    code, data = api_get('/api/v1/market-calendar/US', params={'date': qdate}, timeout=8)
-    if code != 200:
+    payloads = []
+    codes = []
+
+    def fetch_date(d):
+        code, data = api_get('/api/v1/market-calendar/US', params={'date': d}, timeout=8)
+        codes.append(code)
+        if code == 200:
+            payloads.append(data)
+        return code
+
+    first_code = fetch_date(qdate)
+    if first_code != 200:
         state['calendar'] = {}
-        state['status'] = f'CALENDAR_HTTP_{code}'
+        state['status'] = f'CALENDAR_HTTP_{first_code}'
         return False
-    today_cal = _us_calendar_info_from_payload(data, 'today')
-    prev_cal = _us_calendar_info_from_payload(data, 'previousBusinessDay')
+
+    candidates = []
+    seen_dates = set()
+    def add_payload_candidates():
+        for payload in payloads:
+            for cal in _us_calendar_candidates(payload):
+                d = str(cal.get('date', '') or '')
+                if d and d not in seen_dates:
+                    seen_dates.add(d)
+                    candidates.append(cal)
+    add_payload_candidates()
+
+    # 현재 시각을 포함하는 전체 Toss 사이클이 첫 응답에 없고,
+    # 가장 최신 후보의 next_cycle도 이미 지났다면 +1일 query로 다음 미국 거래일을 찾는다.
+    active = []
+    for cal in candidates:
+        day_start, _, after_end, _ = _us_calendar_cycle_bounds(cal)
+        if day_start and after_end and day_start <= nowv <= after_end:
+            active.append(cal)
+    latest_next = max((_us_calendar_cycle_bounds(c)[3] for c in candidates if _us_calendar_cycle_bounds(c)[3]), default=None)
+    if not active and (latest_next is None or nowv >= latest_next):
+        fetch_date((nowv.date() + timedelta(days=1)).isoformat())
+        add_payload_candidates()
+
     chosen = {}
-    # 1) 현재 정규장에 실제로 포함되는 거래일이 최우선.
-    for cal in (today_cal, prev_cal):
-        start = _parse_iso(cal.get('regular_start'))
-        end = _parse_iso(cal.get('regular_end'))
-        if start and end and start <= nowv <= end:
-            chosen = cal
-            break
-    # 2) 정규장 직후 AFTER MARKET(기본 230분)은 직전 거래일에 귀속한다.
-    #    KST 날짜가 자정 이후로 바뀌어도 미래 거래일로 성급히 넘기지 않는다.
-    if not chosen and prev_cal.get('is_business_day'):
-        prev_end = _parse_iso(prev_cal.get('regular_end'))
-        if prev_end and prev_end < nowv <= prev_end + timedelta(minutes=US_AFTER_HOURS_MINUTES):
-            chosen = prev_cal
-    # 3) 다음 거래일 DAY/PRE 구간은 그 거래일 정규장 시작을 anchor로 선택한다.
-    if not chosen and today_cal.get('is_business_day'):
-        today_start = _parse_iso(today_cal.get('regular_start'))
-        if today_start:
-            today_day_start = today_start - timedelta(hours=13, minutes=30)
-            if today_day_start <= nowv:
-                chosen = today_cal
-    # 4) 그 밖의 공백/휴장 구간은 미래 거래일이 아니라 가장 최근 종료 거래일을 보존한다.
-    if not chosen:
+    active = []
+    for cal in candidates:
+        day_start, reg_start, after_end, _ = _us_calendar_cycle_bounds(cal)
+        if day_start and after_end and day_start <= nowv <= after_end:
+            active.append((reg_start or day_start, cal))
+    if active:
+        active.sort(key=lambda x: x[0], reverse=True)
+        chosen = active[0][1]
+    else:
+        # 10분 공백/휴장 등에는 미래 거래일로 점프하지 않고 가장 최근 완료 사이클을 보존한다.
         completed = []
-        for cal in (today_cal, prev_cal):
-            end = _parse_iso(cal.get('regular_end'))
-            if end and end <= nowv:
-                completed.append((end, cal))
+        future = []
+        for cal in candidates:
+            day_start, reg_start, after_end, _ = _us_calendar_cycle_bounds(cal)
+            if after_end and after_end < nowv:
+                completed.append((after_end, cal))
+            elif day_start and day_start > nowv:
+                future.append((day_start, cal))
         if completed:
             completed.sort(key=lambda x: x[0], reverse=True)
             chosen = completed[0][1]
-        elif today_cal.get('is_business_day'):
-            chosen = today_cal
-        elif prev_cal.get('is_business_day'):
-            chosen = prev_cal
+        elif future:
+            future.sort(key=lambda x: x[0])
+            chosen = future[0][1]
+
+    if not chosen:
+        state['calendar'] = {}
+        state['status'] = 'US_CALENDAR_NO_CANDIDATE'
+        state['calendar_query_codes'] = codes
+        return False
+
+    day_start, reg_start, after_end, next_cycle = _us_calendar_cycle_bounds(chosen)
     state['calendar'] = chosen
-    state['status'] = 'READY' if chosen.get('is_business_day') else 'MARKET_CLOSED'
-    return bool(chosen)
+    state['calendar_query_codes'] = codes
+    state['calendar_selected_at'] = nowv.isoformat()
+    state['cycle_day_start'] = day_start.isoformat() if day_start else ''
+    state['final_session_end'] = after_end.isoformat() if after_end else ''
+    state['next_cycle_expected_at'] = next_cycle.isoformat() if next_cycle else ''
+    state['status'] = 'READY'
+    return True
 
 def us_regular_market_open_now():
     # 백업/복구가 직전 거래일 캘린더를 임시 사용했더라도 장중 수집은 항상 공식 현재 캘린더를 다시 확인한다.
@@ -1457,7 +1554,7 @@ def save_state():
     """상태를 원자적으로 저장하고 직전 정상본을 .bak로 보존한다."""
     try:
         with LOCK:
-            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {}), 'us_semi_paper': S.get('us_semi_paper', {}), 'us_surge_paper': S.get('us_surge_paper', {}), 'us_surge_scan': S.get('us_surge_scan', {}), 'us_replay': S.get('us_replay', {})}
+            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {}), 'us_semi_paper': S.get('us_semi_paper', {}), 'us_surge_paper': S.get('us_surge_paper', {}), 'us_surge_scan': S.get('us_surge_scan', {}), 'us_replay': S.get('us_replay', {}), 'guide_paper': S.get('guide_paper', {})}
         if os.path.isfile(STATE_PATH):
             try:
                 with open(STATE_PATH, 'r', encoding='utf-8') as f:
@@ -1530,6 +1627,9 @@ def load_state():
             us_replay = data.get('us_replay')
             if isinstance(us_replay, dict):
                 S['us_replay'] = us_replay
+            guide_paper = data.get('guide_paper')
+            if isinstance(guide_paper, dict):
+                S['guide_paper'] = guide_paper
             if S['paper'].get('start_cash', 0) <= 0:
                 S['paper'] = {'start_cash': VIRTUAL_BASE_CASH, 'cash': VIRTUAL_BASE_CASH, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': VIRTUAL_BASE_CASH, 'profit_rate': 0, 'last_action': '초기 1천만원'}
     except Exception as e:
@@ -5673,6 +5773,413 @@ def run_us_surge_paper():
         except Exception as e:
             set_error(f'{ai_id} state 저장 실패: {e}')
 
+
+def _guide_default_account(market):
+    return {
+        'market': market, 'start_cash': GUIDE_PAPER_START_CASH, 'cash': GUIDE_PAPER_START_CASH,
+        'position': None, 'realized_pl': 0.0, 'asset': GUIDE_PAPER_START_CASH,
+        'profit_rate': 0.0, 'peak_asset': GUIDE_PAPER_START_CASH, 'mdd_pct': 0.0,
+        'signal_date': '', 'signal': 'WAIT', 'signal_features': {},
+        'entry_done_date': '', 'last_action': '초기 1천만원', 'trades': [], 'errors': []
+    }
+
+def ensure_guide_paper_states():
+    with LOCK:
+        root = S.setdefault('guide_paper', {})
+        root.setdefault('version', 'AUTO_TRADING_PAPER_GUIDE_V1_0')
+        root.setdefault('paper_only', True)
+        root.setdefault('fee_side_pct', GUIDE_FEE_SIDE_PCT)
+        root.setdefault('slippage_pct', GUIDE_SLIPPAGE_PCT)
+        root.setdefault('kr_exit_policy', GUIDE_KR_EXIT_POLICY)
+        for aid, market in (('GUIDE_KR01','KR'), ('GUIDE_US01','US')):
+            cur = root.get(aid)
+            if not isinstance(cur, dict):
+                root[aid] = _guide_default_account(market)
+            else:
+                for k, v in _guide_default_account(market).items():
+                    cur.setdefault(k, v)
+                cur['market'] = market
+
+def _guide_dir(market, trade_date):
+    base = os.path.join(LOG_ROOT, 'US', str(trade_date)) if market == 'US' else os.path.join(LOG_ROOT, str(trade_date))
+    path = os.path.join(base, 'paper_guide_v1')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _guide_event_path(market, trade_date):
+    return os.path.join(_guide_dir(market, trade_date), f'guide_events_{market}_{trade_date}.csv')
+
+def _guide_trade_path(market, trade_date):
+    return os.path.join(_guide_dir(market, trade_date), f'guide_trades_{market}_{trade_date}.csv')
+
+def _guide_state_path(aid, trade_date):
+    market = 'KR' if aid == 'GUIDE_KR01' else 'US'
+    return os.path.join(_guide_dir(market, trade_date), f'guide_state_{aid}_{trade_date}.json')
+
+def _guide_log_event(aid, trade_date, event, symbol='', price=0.0, qty=0, reason='', extra=None):
+    market = 'KR' if aid == 'GUIDE_KR01' else 'US'
+    extra = extra if isinstance(extra, dict) else {}
+    write_row(_guide_event_path(market, trade_date),
+              ['time','account','market','event','symbol','price','qty','reason','extra_json'],
+              {'time':now_text(),'account':aid,'market':market,'event':event,'symbol':symbol,
+               'price':price,'qty':qty,'reason':reason,
+               'extra_json':json.dumps(extra, ensure_ascii=False, separators=(',',':'))})
+
+def _guide_log_trade(aid, trade_date, pos, exit_price, exit_fee, pnl, reason):
+    market = 'KR' if aid == 'GUIDE_KR01' else 'US'
+    gross_cost = to_float(pos.get('gross_cost_krw'))
+    net_pct = (pnl / gross_cost * 100.0) if gross_cost > 0 else 0.0
+    st = S.setdefault('guide_paper', {}).get(aid, {})
+    write_row(_guide_trade_path(market, trade_date),
+              ['market','symbol','signal_time','signal_type','entry_time','entry_price','exit_time','exit_price',
+               'exit_reason','entry_fee','exit_fee','slippage_pct_side','net_profit_krw','net_profit_pct',
+               'cumulative_asset_krw','mdd_pct','note'],
+              {'market':market,'symbol':pos.get('symbol',''),'signal_time':pos.get('signal_time',''),
+               'signal_type':pos.get('signal',''),'entry_time':pos.get('entry_time',''),'entry_price':pos.get('avg',0),
+               'exit_time':now_text(),'exit_price':exit_price,'exit_reason':reason,'entry_fee':pos.get('entry_fee',0),
+               'exit_fee':exit_fee,'slippage_pct_side':GUIDE_SLIPPAGE_PCT,'net_profit_krw':round(pnl,2),
+               'net_profit_pct':round(net_pct,4),'cumulative_asset_krw':round(to_float(st.get('asset')),2),
+               'mdd_pct':round(to_float(st.get('mdd_pct')),4),
+               'note':'PAPER ONLY / next tradable snapshot / no future data'})
+
+def _guide_date_of_timestamp(value):
+    dt = parse_api_datetime(value)
+    return dt.strftime('%Y-%m-%d') if dt else ''
+
+def _guide_fetch_completed_daily_closes(symbol, current_trade_date, count=80):
+    """현재 거래일 이전의 확정 일봉만 신호에 사용한다."""
+    code, data = api_get('/api/v1/candles',
+                         params={'symbol':symbol,'interval':'1d','count':max(30,min(200,count)),'adjusted':True},
+                         timeout=12)
+    if code != 200:
+        return []
+    rows = _result_dict(data).get('candles', [])
+    out = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        d = _guide_date_of_timestamp(r.get('timestamp',''))
+        close = to_float(r.get('closePrice',0))
+        if d and d < str(current_trade_date) and close > 0:
+            out[d] = close
+    return [(d, out[d]) for d in sorted(out)]
+
+def _guide_wilder_rsi(closes, period=2):
+    vals = [to_float(x) for x in closes if to_float(x) > 0]
+    if len(vals) < period + 2:
+        return None
+    changes = [vals[i]-vals[i-1] for i in range(1,len(vals))]
+    gains = [max(x,0.0) for x in changes]
+    losses = [max(-x,0.0) for x in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain*(period-1))+gains[i]) / period
+        avg_loss = ((avg_loss*(period-1))+losses[i]) / period
+    if avg_loss <= 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0/(1.0+rs)
+
+def _guide_build_kr_signal(trade_date):
+    rows = _guide_fetch_completed_daily_closes(GUIDE_KR_SIGNAL_SYMBOL, trade_date, 80)
+    closes = [x[1] for x in rows]
+    need = max(GUIDE_KR_SMA_WINDOW, GUIDE_KR_RSI_WINDOW + 2)
+    if len(closes) < need:
+        return {'signal':'WAIT','reason':'DATA_MISSING','trade_date':trade_date,'rows':len(closes)}
+    prev_close = closes[-1]
+    sma = sum(closes[-GUIDE_KR_SMA_WINDOW:]) / GUIDE_KR_SMA_WINDOW
+    rsi = _guide_wilder_rsi(closes, GUIDE_KR_RSI_WINDOW)
+    if rsi is None:
+        sig='WAIT'; reason='RSI_UNAVAILABLE'
+    elif prev_close > sma and rsi <= GUIDE_KR_RSI_LONG_MAX:
+        sig='LONG'; reason='CLOSE_GT_SMA12_AND_RSI2_LE_50'
+    elif prev_close < sma and rsi >= GUIDE_KR_RSI_INVERSE_MIN:
+        sig='INVERSE'; reason='CLOSE_LT_SMA12_AND_RSI2_GE_60'
+    else:
+        sig='WAIT'; reason='CONDITIONS_NOT_MET'
+    return {'signal':sig,'reason':reason,'trade_date':trade_date,'source_symbol':GUIDE_KR_SIGNAL_SYMBOL,
+            'source_date':rows[-1][0],'prev_close':round(prev_close,6),'sma12':round(sma,6),
+            'rsi2_wilder':round(rsi,6) if rsi is not None else None,'rows':len(closes)}
+
+def _guide_build_us_signal(trade_date):
+    rows = _guide_fetch_completed_daily_closes(GUIDE_US_SIGNAL_SYMBOL, trade_date, 80)
+    closes = [x[1] for x in rows]
+    if len(closes) < GUIDE_US_SMA_WINDOW:
+        return {'signal':'WAIT','reason':'DATA_MISSING','trade_date':trade_date,'rows':len(closes)}
+    prev_close = closes[-1]
+    sma = sum(closes[-GUIDE_US_SMA_WINDOW:]) / GUIDE_US_SMA_WINDOW
+    if prev_close > sma:
+        sig='SOXL'; reason='SOXL_CLOSE_GT_SMA15'
+    elif prev_close < sma:
+        sig='SOXS'; reason='SOXL_CLOSE_LT_SMA15'
+    else:
+        sig='WAIT'; reason='EQUAL_OR_UNDECIDED'
+    return {'signal':sig,'reason':reason,'trade_date':trade_date,'source_symbol':GUIDE_US_SIGNAL_SYMBOL,
+            'source_date':rows[-1][0],'prev_close':round(prev_close,6),'sma15':round(sma,6),'rows':len(closes)}
+
+def _guide_live_fill(symbol, side, market):
+    """호가 우선, 실패 시 현재가. 호출 시점 스냅샷만 사용한다."""
+    c, d = api_get('/api/v1/orderbook', params={'symbol':symbol}, timeout=8)
+    base = 0.0
+    source = 'ORDERBOOK'
+    if c == 200:
+        r = _result_dict(d)
+        asks = r.get('asks',[]) if isinstance(r.get('asks',[]),list) else []
+        bids = r.get('bids',[]) if isinstance(r.get('bids',[]),list) else []
+        if side == 'BUY' and asks:
+            base = to_float(asks[0].get('price',0))
+        elif side == 'SELL' and bids:
+            base = to_float(bids[0].get('price',0))
+    if base <= 0:
+        c, d = api_get('/api/v1/prices', params={'symbols':symbol}, timeout=8)
+        source = 'PRICE_FALLBACK'
+        if c == 200:
+            arr = d.get('result',[]) if isinstance(d,dict) else []
+            if isinstance(arr,list) and arr:
+                base = to_float(arr[0].get('lastPrice', arr[0].get('price',0)))
+    if base <= 0:
+        return {'ok':False,'reason':'NO_EXECUTABLE_PRICE'}
+    slip = GUIDE_SLIPPAGE_PCT/100.0
+    fill = base*(1.0+slip) if side == 'BUY' else base*(1.0-slip)
+    fill = round(fill) if market == 'KR' else round(fill,4)
+    return {'ok':True,'base_price':base,'fill_price':fill,'source':source,'slippage_pct':GUIDE_SLIPPAGE_PCT}
+
+def _guide_usdkrw():
+    fx = _us_replay_fx_usdkrw(False)
+    return fx if fx > 0 else 0.0
+
+def _guide_update_asset(aid, mark_price=0.0):
+    with LOCK:
+        st=S['guide_paper'][aid]
+        pos=dict(st.get('position') or {})
+        cash=to_float(st.get('cash'))
+    asset=cash
+    if pos:
+        px=mark_price if mark_price>0 else to_float(pos.get('last_price',pos.get('avg',0)))
+        if aid=='GUIDE_US01':
+            fx=_guide_usdkrw()
+            asset += to_int(pos.get('qty'))*px*fx if fx>0 else to_float(pos.get('marked_value_krw',0))
+        else:
+            asset += to_int(pos.get('qty'))*px
+    with LOCK:
+        st=S['guide_paper'][aid]
+        st['asset']=asset
+        st['peak_asset']=max(to_float(st.get('peak_asset',GUIDE_PAPER_START_CASH)),asset)
+        peak=max(1.0,to_float(st.get('peak_asset')))
+        st['mdd_pct']=min(to_float(st.get('mdd_pct',0.0)),(asset/peak-1.0)*100.0)
+        st['profit_rate']=(asset/to_float(st.get('start_cash',GUIDE_PAPER_START_CASH))-1.0)*100.0
+    return asset
+
+def _guide_buy(aid, symbol, signal, trade_date, features):
+    market='KR' if aid=='GUIDE_KR01' else 'US'
+    fill=_guide_live_fill(symbol,'BUY',market)
+    if not fill.get('ok'):
+        _guide_log_event(aid,trade_date,'NO_FILL',symbol,0,0,fill.get('reason',''))
+        return False
+    with LOCK:
+        st=S['guide_paper'][aid]
+        cash=to_float(st.get('cash'))
+        if st.get('position'):
+            return False
+    px=to_float(fill.get('fill_price'))
+    if market=='US':
+        fx=_guide_usdkrw()
+        if fx<=0:
+            return False
+        unit_krw=px*fx
+    else:
+        fx=1.0
+        unit_krw=px
+    fee_rate=GUIDE_FEE_SIDE_PCT/100.0
+    qty=int(cash/(unit_krw*(1.0+fee_rate)))
+    if qty<=0:
+        return False
+    gross=qty*unit_krw
+    fee=gross*fee_rate
+    total=gross+fee
+    with LOCK:
+        st=S['guide_paper'][aid]
+        if total>to_float(st.get('cash')) or st.get('position'):
+            return False
+        st['cash']=to_float(st.get('cash'))-total
+        st['position']={'symbol':symbol,'qty':qty,'avg':px,'entry_fee':fee,'gross_cost_krw':gross,
+                        'entry_time':now_text(),'signal_time':now_text(),'signal':signal,'signal_features':dict(features),
+                        'peak_price':px,'trailing_armed':False,'last_price':px,'fx_entry':fx}
+        st['entry_done_date']=trade_date
+        st['last_action']=f"{now_short()} PAPER BUY {symbol} {qty}@{px}"
+    _guide_update_asset(aid,px)
+    _guide_log_event(aid,trade_date,'PAPER_ENTRY',symbol,px,qty,'ENTRY',dict(features,**fill,fee=fee,fx=fx))
+    return True
+
+def _guide_sell(aid, trade_date, reason):
+    market='KR' if aid=='GUIDE_KR01' else 'US'
+    with LOCK:
+        st=S['guide_paper'][aid]
+        pos=dict(st.get('position') or {})
+    if not pos:
+        return False
+    fill=_guide_live_fill(pos['symbol'],'SELL',market)
+    if not fill.get('ok'):
+        _guide_log_event(aid,trade_date,'SELL_NO_FILL',pos.get('symbol',''),0,0,fill.get('reason',''))
+        return False
+    px=to_float(fill.get('fill_price'))
+    qty=to_int(pos.get('qty'))
+    avg=to_float(pos.get('avg'))
+    if market=='US':
+        fx=_guide_usdkrw()
+        if fx<=0:
+            return False
+        gross=qty*px*fx
+        cost_basis=qty*avg*to_float(pos.get('fx_entry',fx))
+    else:
+        fx=1.0
+        gross=qty*px
+        cost_basis=qty*avg
+    exit_fee=gross*(GUIDE_FEE_SIDE_PCT/100.0)
+    pnl=gross-exit_fee-cost_basis-to_float(pos.get('entry_fee'))
+    with LOCK:
+        st=S['guide_paper'][aid]
+        st['cash']=to_float(st.get('cash'))+gross-exit_fee
+        st['realized_pl']=to_float(st.get('realized_pl'))+pnl
+        st['position']=None
+        st['last_action']=f"{now_short()} PAPER SELL {pos.get('symbol')} {reason}"
+        st.setdefault('trades',[]).append({'time':now_text(),'symbol':pos.get('symbol'),'entry':avg,'exit':px,'qty':qty,'pnl':pnl,'reason':reason})
+    _guide_update_asset(aid,0)
+    _guide_log_trade(aid,trade_date,pos,px,exit_fee,pnl,reason)
+    _guide_log_event(aid,trade_date,'PAPER_EXIT',pos.get('symbol',''),px,qty,reason,dict(fill,exit_fee=exit_fee,pnl=pnl,fx=fx))
+    return True
+
+def _guide_kr_run():
+    aid='GUIDE_KR01'
+    refresh_kr_market_calendar(False)
+    cal=S.setdefault('market_data_capture',{}).get('calendar',{})
+    trade_date=str(cal.get('date','') or today())
+    if not trade_date or not cal.get('is_business_day'):
+        return
+    with LOCK:
+        st=S['guide_paper'][aid]
+        need_signal=st.get('signal_date')!=trade_date
+    if need_signal:
+        f=_guide_build_kr_signal(trade_date)
+        with LOCK:
+            st=S['guide_paper'][aid]
+            st['signal_date']=trade_date
+            st['signal']=f.get('signal','WAIT')
+            st['signal_features']=f
+            st['last_action']=f"{now_short()} SIGNAL {st['signal']}"
+        _guide_log_event(aid,trade_date,'SIGNAL',reason=f.get('reason',''),extra=f)
+        save_state()
+    market_ok,_=regular_market_open_now()
+    if not market_ok:
+        _atomic_json_write(_guide_state_path(aid,trade_date),S['guide_paper'][aid])
+        return
+    with LOCK:
+        st=S['guide_paper'][aid]
+        sig=st.get('signal','WAIT')
+        pos=dict(st.get('position') or {})
+        entered=st.get('entry_done_date')==trade_date
+        f=dict(st.get('signal_features') or {})
+    desired = GUIDE_KR_LONG_SYMBOL if sig=='LONG' else (GUIDE_KR_INVERSE_SYMBOL if sig=='INVERSE' else '')
+    if pos and desired and pos.get('symbol')!=desired:
+        if _guide_sell(aid,trade_date,'NEXT_DAILY_OPPOSITE_SIGNAL'):
+            pos={}
+    if (not pos) and desired and not entered:
+        _guide_buy(aid,desired,sig,trade_date,f)
+    with LOCK:
+        pos=dict(S['guide_paper'][aid].get('position') or {})
+    if pos:
+        c,d=api_get('/api/v1/prices',params={'symbols':pos['symbol']},timeout=8)
+        if c==200:
+            arr=d.get('result',[]) if isinstance(d,dict) else []
+            if isinstance(arr,list) and arr:
+                px=to_float(arr[0].get('lastPrice',arr[0].get('price',0)))
+                if px>0:
+                    with LOCK:
+                        S['guide_paper'][aid]['position']['last_price']=px
+                    _guide_update_asset(aid,px)
+    _atomic_json_write(_guide_state_path(aid,trade_date),S['guide_paper'][aid])
+
+def _guide_us_run():
+    aid='GUIDE_US01'
+    refresh_us_market_calendar(False)
+    trade_date=us_trade_date_from_calendar()
+    if not trade_date:
+        return
+    with LOCK:
+        st=S['guide_paper'][aid]
+        need_signal=st.get('signal_date')!=trade_date
+    if need_signal:
+        f=_guide_build_us_signal(trade_date)
+        with LOCK:
+            st=S['guide_paper'][aid]
+            st['signal_date']=trade_date
+            st['signal']=f.get('signal','WAIT')
+            st['signal_features']=f
+            st['last_action']=f"{now_short()} SIGNAL {st['signal']}"
+        _guide_log_event(aid,trade_date,'SIGNAL',reason=f.get('reason',''),extra=f)
+        save_state()
+    session, overnight_start, pre_start, reg_start, reg_end, after_end = us_market_session_status()
+    nowv=now_kst()
+    with LOCK:
+        st=S['guide_paper'][aid]
+        sig=st.get('signal','WAIT')
+        pos=dict(st.get('position') or {})
+        entered=st.get('entry_done_date')==trade_date
+        f=dict(st.get('signal_features') or {})
+    if pos:
+        c,d=api_get('/api/v1/prices',params={'symbols':pos['symbol']},timeout=8)
+        price=0.0
+        if c==200:
+            arr=d.get('result',[]) if isinstance(d,dict) else []
+            if isinstance(arr,list) and arr:
+                price=to_float(arr[0].get('lastPrice',arr[0].get('price',0)))
+        if price>0:
+            with LOCK:
+                p=S['guide_paper'][aid]['position']
+                p['last_price']=price
+                p['peak_price']=max(to_float(p.get('peak_price',price)),price)
+                profit=pct(price,to_float(p.get('avg')))
+                if profit>=GUIDE_US_TRAIL_ARM_PCT:
+                    p['trailing_armed']=True
+                peak=to_float(p.get('peak_price'))
+                armed=bool(p.get('trailing_armed'))
+            draw=pct(price,peak)
+            _guide_update_asset(aid,price)
+            if profit<=GUIDE_US_HARD_SL_PCT:
+                _guide_sell(aid,trade_date,f'HARD_SL {profit:.2f}%')
+            elif profit>=GUIDE_US_TP_PCT:
+                _guide_sell(aid,trade_date,f'TP {profit:.2f}%')
+            elif armed and draw<=-GUIDE_US_TRAIL_DRAW_PCT:
+                _guide_sell(aid,trade_date,f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
+            elif reg_end and nowv >= reg_end - timedelta(seconds=max(20,REFRESH_SEC)):
+                _guide_sell(aid,trade_date,'EOD_REGULAR_CLOSE')
+        elif reg_end and nowv >= reg_end:
+            _guide_sell(aid,trade_date,'EOD_REGULAR_CLOSE_FALLBACK')
+    else:
+        if session=='REGULAR' and not entered:
+            desired=GUIDE_US_LONG_SYMBOL if sig=='SOXL' else (GUIDE_US_INVERSE_SYMBOL if sig=='SOXS' else '')
+            if desired:
+                _guide_buy(aid,desired,sig,trade_date,f)
+    _atomic_json_write(_guide_state_path(aid,trade_date),S['guide_paper'][aid])
+
+def run_guide_paper():
+    """운영가이드 v1.0 PAPER ONLY. 기존 101개 계좌와 완전 독립."""
+    ensure_guide_paper_states()
+    if not GUIDE_PAPER_ENABLED:
+        return
+    try:
+        _guide_kr_run()
+    except Exception as e:
+        S.setdefault('guide_paper',{}).setdefault('GUIDE_KR01',_guide_default_account('KR')).setdefault('errors',[]).append({'time':now_text(),'error':str(e)[:500]})
+        set_error(f'GUIDE KR PAPER 오류: {e}')
+    try:
+        _guide_us_run()
+    except Exception as e:
+        S.setdefault('guide_paper',{}).setdefault('GUIDE_US01',_guide_default_account('US')).setdefault('errors',[]).append({'time':now_text(),'error':str(e)[:500]})
+        set_error(f'GUIDE US PAPER 오류: {e}')
+
+
 def run_us_semi_paper():
     """U01/U02 분봉 역추세 + U03 20/80 급락스윙 + U04 시장레짐 적응형 PAPER."""
     ensure_us_semi_paper_states()
@@ -7742,7 +8249,8 @@ def us_backup_ready_status(now_value=None):
     state = S.setdefault('us_market_data_capture', {})
     if not cal:
         return (False, f'US_CALENDAR_NO_COMPLETED_SESSION_HTTP_{code}', '', None, None, None)
-    state['calendar'] = cal
+    # 백업 판정용 직전 거래일은 실시간 수집용 state['calendar']를 절대 덮어쓰지 않는다.
+    state['backup_calendar'] = cal
     trade_date = str(cal.get('date', '') or '')
     start = _parse_iso(cal.get('regular_start'))
     end = _parse_iso(cal.get('regular_end'))
@@ -7754,8 +8262,8 @@ def us_backup_ready_status(now_value=None):
 
     after_end = end + timedelta(minutes=US_AFTER_HOURS_MINUTES)
     ready_at = after_end
-    state['final_session_end'] = after_end.isoformat()
-    state['next_cycle_expected_at'] = (after_end + timedelta(minutes=US_CYCLE_GAP_MINUTES)).isoformat()
+    state['backup_final_session_end'] = after_end.isoformat()
+    state['backup_next_cycle_expected_at'] = (after_end + timedelta(minutes=US_CYCLE_GAP_MINUTES)).isoformat()
 
     if nowv < ready_at:
         state['status'] = 'COLLECTING_US_FULL_CYCLE'
@@ -8112,6 +8620,7 @@ def loop():
     load_state()
     ensure_multi_ai_states()
     ensure_us_semi_paper_states()
+    ensure_guide_paper_states()
     save_state()
     counter = 0
     initialized = False
@@ -8136,6 +8645,7 @@ def loop():
                             capture_us_market_data()
                             _us_replay_dynamic_capture()
                         run_us_semi_paper()
+                        run_guide_paper()
                     except Exception as e:
                         set_error(f'주말 미국 데이터/PAPER 오류: {e}')
                     try:
@@ -8176,6 +8686,10 @@ def loop():
                 run_us_semi_paper()
             except Exception as e:
                 set_error(f'미국 PAPER 오류: {e}')
+            try:
+                run_guide_paper()
+            except Exception as e:
+                set_error(f'운영가이드 PAPER 오류: {e}')
             calc_wma_all()
             calc_scores()
             write_logs()
@@ -9013,7 +9527,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS), 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), 'paper_start_cash_each': MULTI_AI_START_CASH, 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS) + 1, 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + 1, 'paper_start_cash_each': MULTI_AI_START_CASH, 'guide_paper_enabled': GUIDE_PAPER_ENABLED, 'guide_paper': S.get('guide_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -9068,7 +9582,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)}계좌 (KR {len(MULTI_AI_IDS)} + US {len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)})</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS)}계좌 (KR {len(MULTI_AI_IDS)+1} + US {len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)+1})</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
@@ -9222,7 +9736,7 @@ def acquire_single_instance_lock():
 def print_core_selfcheck():
     print('[CORE DATA/PAPER/BACKUP FROZEN]', flush=True)
     print('version=', OPERATING_VERSION, flush=True)
-    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), '(KR=', len(MULTI_AI_IDS), 'US=', len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS), ')', flush=True)
+    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS), '(KR=', len(MULTI_AI_IDS)+1, 'US=', len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)+1, ')', flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
     print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
     print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
@@ -9267,7 +9781,9 @@ def print_core_selfcheck():
     if len(US_SURGE_PAPER_IDS) != 4:
         raise RuntimeError(f'US 급등 가상계좌 수 오류: {len(US_SURGE_PAPER_IDS)}')
     if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) != 101:
-        raise RuntimeError(f'전체 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)}')
+        raise RuntimeError(f'기존 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)}')
+    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS) != 103:
+        raise RuntimeError('운영가이드 포함 전체 PAPER 계좌 수 오류')
 if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
