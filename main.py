@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_32_CORE4_FORWARD_PAPER_KRSEMI_FIXED'
+OPERATING_VERSION = 'OPERATING_V5_33_CORE4_PAPER_WITH_DASHBOARD'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'CORE4_PAPER', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -9985,6 +9985,119 @@ def paper_summary_snapshot():
     return core4_summary_snapshot()
 
 
+
+def core4_dashboard_html():
+    """Human-readable realtime dashboard for the 4 active PAPER accounts."""
+    return """<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CORE4 PAPER Dashboard</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:18px;background:#111;color:#eee}
+h1{font-size:22px;margin:0 0 10px}
+.small{color:#aaa;font-size:12px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:14px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid #262626}
+.row:last-child{border-bottom:none}
+.k{color:#aaa}.v{font-weight:700;text-align:right;word-break:break-all}
+.buy{color:#65d46e}.sell{color:#ff6b6b}.hold{color:#ffd166}.wait{color:#9ec5ff}
+.ok{color:#65d46e}.bad{color:#ff6b6b}
+table{width:100%;border-collapse:collapse;margin-top:12px;background:#1b1b1b}
+th,td{padding:8px;border:1px solid #333;text-align:right;font-size:13px}
+th:first-child,td:first-child{text-align:left}
+.top{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px}
+.badge{background:#222;border:1px solid #333;border-radius:8px;padding:7px 10px}
+</style>
+</head>
+<body>
+<h1>CORE4 실시간 가상매매</h1>
+<div class="small">3초 자동갱신 · PAPER ONLY · 실제 주문 없음</div>
+<div id="top" class="top"></div>
+<div id="cards" class="grid"></div>
+
+<script>
+function fnum(x, d=2){
+  const n=Number(x);
+  return Number.isFinite(n)?n.toLocaleString('ko-KR',{maximumFractionDigits:d}):'-';
+}
+function sigClass(s){
+  s=(s||'').toUpperCase();
+  if(s==='BUY') return 'buy';
+  if(s==='SELL') return 'sell';
+  if(s==='HOLD') return 'hold';
+  return 'wait';
+}
+function posText(p){
+  if(!p) return '없음';
+  return `${p.symbol||''} / ${fnum(p.qty,0)}주 / 평균 ${fnum(p.avg,4)}`;
+}
+async function refresh(){
+  try{
+    const [sRes,cRes]=await Promise.all([
+      fetch('/paper_summary',{cache:'no-store'}),
+      fetch('/selfcheck',{cache:'no-store'})
+    ]);
+    const s=await sRes.json();
+    const c=await cRes.json();
+
+    const top=document.getElementById('top');
+    top.innerHTML = `
+      <div class="badge">버전: <b>${c.version||s.version||'-'}</b></div>
+      <div class="badge">실주문: <b class="${c.real_order_enabled?'bad':'ok'}">${c.real_order_enabled?'ON':'OFF'}</b></div>
+      <div class="badge">KR수집: <b class="${c.kr_data_worker_alive?'ok':'wait'}">${c.kr_data_worker_alive?'RUN':'STOP/휴장'}</b></div>
+      <div class="badge">US수집: <b class="${c.us_data_worker_alive?'ok':'wait'}">${c.us_data_worker_alive?'RUN':'STOP/휴장'}</b></div>
+      <div class="badge">급등스캐너: <b class="${c.project_scanner_alive?'ok':'wait'}">${c.project_scanner_alive?'RUN':'STOP/휴장'}</b></div>
+      <div class="badge">Drive: <b class="${c.google_drive_ready?'ok':'bad'}">${c.google_drive_ready?'READY':'NOT READY'}</b></div>
+      <div class="badge">저장공간: <b>${fnum((c.project_storage||{}).used_pct,1)}%</b></div>
+      <div class="badge">업데이트: <b>${new Date().toLocaleTimeString('ko-KR')}</b></div>
+    `;
+
+    const rows=s.ranking||[];
+    document.getElementById('cards').innerHTML = rows.map(r=>{
+      const p = r.positions && Object.keys(r.positions).length ? r.positions[Object.keys(r.positions)[0]] : null;
+      const feat = r.signal_features||{};
+      let indicators='-';
+      if(r.id==='KR_SEMI'){
+        indicators=`종가 ${fnum(feat.prev_close,2)} / MA10 ${fnum(feat.ma10,2)} / RSI2 ${fnum(feat.rsi2,2)}`;
+      }else if(r.id==='US_SOXL'){
+        indicators=`종가 ${fnum(feat.prev_close,2)} / MA5 ${fnum(feat.ma5,2)} / RSI2 ${fnum(feat.rsi2,2)}`;
+      }else{
+        const parts=[];
+        if(feat.score!=null) parts.push(`score ${fnum(feat.score,1)}`);
+        if(feat.r3!=null) parts.push(`r3 ${fnum(feat.r3,2)}%`);
+        if(feat.r10!=null) parts.push(`r10 ${fnum(feat.r10,2)}%`);
+        indicators=parts.length?parts.join(' / '):'-';
+      }
+      return `
+      <div class="card">
+        <div class="row"><span class="k">전략</span><span class="v">${r.id} · ${r.name||''}</span></div>
+        <div class="row"><span class="k">신호</span><span class="v ${sigClass(r.signal)}">${r.signal||'-'}</span></div>
+        <div class="row"><span class="k">이유</span><span class="v">${r.reason||'-'}</span></div>
+        <div class="row"><span class="k">지표</span><span class="v">${indicators}</span></div>
+        <div class="row"><span class="k">보유</span><span class="v">${posText(p)}</span></div>
+        <div class="row"><span class="k">현금</span><span class="v">${fnum(r.cash,0)}원</span></div>
+        <div class="row"><span class="k">총자산</span><span class="v">${fnum(r.asset,0)}원</span></div>
+        <div class="row"><span class="k">누적수익률</span><span class="v">${fnum(r.profit_rate,3)}%</span></div>
+        <div class="row"><span class="k">실현손익</span><span class="v">${fnum(r.realized_pl,0)}원</span></div>
+        <div class="row"><span class="k">MDD</span><span class="v">${fnum(r.mdd_pct,3)}%</span></div>
+        <div class="row"><span class="k">거래수</span><span class="v">${fnum(r.closed_trade_count,0)}회 완료 / ${fnum(r.trade_count,0)}회 진입</span></div>
+        <div class="row"><span class="k">최근동작</span><span class="v">${r.last_action||'-'}</span></div>
+      </div>`;
+    }).join('');
+  }catch(e){
+    document.getElementById('top').innerHTML='<div class="badge bad">대시보드 조회 오류: '+e+'</div>';
+  }
+}
+refresh();
+setInterval(refresh,3000);
+</script>
+</body>
+</html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -10002,6 +10115,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html_response("<html><head><meta charset='utf-8'></head><body><h2>Google Drive 승인 성공</h2><p>refresh token을 Persistent Disk에 안전하게 저장했습니다. 재배포 없이 다음 백업부터 자동 사용합니다.</p></body></html>")
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
+        if path in ('/dashboard', '/paper_dashboard'):
+            return self.html_response(core4_dashboard_html())
         if path in ('/selfcheck', '/configcheck'):
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 4, 'kr_paper_accounts': 2, 'us_paper_accounts': 2, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
@@ -10058,7 +10173,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + CORE4 Forward PAPER + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER 4계좌 (KR 2 + US 2)</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + CORE4 Forward PAPER + Drive 백업 전용 · <a href='/dashboard'>실시간 대시보드</a></p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER 4계좌 (KR 2 + US 2)</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
