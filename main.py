@@ -29,9 +29,9 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_28_GUIDE_PAPER_INTEGRATED_PAPER'
+OPERATING_VERSION = 'OPERATING_V5_32_CORE4_FORWARD_PAPER_KRSEMI_FIXED'
 DATA_PAPER_BACKUP_ONLY = True
-RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'PAPER_92_KR', 'PAPER_4_US', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
+RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'CORE4_PAPER', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
@@ -88,9 +88,66 @@ PAPER_ONLY_MODE = True
 ENABLE_REAL_ORDER = False
 US_REAL_ORDER_ENABLED = False
 
+# ================= V5.29 CORE4 FORWARD PAPER =================
+# 실주문은 계속 완전 차단. 기존 103계좌는 코드/과거기록 보존만 하고 실행하지 않는다.
+CORE4_ENABLED = os.environ.get('CORE4_ENABLED', 'true').lower() == 'true'
+CORE4_FORWARD_START = os.environ.get('CORE4_FORWARD_START', '2026-10-05').strip()
+CORE4_START_CASH = int(float(os.environ.get('CORE4_START_CASH', '10000000')))
+CORE4_FEE_SIDE_PCT = max(0.0, float(os.environ.get('CORE4_FEE_SIDE_PCT', '0.10')))
+CORE4_ACCOUNT_IDS = ('KR_SURGE','KR_SEMI','US_SOXL','US_SURGE')
+CORE4_NAMES = {
+    'KR_SURGE':'한국 급등 V2 리더-눌림-재돌파',
+    'KR_SEMI':'한국 반도체 MA10+RSI2<=60 / SL8 / Trail20',
+    'US_SOXL':'미국 SOXL MA5+RSI2<=80',
+    'US_SURGE':'미국 급등 PREMARKET 눌림-재돌파',
+}
+
+# KR_SURGE: 현재 연구 데이터에서 가장 유력한 forward 후보.
+CORE_KR_SURGE_MIN_SCORE = float(os.environ.get('CORE_KR_SURGE_MIN_SCORE','93'))
+CORE_KR_SURGE_MIN_R10 = float(os.environ.get('CORE_KR_SURGE_MIN_R10','3.0'))
+CORE_KR_SURGE_MAX_R10 = float(os.environ.get('CORE_KR_SURGE_MAX_R10','5.5'))
+CORE_KR_SURGE_NEAR_HIGH = float(os.environ.get('CORE_KR_SURGE_NEAR_HIGH','-0.20'))
+CORE_KR_SURGE_PULLBACK_LOW = float(os.environ.get('CORE_KR_SURGE_PULLBACK_LOW','-2.0'))
+CORE_KR_SURGE_PULLBACK_HIGH = float(os.environ.get('CORE_KR_SURGE_PULLBACK_HIGH','-0.5'))
+CORE_KR_SURGE_SL = -abs(float(os.environ.get('CORE_KR_SURGE_SL','0.8')))
+CORE_KR_SURGE_PROTECT_ARM = abs(float(os.environ.get('CORE_KR_SURGE_PROTECT_ARM','1.0')))
+CORE_KR_SURGE_PROTECT_FLOOR = float(os.environ.get('CORE_KR_SURGE_PROTECT_FLOOR','0.25'))
+CORE_KR_SURGE_PARTIAL = abs(float(os.environ.get('CORE_KR_SURGE_PARTIAL','1.5')))
+CORE_KR_SURGE_TRAIL_ARM = abs(float(os.environ.get('CORE_KR_SURGE_TRAIL_ARM','2.0')))
+CORE_KR_SURGE_TRAIL_DRAW = abs(float(os.environ.get('CORE_KR_SURGE_TRAIL_DRAW','0.7')))
+
+# KR_SEMI: 반도체_한국_미국_검증_20261003.zip / swing.py에서 정확히 복원.
+# 8월(2026-08-03~08-31) 성적으로 선택된 OOS 전략 id=170:
+# ('MA10_RSI_LE60', stop=0.08, trail=0.20)
+# 9/1~10/2 고정 적용: +10.032884%, MDD -4.769152%, 완료 3거래.
+CORE_KR_SEMI_SYMBOL = '494310'
+CORE_KR_SEMI_MA = 10
+CORE_KR_SEMI_RSI_MAX = 60.0
+CORE_KR_SEMI_SL = -8.0
+CORE_KR_SEMI_TRAIL_DRAW = 20.0
+CORE_KR_SEMI_DECISION_KST = '09:03'
+CORE_KR_SEMI_VOLUME_CAP_RATIO = 0.01  # 직전 완료 1분봉 거래량의 1%
+
+# US_SOXL: 운영 브리핑과 동일한 규칙.
+CORE_US_SOXL_MA = 5
+CORE_US_SOXL_RSI_MAX = 80.0
+CORE_US_SOXL_SL = -8.0
+CORE_US_SOXL_TRAIL_DRAW = 20.0
+CORE_US_SOXL_DECISION_ET = '09:32'
+
+# US_SURGE: 기존 PREMARKET 수집/호가체결 엔진을 재사용하되 즉시 추격 금지.
+CORE_US_SURGE_PULLBACK_LOW = float(os.environ.get('CORE_US_SURGE_PULLBACK_LOW','-3.0'))
+CORE_US_SURGE_PULLBACK_HIGH = float(os.environ.get('CORE_US_SURGE_PULLBACK_HIGH','-0.5'))
+CORE_US_SURGE_SL = -abs(float(os.environ.get('CORE_US_SURGE_SL','1.2')))
+CORE_US_SURGE_PROTECT_ARM = abs(float(os.environ.get('CORE_US_SURGE_PROTECT_ARM','2.0')))
+CORE_US_SURGE_PROTECT_FLOOR = float(os.environ.get('CORE_US_SURGE_PROTECT_FLOOR','0.5'))
+CORE_US_SURGE_TRAIL_ARM = abs(float(os.environ.get('CORE_US_SURGE_TRAIL_ARM','2.5')))
+CORE_US_SURGE_TRAIL_DRAW = abs(float(os.environ.get('CORE_US_SURGE_TRAIL_DRAW','0.9')))
+# ==============================================================
+
 # V5.13: US semiconductor 3x ETF reversal PAPER LAB.
 # Existing US market-data collector is the single data source; this engine never calls Toss APIs directly.
-US_SEMI_PAPER_ENABLED = os.environ.get('US_SEMI_PAPER_ENABLED', 'true').lower() == 'true'
+US_SEMI_PAPER_ENABLED = False  # V5.29 archived: U01~U04
 US_SEMI_INTRADAY_IDS = ['U01', 'U02']
 US_SEMI_PAPER_IDS = ['U01', 'U02', 'U03', 'U04']
 US_SEMI_PAPER_NAMES = {
@@ -124,7 +181,7 @@ US_SEMI_FEE_SIDE_PCT = max(0.0, float(os.environ.get('US_SEMI_FEE_SIDE_PCT', '0.
 # V5.24: 미국 급등 전용 PAPER. 데이마켓/애프터마켓은 신규진입하지 않고,
 # PREMARKET / REGULAR을 완전히 독립 운영한다. 성공 기준은 '당일 상승률'이 아니라
 # PAPER 평균체결가 이후 +2% 도달 여부다. 기존 U01~U04는 그대로 보존한다.
-US_SURGE_PAPER_ENABLED = os.environ.get('US_SURGE_PAPER_ENABLED', 'true').lower() == 'true'
+US_SURGE_PAPER_ENABLED = False  # V5.29 archived: UP01/UP02/UR01/UR02
 US_SURGE_PAPER_IDS = ['UP01', 'UP02', 'UR01', 'UR02']
 US_SURGE_PAPER_NAMES = {
     'UP01': 'US급등 PREMARKET 하루최대2회 +2%보호/추적',
@@ -179,7 +236,7 @@ US_REPLAY_WS_THREAD = None
 
 # V5.28 자동매매 가상매매 운영가이드 v1.0 전용 비교계좌.
 # 기존 101개 PAPER 계좌와 자금/로그/전략을 완전히 분리한다.
-GUIDE_PAPER_ENABLED = os.environ.get('GUIDE_PAPER_ENABLED', 'true').lower() == 'true'
+GUIDE_PAPER_ENABLED = False  # V5.29 archived: GUIDE_KR01/GUIDE_US01
 GUIDE_PAPER_START_CASH = int(float(os.environ.get('GUIDE_PAPER_START_CASH', '10000000')))
 GUIDE_FEE_SIDE_PCT = max(0.0, float(os.environ.get('GUIDE_FEE_SIDE_PCT', '0.10')))
 GUIDE_SLIPPAGE_PCT = max(0.0, float(os.environ.get('GUIDE_SLIPPAGE_PCT', '0.05')))
@@ -226,11 +283,11 @@ US_SEMI_EXTENDED_ORDERFLOW_SEC = max(30, int(os.environ.get('US_SEMI_EXTENDED_OR
 US_SEMI_STALE_DATA_SEC = max(90, int(os.environ.get('US_SEMI_STALE_DATA_SEC', '240')))
 US_SEMI_AFTER_HOURS = os.environ.get('US_SEMI_AFTER_HOURS', 'true').lower() == 'true'
 US_SEMI_OVERNIGHT = os.environ.get('US_SEMI_OVERNIGHT', 'true').lower() == 'true'
-ENABLE_PAPER_AUTO = os.environ.get('ENABLE_PAPER_AUTO', 'true').lower() == 'true'
+ENABLE_PAPER_AUTO = False  # V5.29 archived old single-paper engine
 REFRESH_SEC = int(os.environ.get('REFRESH_SEC', '30'))
 MAX_BUY_RATIO = float(os.environ.get('MAX_BUY_RATIO', '0.70'))
 VIRTUAL_BASE_CASH = int(float(os.environ.get('VIRTUAL_BASE_CASH', '10000000')))
-ENABLE_MULTI_PAPER_AI = os.environ.get('ENABLE_MULTI_PAPER_AI', 'true').lower() == 'true'
+ENABLE_MULTI_PAPER_AI = False  # V5.29 archived 93-account engine
 MULTI_AI_START_CASH = int(float(os.environ.get('MULTI_AI_START_CASH', '10000000')))
 MULTI_AI_FEE_SIDE_PCT = float(os.environ.get('MULTI_AI_FEE_SIDE_PCT', '0.10'))
 ARC_PAPER_FEE_SIDE_PCT = ARC_PAPER_KRX_COMMISSION_PCT  # backward-compatible status field
@@ -261,7 +318,7 @@ FULL_MARKET_BLOCKED_SYMBOLS = FULL_MARKET_BLOCKED_SYMBOLS_BASE | PAPER_BLOCKED_S
 
 # V5.10: 08시 프리마켓 관찰 + 정규장 확인진입 + 재진입/연속손실/수익반납 보호 + PAPER LAB.
 # 실주문은 계속 완전 차단한다. 목표수익은 보장값이 아니라 PAPER 검증 목표다.
-PROJECT_PAPER_LAB_ENABLED = os.environ.get('PROJECT_PAPER_LAB_ENABLED', 'true').lower() == 'true'
+PROJECT_PAPER_LAB_ENABLED = os.environ.get('PROJECT_PAPER_LAB_ENABLED', 'true').lower() == 'true'  # scanner/data capture only; old G/E execution not called
 PROJECT_MONTHLY_TARGET_PCT = float(os.environ.get('PROJECT_MONTHLY_TARGET_PCT', '30.0'))
 PROJECT_DAILY_SOFT_TARGET_PCT = float(os.environ.get('PROJECT_DAILY_SOFT_TARGET_PCT', '1.4'))  # 보고/비교용, 기본 강제종료 아님
 PROJECT_DAILY_MAX_LOSS_PCT = float(os.environ.get('PROJECT_DAILY_MAX_LOSS_PCT', '-1.4'))
@@ -6610,24 +6667,9 @@ def write_logs():
     # 실계좌 포트폴리오/스윙 로그는 데이터·가상매매 전용 빌드에서 생성하지 않는다.
 
 def finalize_all_paper_accounts():
-    """매매가 없어도 92개 계좌 모두 당일 평가·상태 파일을 남긴다."""
-    ensure_multi_ai_states()
-    for ai_id in MULTI_AI_IDS:
-        _multi_ai_update(ai_id)
-        with LOCK:
-            st = dict(S['paper_ais'][ai_id])
-        state_path = multi_ai_state_path(ai_id)
-        os.makedirs(os.path.dirname(state_path), exist_ok=True)
-        state_tmp = state_path + '.tmp'
-        with open(state_tmp, 'w', encoding='utf-8') as f:
-            json.dump({'saved_at': now_text(), 'date': today(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'start_cash': int(to_float(st.get('start_cash', MULTI_AI_START_CASH))), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 6), 'realized_pl': int(to_float(st.get('realized_pl', 0))), 'peak_asset': int(to_float(st.get('peak_asset', MULTI_AI_START_CASH))), 'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6), 'trade_count': len(st.get('trades', [])) if isinstance(st.get('trades', []), list) else 0, 'positions': st.get('positions', {}), 'last_action': st.get('last_action', '초기화'), 'paper_only': True, 'real_order': False}, f, ensure_ascii=False, indent=2)
-        os.replace(state_tmp, state_path)
-        path = multi_ai_path(ai_id)
-        existing = _read_csv_rows(path)
-        if existing:
-            continue
-        row = {'time': now_text(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'action': '가상관망', 'symbol': '', 'name': '', 'price': 0, 'qty': 0, 'fee': 0, 'pl': 0, 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 4), 'reason': 'NO_TRADE_EVALUATED; last_action=' + str(st.get('last_action', '초기화')), 'partial': False, 'real_order': False}
-        write_row(path, ['time', 'ai_id', 'ai_name', 'action', 'symbol', 'name', 'price', 'qty', 'fee', 'pl', 'cash', 'asset', 'profit_rate', 'reason', 'partial', 'real_order'], row)
+    """V5.30: legacy 93-account PAPER finalization retired. CORE4 state is persisted via save_state/event logs."""
+    return True
+
 
 def _completed_kr_trading_candle(ts, session_date, session_start, session_end, now_value=None):
     """
@@ -6919,10 +6961,10 @@ def audit_kr_grade1():
         failures.append('MARKET_INDICATORS_MISSING')
     if not _read_csv_rows(investor_trading_path()):
         failures.append('INVESTOR_TRADING_MISSING')
-    missing_accounts = [x for x in MULTI_AI_IDS if not _read_csv_rows(multi_ai_path(x)) or not os.path.isfile(multi_ai_state_path(x))]
-    if missing_accounts:
-        failures.append('PAPER_ACCOUNTS_MISSING:' + ','.join(missing_accounts))
-    return {'grade': 'GRADE_1' if not failures else 'GRADE_2_PARTIAL', 'failures': failures, 'details': details, 'paper_account_files': len(MULTI_AI_IDS) - len(missing_accounts)}
+    # V5.30: 데이터 백업 등급은 시장 원본 품질로만 판정한다.
+    # 폐기된 93개 PAPER 파일 존재 여부를 GRADE_1 조건으로 사용하지 않는다.
+    return {'grade': 'GRADE_1' if not failures else 'GRADE_2_PARTIAL', 'failures': failures, 'details': details,
+            'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS)}
 
 def _kr_backup_source_files(base):
     """한국 당일 원본만 백업 대상으로 고정한다.
@@ -6996,7 +7038,7 @@ def _create_backup_zip_unlocked():
     tmp_path = os.path.join(os.path.dirname(path), f'.backup_KR_{today()}_{uuid.uuid4().hex}.tmp.zip')
     included_files = len(source_files)
     included_bytes = sum((os.path.getsize(fp) for _, fp in source_files))
-    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_symbols': ALL26_SYMBOLS, 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': quality.get('paper_account_files', 0), 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
+    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_symbols': ALL26_SYMBOLS, 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
     try:
         with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
             for arc, fp in source_files:
@@ -7407,8 +7449,12 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
                     add_failure(f"MANIFEST_GRADE_NOT_1:{manifest.get('data_quality_grade')}")
                 if list(manifest.get('data_quality_failures') or []):
                     add_failure('MANIFEST_HAS_QUALITY_FAILURES')
-                if int(to_float(manifest.get('paper_account_files', 0), 0)) != len(MULTI_AI_IDS):
-                    add_failure(f"MANIFEST_PAPER_ACCOUNT_COUNT:{manifest.get('paper_account_files')}")
+                # V5.31: 폐기된 legacy PAPER 파일 수는 백업 품질 조건이 아니다.
+                # 신규 CORE4는 state/event log로 별도 관리하며, 시장 원본 백업의 GRADE_1을 방해하지 않는다.
+                if int(to_float(manifest.get('paper_account_files', 0), 0)) != 0:
+                    add_failure(f"MANIFEST_LEGACY_PAPER_FILES_NONZERO:{manifest.get('paper_account_files')}")
+                if int(to_float(manifest.get('active_core4_accounts', 0), 0)) != len(CORE4_ACCOUNT_IDS):
+                    add_failure(f"MANIFEST_CORE4_COUNT:{manifest.get('active_core4_accounts')}")
                 safety_ok = manifest.get('paper_only_mode') is True and manifest.get('real_order_enabled') is False and (manifest.get('real_auto_buy') is False) and (manifest.get('real_auto_sell') is False)
                 result['paper_only_ok'] = safety_ok
                 if not safety_ok:
@@ -7483,29 +7529,11 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
                         add_failure(f'{sym}:METADATA_INVALID rows={len(metadata_rows)} http_ok={metadata_http_ok}')
                 details[sym] = {'ok': sym_ok, 'minute_rows': len(rows), 'first': actual_iso[0] if actual_iso else '', 'last': actual_iso[-1] if actual_iso else '', 'minute_invalid_timestamp': ts_invalid, 'minute_reverse': reverse, 'minute_duplicate': duplicate, 'minute_wrong_day': wrong_day, 'ohlcv_invalid': bad_ohlcv, 'symbol_mismatch': bad_symbol, 'ohlc_relation_invalid': bad_price_relation, 'orderbook_rows': len(orderbook_rows), 'orderbook_ok': orderbook_ok, 'trade_rows': len(trade_rows), 'trades_ok': trades_ok, 'snapshot_rows': len(snapshot_rows), 'snapshot_ok': snapshot_ok, 'daily_rows': len(daily_rows), 'daily_ok': daily_ok, 'metadata_http_ok': metadata_http_ok}
             result['symbol_count'] = passed_symbols
-            paper_csv_count = 0
-            paper_state_count = 0
-            for account_id in MULTI_AI_IDS:
-                csv_member = one_member(names, os.path.basename(multi_ai_path(account_id)), f'PAPER_CSV:{account_id}')
-                state_member = one_member(names, os.path.basename(multi_ai_state_path(account_id)), f'PAPER_STATE:{account_id}')
-                csv_rows = _zip_read_csv(z, csv_member)
-                if csv_member and csv_rows:
-                    paper_csv_count += 1
-                else:
-                    add_failure(f'PAPER_CSV_INVALID:{account_id}')
-                if state_member:
-                    try:
-                        state_obj = json.loads(z.read(state_member).decode('utf-8-sig'))
-                        if isinstance(state_obj, dict):
-                            paper_state_count += 1
-                        else:
-                            add_failure(f'PAPER_STATE_INVALID:{account_id}')
-                    except Exception:
-                        add_failure(f'PAPER_STATE_INVALID:{account_id}')
-            result['paper_csv_count'] = paper_csv_count
-            result['paper_state_count'] = paper_state_count
-            if paper_csv_count != len(MULTI_AI_IDS) or paper_state_count != len(MULTI_AI_IDS):
-                add_failure(f'PAPER_ACCOUNT_COUNT csv={paper_csv_count} state={paper_state_count} expected={len(MULTI_AI_IDS)}')
+            # V5.30: legacy PAPER 93개는 백업 필수 멤버가 아니다.
+            # 시장 원본/manifest/CRC 검증만으로 GRADE_1을 판정한다.
+            result['paper_csv_count'] = 0
+            result['paper_state_count'] = 0
+            result['active_core4_accounts'] = len(CORE4_ACCOUNT_IDS)
     except zipfile.BadZipFile:
         add_failure('ZIP_OPEN_FAILED:BAD_ZIP')
     except Exception as e:
@@ -8615,12 +8643,467 @@ def start_project_scanner_worker_once():
     _project_state()['scanner_thread_started'] = True
 
 
+
+# ================= V5.29 CORE4 ENGINE =================
+def _core4_default(aid):
+    return {
+        'id': aid, 'name': CORE4_NAMES.get(aid,aid), 'start_cash': CORE4_START_CASH,
+        'cash': float(CORE4_START_CASH), 'asset': float(CORE4_START_CASH),
+        'realized_pl': 0.0, 'profit_rate': 0.0, 'peak_asset': float(CORE4_START_CASH),
+        'mdd_pct': 0.0, 'position': None, 'pending': None, 'watch': {},
+        'trade_count': 0, 'closed_trade_count': 0, 'signal':'WAIT', 'reason':'INIT',
+        'signal_features': {}, 'last_action':'INIT', 'last_update':'',
+        'last_signal_date':'', 'entry_done_date':'', 'exit_done_date':'',
+        'paper_only': True, 'forward_start': CORE4_FORWARD_START,
+    }
+
+def ensure_core4_states():
+    with LOCK:
+        book=S.setdefault('core4_paper',{})
+        for aid in CORE4_ACCOUNT_IDS:
+            if not isinstance(book.get(aid),dict):
+                book[aid]=_core4_default(aid)
+            else:
+                base=_core4_default(aid); base.update(book[aid]); book[aid]=base
+    return S['core4_paper']
+
+def _core4_root():
+    p=os.path.join(LOG_ROOT,'core4_paper')
+    os.makedirs(p,exist_ok=True)
+    return p
+
+def _core4_log(aid, event, symbol='', price=0.0, qty=0, reason='', extra=None):
+    extra=extra or {}
+    write_row(os.path.join(_core4_root(),f'{aid}_events.csv'),
+              ['time','account','event','symbol','price','qty','reason','features','paper_only'],
+              {'time':now_text(),'account':aid,'event':event,'symbol':symbol,
+               'price':round(to_float(price),6),'qty':int(to_float(qty)),'reason':reason,
+               'features':json.dumps(extra,ensure_ascii=False,default=str)[:12000],'paper_only':True})
+
+def _core4_trade(aid, side, symbol, qty, price, fee, pnl, reason, fx=1.0):
+    write_row(os.path.join(_core4_root(),f'{aid}_trades.csv'),
+              ['time','account','side','symbol','qty','price','fx','fee_krw','realized_pl_krw','reason','paper_only'],
+              {'time':now_text(),'account':aid,'side':side,'symbol':symbol,'qty':qty,
+               'price':round(to_float(price),6),'fx':round(to_float(fx),6),
+               'fee_krw':round(to_float(fee),2),'realized_pl_krw':round(to_float(pnl),2),
+               'reason':reason,'paper_only':True})
+
+def _core4_fx(aid):
+    if aid.startswith('KR_'): return 1.0
+    fx=_us_replay_fx_usdkrw(False)
+    return fx if fx>0 else 0.0
+
+def _core4_mark(aid,symbol):
+    if aid.startswith('US_'):
+        try: return to_float(_us_surge_mark(symbol),0)
+        except Exception: return 0.0
+    return to_float(S.get('prices',{}).get(symbol,0),0)
+
+def _core4_update_asset(aid):
+    ensure_core4_states()
+    with LOCK:
+        st=S['core4_paper'][aid]; cash=to_float(st.get('cash')); pos=dict(st.get('position') or {})
+    asset=cash
+    if pos:
+        px=_core4_mark(aid,pos.get('symbol','')) or to_float(pos.get('avg'))
+        fx=_core4_fx(aid)
+        if px>0 and fx>0:
+            asset += to_int(pos.get('qty'))*px*fx
+            with LOCK:
+                live=S['core4_paper'][aid].get('position')
+                if isinstance(live,dict):
+                    live['last_price']=px
+                    live['peak_price']=max(to_float(live.get('peak_price',px)),px)
+                    live['trough_price']=min(to_float(live.get('trough_price',px)) or px,px)
+    with LOCK:
+        st=S['core4_paper'][aid]
+        st['asset']=asset
+        st['peak_asset']=max(to_float(st.get('peak_asset',CORE4_START_CASH)),asset)
+        peak=max(1.0,to_float(st.get('peak_asset')))
+        st['mdd_pct']=min(to_float(st.get('mdd_pct',0)),(asset/peak-1.0)*100.0)
+        st['profit_rate']=(asset/CORE4_START_CASH-1.0)*100.0
+        st['last_update']=now_text()
+
+def _core4_schedule(aid, action, symbol, reason, features=None, ratio=1.0, max_qty=0):
+    with LOCK:
+        st=S['core4_paper'][aid]
+        if st.get('pending'): return False
+        st['pending']={'action':action,'symbol':symbol,'reason':reason,'features':features or {},
+                       'ratio':ratio,'max_qty':int(max(0,to_float(max_qty))),'created_ts':time.time()}
+        st['signal']=action; st['reason']=reason; st['signal_features']=features or {}
+    _core4_log(aid,'SIGNAL',symbol,reason=reason,extra=features or {})
+    return True
+
+def _core4_kr_fill(symbol, side, max_cash=0.0, qty=0):
+    # 실제 호가 잔량/부분체결을 반영하는 기존 함수 재사용.
+    return simulated_orderbook_fill(
+        symbol, side, max_cash=max_cash, qty=qty,
+        max_slippage_pct=PROJECT_G_MAX_ENTRY_SLIPPAGE_PCT if side=='BUY' else PROJECT_G_MAX_EXIT_SLIPPAGE_PCT,
+        depth_usage_ratio=PROJECT_G_MAX_DEPTH_USAGE_RATIO,
+        max_levels=PROJECT_G_ORDERBOOK_LEVELS
+    )
+
+def _core4_us_fill(symbol, side, max_cash=0.0, qty=0):
+    _us_surge_fetch_snapshot(symbol)
+    return _us_surge_fill(
+        symbol, side, max_cash=max_cash, qty=qty,
+        max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT if side=='BUY' else US_SURGE_MAX_SELL_SLIPPAGE_PCT
+    )
+
+def _core4_execute_pending(aid):
+    # 신호와 같은 루프에서 체결하지 않는다.
+    with LOCK:
+        st=S['core4_paper'][aid]; p=dict(st.get('pending') or {}); pos=dict(st.get('position') or {}); cash=to_float(st.get('cash'))
+    if not p: return False
+    if time.time()-to_float(p.get('created_ts')) < max(2.0,min(10.0,REFRESH_SEC/2.0)):
+        return False
+    action=p.get('action'); sym=p.get('symbol',''); fx=_core4_fx(aid)
+    if fx<=0: return False
+    fee_rate=CORE4_FEE_SIDE_PCT/100.0
+
+    if action=='BUY' and not pos:
+        if aid.startswith('US_'):
+            fill=_core4_us_fill(sym,'BUY',max_cash=(cash/fx))
+            if not fill.get('ok') or to_float(fill.get('fill_ratio')) < US_SURGE_MIN_FILL_RATIO:
+                with LOCK:
+                    st=S['core4_paper'][aid]; st['pending']=None; st['signal']='WAIT'; st['reason']='LIQUIDITY_OR_SLIPPAGE'
+                _core4_log(aid,'BLOCK',sym,reason='LIQUIDITY_OR_SLIPPAGE',extra=fill); return False
+            qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])*fx
+        else:
+            buy_cash=cash
+            max_qty=to_int(p.get('max_qty',0))
+            if max_qty>0:
+                mark=_core4_mark(aid,sym)
+                if mark>0:
+                    buy_cash=min(cash, max_qty*mark*1.02)
+            fill=_core4_kr_fill(sym,'BUY',max_cash=buy_cash)
+            if max_qty>0 and fill.get('ok') and to_int(fill.get('qty'))>max_qty:
+                # depth simulator의 목표수량은 현금기준이므로 정확한 1% cap을 다시 강제한다.
+                fill=_core4_kr_fill(sym,'BUY',max_cash=max_qty*max(1.0,to_float(fill.get('best_price',mark))))
+            if not fill.get('ok') or to_float(fill.get('fill_ratio')) < PROJECT_G_MIN_FILL_RATIO:
+                with LOCK:
+                    st=S['core4_paper'][aid]; st['pending']=None; st['signal']='WAIT'; st['reason']='LIQUIDITY_OR_SLIPPAGE'
+                _core4_log(aid,'BLOCK',sym,reason='LIQUIDITY_OR_SLIPPAGE',extra=fill); return False
+            qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])
+        fee=gross*fee_rate; total=gross+fee
+        if qty<=0 or total>cash: return False
+        with LOCK:
+            st=S['core4_paper'][aid]
+            st['cash']=cash-total
+            st['position']={'symbol':sym,'qty':qty,'avg':px,'entry_fee':fee,'fx_entry':fx,
+                            'entry_time':now_text(),'entry_ts':time.time(),'peak_price':px,'trough_price':px,
+                            'partial_taken':False,'protected':False,'peak_completed_close':px,'entry_features':p.get('features',{})}
+            st['pending']=None; st['trade_count']=to_int(st.get('trade_count'))+1
+            st['signal']='HOLD'; st['reason']='ENTRY_FILLED'; st['last_action']=f'BUY {sym} {qty}@{px}'
+            st['entry_done_date']=today()
+        _core4_trade(aid,'BUY',sym,qty,px,fee,0,p.get('reason',''),fx); return True
+
+    if action in ('SELL','PARTIAL_SELL') and pos:
+        held=to_int(pos.get('qty')); ratio=max(0.01,min(1.0,to_float(p.get('ratio',1.0))))
+        req=held if action=='SELL' else max(1,int(held*ratio))
+        if aid.startswith('US_'):
+            fill=_core4_us_fill(sym,'SELL',qty=req)
+            if not fill.get('ok'): return False
+            qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])*fx
+        else:
+            fill=_core4_kr_fill(sym,'SELL',qty=req)
+            if not fill.get('ok'): return False
+            qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])
+        fee=gross*fee_rate
+        entry_fee=to_float(pos.get('entry_fee'))*(qty/max(1,held))
+        cost=qty*to_float(pos.get('avg'))*to_float(pos.get('fx_entry',fx))
+        pnl=gross-fee-cost-entry_fee
+        remain=held-qty
+        with LOCK:
+            st=S['core4_paper'][aid]
+            st['cash']=to_float(st.get('cash'))+gross-fee
+            st['realized_pl']=to_float(st.get('realized_pl'))+pnl
+            if remain<=0:
+                st['position']=None; st['closed_trade_count']=to_int(st.get('closed_trade_count'))+1
+                st['exit_done_date']=today()
+            else:
+                st['position']['qty']=remain
+                st['position']['entry_fee']=max(0.0,to_float(st['position'].get('entry_fee'))-entry_fee)
+                st['position']['partial_taken']=True
+            st['pending']=None; st['signal']='WAIT' if remain<=0 else 'HOLD'
+            st['reason']=p.get('reason',''); st['last_action']=f'{action} {sym} {qty}@{px}'
+        _core4_trade(aid,action,sym,qty,px,fee,pnl,p.get('reason',''),fx); return True
+    return False
+
+def _core4_rsi2_ewm(closes):
+    if len(closes)<3: return None
+    gains=[]; losses=[]
+    for a,b in zip(closes[:-1],closes[1:]):
+        d=b-a; gains.append(max(d,0.0)); losses.append(max(-d,0.0))
+    ag=gains[0]; al=losses[0]
+    for g,l in zip(gains[1:],losses[1:]):
+        ag=0.5*g+0.5*ag; al=0.5*l+0.5*al
+    if al<=0: return 100.0
+    rs=ag/al
+    return 100.0-100.0/(1.0+rs)
+
+def _core4_soxl_signal(trade_date):
+    rows=_guide_fetch_completed_daily_closes('SOXL',trade_date,100)
+    closes=[to_float(x[1]) for x in rows if to_float(x[1])>0]
+    if len(closes)<6:
+        return {'ok':False,'signal':'WAIT','reason':'DATA_MISSING','rows':len(closes),'retryable':True}
+    prev=closes[-1]; ma5=sum(closes[-5:])/5.0; rsi=_core4_rsi2_ewm(closes)
+    buy=prev>ma5 and rsi is not None and rsi<=CORE_US_SOXL_RSI_MAX
+    return {'ok':True,'signal':'BUY' if buy else 'WAIT',
+            'reason':'MA5_RSI_OK' if buy else ('RSI_TOO_HIGH' if prev>ma5 and rsi>CORE_US_SOXL_RSI_MAX else 'TREND_FILTER_FAIL'),
+            'prev_close':prev,'ma5':ma5,'rsi2':rsi,'source_date':rows[-1][0],'retryable':False}
+
+def _core4_manage_us_soxl():
+    aid='US_SOXL'; et=datetime.now(pytz.timezone('America/New_York'))
+    trade_date=et.strftime('%Y-%m-%d')
+    f=_core4_soxl_signal(trade_date)
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {})
+        st['signal_features']=f
+    # 일봉 조회 실패는 signal_date를 확정하지 않음 -> 같은 날 재시도.
+    if not f.get('ok'):
+        with LOCK:
+            S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','DATA_MISSING')
+        return
+    if pos:
+        price=_core4_mark(aid,'SOXL'); avg=to_float(pos.get('avg')); peak=max(to_float(pos.get('peak_price',avg)),price)
+        prof=pct(price,avg) if price>0 and avg>0 else 0.0; draw=pct(price,peak) if price>0 and peak>0 else 0.0
+        if prof<=CORE_US_SOXL_SL:
+            _core4_schedule(aid,'SELL','SOXL','HARD_SL_8',{'profit_pct':prof}); return
+        if draw<=-CORE_US_SOXL_TRAIL_DRAW:
+            _core4_schedule(aid,'SELL','SOXL','TRAIL_20',{'profit_pct':prof,'draw_pct':draw}); return
+    hhmm=et.strftime('%H:%M')
+    if et.weekday()<5 and CORE_US_SOXL_DECISION_ET<=hhmm<'16:00':
+        with LOCK:
+            st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); entered=st.get('entry_done_date')==trade_date; exited=st.get('exit_done_date')==trade_date
+        if pos and f['signal']!='BUY':
+            _core4_schedule(aid,'SELL','SOXL','DAILY_CONDITION_OFF',f)
+        elif (not pos) and f['signal']=='BUY' and not entered and not exited:
+            _core4_schedule(aid,'BUY','SOXL','DAILY_ENTRY_0932',f)
+        else:
+            with LOCK:
+                S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'
+                S['core4_paper'][aid]['reason']=f.get('reason','WAIT')
+
+def _core4_latest_kr_completed_rows(symbol, n=6):
+    rows=_read_csv_rows(candle_1m_path(symbol))
+    out=[]
+    now_min=now_kst().replace(second=0,microsecond=0)
+    for r in rows:
+        dt=_parse_iso(r.get('timestamp'))
+        if not dt: continue
+        if dt >= now_min: continue
+        if dt.astimezone(KST).date().isoformat()!=today(): continue
+        out.append(r)
+    return out[-max(1,n):]
+
+def _core4_kr_semi_signal(trade_date):
+    rows=_guide_fetch_completed_daily_closes(CORE_KR_SEMI_SYMBOL,trade_date,100)
+    closes=[to_float(x[1]) for x in rows if to_float(x[1])>0]
+    if len(closes)<max(CORE_KR_SEMI_MA,3):
+        return {'ok':False,'signal':'WAIT','reason':'DATA_MISSING','rows':len(closes),'retryable':True}
+    prev=closes[-1]
+    ma=sum(closes[-CORE_KR_SEMI_MA:])/CORE_KR_SEMI_MA
+    rsi=_core4_rsi2_ewm(closes)
+    eligible=prev>ma and rsi is not None and rsi<=CORE_KR_SEMI_RSI_MAX
+    return {'ok':True,'signal':'BUY' if eligible else 'WAIT',
+            'reason':'MA10_RSI2_LE60' if eligible else ('RSI_TOO_HIGH' if prev>ma and rsi is not None and rsi>CORE_KR_SEMI_RSI_MAX else 'TREND_FILTER_FAIL'),
+            'prev_close':prev,'ma10':ma,'rsi2':rsi,'source_date':rows[-1][0] if rows else '',
+            'config_id':170,'stop_pct':8.0,'trail_pct':20.0,'volume_cap_ratio':CORE_KR_SEMI_VOLUME_CAP_RATIO}
+
+def _core4_manage_kr_semi():
+    aid='KR_SEMI'; trade_date=today()
+    f=_core4_kr_semi_signal(trade_date)
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); st['signal_features']=f
+    # 일봉 데이터 실패는 같은 날 계속 재시도한다.
+    if not f.get('ok'):
+        with LOCK:
+            S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','DATA_MISSING')
+        return
+
+    # 보유 중: 완료된 1분봉 close로 -8% stop / 최고 완료 close 대비 -20% trail 신호.
+    if pos:
+        rows=_core4_latest_kr_completed_rows(CORE_KR_SEMI_SYMBOL,8)
+        if rows:
+            px=to_float(rows[-1].get('close')); avg=to_float(pos.get('avg'))
+            with LOCK:
+                live=S['core4_paper'][aid].get('position')
+                if live and px>0:
+                    live['peak_completed_close']=max(to_float(live.get('peak_completed_close',avg)),px)
+                    peak=to_float(live.get('peak_completed_close',avg))
+                else:
+                    peak=avg
+            prof=pct(px,avg) if px>0 and avg>0 else 0.0
+            draw=pct(px,peak) if px>0 and peak>0 else 0.0
+            if prof<=CORE_KR_SEMI_SL:
+                _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_HARD_SL_8',{'completed_close':px,'profit_pct':prof}); return
+            if draw<=-CORE_KR_SEMI_TRAIL_DRAW:
+                _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_TRAIL_20',{'completed_close':px,'draw_pct':draw}); return
+
+    # swing.py는 전일 완료 일봉 신호를 사용하고 한국 3번째 거래분봉 open(09:03)에 진입/조건해제 청산.
+    if now_kst().strftime('%H:%M') < CORE_KR_SEMI_DECISION_KST:
+        with LOCK:
+            S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'; S['core4_paper'][aid]['reason']='WAIT_0903_KST'
+        return
+
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); entered=st.get('entry_done_date')==trade_date; exited=st.get('exit_done_date')==trade_date
+    if pos and f.get('signal')!='BUY':
+        _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_DAILY_CONDITION_OFF',f); return
+    if (not pos) and f.get('signal')=='BUY' and not entered and not exited:
+        rows=_core4_latest_kr_completed_rows(CORE_KR_SEMI_SYMBOL,4)
+        # 09:03 진입 시 직전 완료봉(09:02)의 거래량 1%를 수량 상한으로 사용.
+        prev_vol=to_float(rows[-1].get('volume')) if rows else 0.0
+        max_qty=max(0,int(prev_vol*CORE_KR_SEMI_VOLUME_CAP_RATIO))
+        if max_qty<=0:
+            with LOCK:
+                S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='PREV_MINUTE_VOLUME_MISSING'
+            return
+        ff=dict(f); ff['prev_completed_1m_volume']=prev_vol; ff['max_qty_1pct']=max_qty
+        _core4_schedule(aid,'BUY',CORE_KR_SEMI_SYMBOL,'KR_SEMI_ENTRY_0903',ff,max_qty=max_qty); return
+    with LOCK:
+        S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','WAIT')
+
+
+def _core4_manage_kr_surge():
+    aid='KR_SURGE'
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); watch=dict(st.get('watch') or {})
+    if pos:
+        px=_core4_mark(aid,pos['symbol']); avg=to_float(pos.get('avg')); peak=max(to_float(pos.get('peak_price',avg)),px)
+        prof=pct(px,avg) if px>0 and avg>0 else 0.0; draw=pct(px,peak) if px>0 and peak>0 else 0.0
+        if prof>=CORE_KR_SURGE_PROTECT_ARM:
+            with LOCK:
+                if S['core4_paper'][aid].get('position'): S['core4_paper'][aid]['position']['protected']=True
+        protected=bool(S['core4_paper'][aid].get('position',{}).get('protected'))
+        partial=bool(S['core4_paper'][aid].get('position',{}).get('partial_taken'))
+        if prof<=CORE_KR_SURGE_SL: _core4_schedule(aid,'SELL',pos['symbol'],'HARD_SL',{'profit_pct':prof})
+        elif (not partial) and prof>=CORE_KR_SURGE_PARTIAL: _core4_schedule(aid,'PARTIAL_SELL',pos['symbol'],'PARTIAL_TP',{'profit_pct':prof},0.5)
+        elif protected and prof<=CORE_KR_SURGE_PROTECT_FLOOR: _core4_schedule(aid,'SELL',pos['symbol'],'PROFIT_PROTECT',{'profit_pct':prof})
+        elif prof>=CORE_KR_SURGE_TRAIL_ARM and draw<=-CORE_KR_SURGE_TRAIL_DRAW: _core4_schedule(aid,'SELL',pos['symbol'],'TRAIL',{'profit_pct':prof,'draw_pct':draw})
+        elif now_kst().strftime('%H:%M')>='15:10': _core4_schedule(aid,'SELL',pos['symbol'],'EOD_1510')
+        return
+    ranked=list(S.setdefault('full_market',{}).get('ranked',[]))[:50]
+    for base_score,sym,q in ranked:
+        score,r3,r10,fh,fl,sigtype,feat=_project_candidate_score(base_score,sym,q)
+        px=to_float(q.get('price')); 
+        if px<=0: continue
+        w=watch.get(sym,{})
+        if score>=CORE_KR_SURGE_MIN_SCORE and CORE_KR_SURGE_MIN_R10<=r10<=CORE_KR_SURGE_MAX_R10 and fh>=CORE_KR_SURGE_NEAR_HIGH:
+            if not w: w={'anchor_high':px,'pullback_seen':False,'created':now_text()}
+            w['anchor_high']=max(to_float(w.get('anchor_high',px)),px)
+        anchor=to_float(w.get('anchor_high'))
+        if anchor>0:
+            dd=pct(px,anchor)
+            if CORE_KR_SURGE_PULLBACK_LOW<=dd<=CORE_KR_SURGE_PULLBACK_HIGH: w['pullback_seen']=True
+            if w.get('pullback_seen') and px>=anchor and r3>0:
+                with LOCK: S['core4_paper'][aid]['watch']=watch
+                _core4_schedule(aid,'BUY',sym,'LEADER_PULLBACK_REBREAK',
+                                {'score':score,'r3':r3,'r10':r10,'from_high':fh,'anchor_high':anchor,'signal_type':sigtype}); return
+        watch[sym]=w
+    with LOCK:
+        S['core4_paper'][aid]['watch']=dict(list(watch.items())[-80:])
+        S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='NO_VALID_REBREAK'
+
+def _core4_manage_us_surge():
+    aid='US_SURGE'; session=us_market_session_status()[0]
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); watch=dict(st.get('watch') or {})
+    if pos:
+        px=_core4_mark(aid,pos['symbol']); avg=to_float(pos.get('avg')); peak=max(to_float(pos.get('peak_price',avg)),px)
+        prof=pct(px,avg) if px>0 and avg>0 else 0.0; draw=pct(px,peak) if px>0 and peak>0 else 0.0
+        if prof>=CORE_US_SURGE_PROTECT_ARM:
+            with LOCK:
+                if S['core4_paper'][aid].get('position'): S['core4_paper'][aid]['position']['protected']=True
+        protected=bool(S['core4_paper'][aid].get('position',{}).get('protected'))
+        if prof<=CORE_US_SURGE_SL: _core4_schedule(aid,'SELL',pos['symbol'],'HARD_SL',{'profit_pct':prof})
+        elif protected and prof<=CORE_US_SURGE_PROTECT_FLOOR: _core4_schedule(aid,'SELL',pos['symbol'],'PROFIT_PROTECT',{'profit_pct':prof})
+        elif prof>=CORE_US_SURGE_TRAIL_ARM and draw<=-CORE_US_SURGE_TRAIL_DRAW: _core4_schedule(aid,'SELL',pos['symbol'],'TRAIL',{'profit_pct':prof,'draw_pct':draw})
+        return
+    if session!='PREMARKET':
+        with LOCK:
+            S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='PREMARKET_ONLY'
+        return
+    scan=S.setdefault('us_surge_scan',{})
+    ranked=list(scan.get('ranked') or []) if scan.get('session')=='PREMARKET' else []
+    if not ranked:
+        for meta in _us_surge_rankings('PREMARKET'):
+            f=_us_surge_features(meta['symbol'],'PREMARKET',meta)
+            row=dict(meta); row.update(f); ranked.append(row)
+        ranked.sort(key=lambda x:(bool(x.get('ok')),to_float(x.get('score'))),reverse=True)
+        scan['ranked']=ranked; scan['session']='PREMARKET'; scan['last_scan_ts']=time.time()
+    for f in ranked:
+        if not f.get('ok'): continue
+        sym=f.get('symbol',''); px=to_float(f.get('price')); w=watch.get(sym,{})
+        if not w: w={'anchor_high':px,'pullback_seen':False,'created':now_text()}
+        w['anchor_high']=max(to_float(w.get('anchor_high',px)),px)
+        anchor=to_float(w.get('anchor_high')); dd=pct(px,anchor) if anchor>0 else 0.0
+        if CORE_US_SURGE_PULLBACK_LOW<=dd<=CORE_US_SURGE_PULLBACK_HIGH: w['pullback_seen']=True
+        if w.get('pullback_seen') and px>=anchor and to_float(f.get('r3'))>0:
+            with LOCK: S['core4_paper'][aid]['watch']=watch
+            _core4_schedule(aid,'BUY',sym,'PREMARKET_PULLBACK_REBREAK',f); return
+        watch[sym]=w
+    with LOCK:
+        S['core4_paper'][aid]['watch']=dict(list(watch.items())[-80:])
+        S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='NO_VALID_PREMARKET_REBREAK'
+
+def run_core4_paper():
+    if not CORE4_ENABLED: return
+    ensure_core4_states()
+    # pending 먼저 처리 -> 신호 루프와 체결 루프 분리.
+    for aid in CORE4_ACCOUNT_IDS:
+        try: _core4_execute_pending(aid)
+        except Exception as e: set_error(f'{aid} fill 오류: {e}')
+    if today()<CORE4_FORWARD_START:
+        for aid in CORE4_ACCOUNT_IDS:
+            with LOCK:
+                S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='FORWARD_NOT_STARTED'
+        return
+    try:
+        kr_open,_=regular_market_open_now()
+    except Exception:
+        kr_open=False
+    if kr_open:
+        try: _core4_manage_kr_surge()
+        except Exception as e: set_error(f'KR_SURGE 오류: {e}')
+        try: _core4_manage_kr_semi()
+        except Exception as e: set_error(f'KR_SEMI 오류: {e}')
+    try: _core4_manage_us_soxl()
+    except Exception as e: set_error(f'US_SOXL 오류: {e}')
+    try: _core4_manage_us_surge()
+    except Exception as e: set_error(f'US_SURGE 오류: {e}')
+    for aid in CORE4_ACCOUNT_IDS:
+        try: _core4_update_asset(aid)
+        except Exception as e: set_error(f'{aid} asset 오류: {e}')
+    save_state()
+
+def core4_summary_snapshot():
+    ensure_core4_states()
+    rows=[]
+    for aid in CORE4_ACCOUNT_IDS:
+        _core4_update_asset(aid)
+        with LOCK: st=json.loads(json.dumps(S['core4_paper'][aid],ensure_ascii=False,default=str))
+        pos=st.get('position')
+        rows.append({'id':aid,'name':CORE4_NAMES[aid],'market':'KR' if aid.startswith('KR_') else 'US',
+                     'start_cash':CORE4_START_CASH,'cash':round(to_float(st.get('cash')),2),
+                     'asset':round(to_float(st.get('asset')),2),'profit_rate':round(to_float(st.get('profit_rate')),6),
+                     'realized_pl':round(to_float(st.get('realized_pl')),2),'mdd_pct':round(to_float(st.get('mdd_pct')),6),
+                     'trade_count':to_int(st.get('trade_count')),'closed_trade_count':to_int(st.get('closed_trade_count')),
+                     'positions':{} if not pos else {pos.get('symbol','POSITION'):pos},
+                     'position_count':0 if not pos else 1,'signal':st.get('signal'),'reason':st.get('reason'),
+                     'signal_features':st.get('signal_features',{}),'last_action':st.get('last_action'),
+                     'paper_only':True,'forward_start':CORE4_FORWARD_START})
+    rows.sort(key=lambda x:to_float(x.get('profit_rate')),reverse=True)
+    for i,r in enumerate(rows,1): r['rank']=i
+    return {'ok':True,'version':OPERATING_VERSION,'generated_at_kst':now_text(),'paper_only':True,
+            'real_order_enabled':False,'account_count':4,'ranking':rows}
+# ============================================================
+
 def loop():
     """DATA+PAPER ONLY 핵심 루프: KR/US 데이터 수집 + 가상매매 + 원본보존/백업만 수행한다. 실주문/추천 실행 없음."""
     load_state()
-    ensure_multi_ai_states()
-    ensure_us_semi_paper_states()
-    ensure_guide_paper_states()
+    ensure_core4_states()
     save_state()
     counter = 0
     initialized = False
@@ -8644,8 +9127,7 @@ def loop():
                             refresh_us_market_calendar(False)
                             capture_us_market_data()
                             _us_replay_dynamic_capture()
-                        run_us_semi_paper()
-                        run_guide_paper()
+                        run_core4_paper()
                     except Exception as e:
                         set_error(f'주말 미국 데이터/PAPER 오류: {e}')
                     try:
@@ -8683,29 +9165,18 @@ def loop():
             # V5.26: KR/US 원본 수집은 독립 worker가 담당한다.
             # 메인 루프는 PAPER 판단/리포트/백업만 수행해 수집 중단 전파를 막는다.
             try:
-                run_us_semi_paper()
+                run_core4_paper()
             except Exception as e:
-                set_error(f'미국 PAPER 오류: {e}')
-            try:
-                run_guide_paper()
-            except Exception as e:
-                set_error(f'운영가이드 PAPER 오류: {e}')
+                set_error(f'CORE4 PAPER 오류: {e}')
             calc_wma_all()
             calc_scores()
             write_logs()
-            update_paper_asset()
+            # V5.29 기존 93계좌/구 LAB는 실행하지 않는다.
+            # full-market scanner와 원본 수집만 CORE4 후보데이터용으로 유지한다.
             try:
-                gate_ok, _ = market_safety_gate()
-                if gate_ok:
-                    run_paper_ai_if_enabled()
-                    run_multi_paper_ais()
-                    if PROJECT_PAPER_LAB_ENABLED:
-                        try:
-                            project_capture_market_snapshot(False)
-                        except Exception as e:
-                            set_error(f'PROJECT 연구스냅샷 오류: {e}')
+                project_capture_market_snapshot(False)
             except Exception as e:
-                set_error(f'가상매매 오류: {e}')
+                set_error(f'PROJECT 연구스냅샷 오류: {e}')
             try:
                 generate_project_daily_report(False)
             except Exception as e:
@@ -9509,6 +9980,11 @@ def paper_summary_snapshot():
 
 
 
+# V5.29 public PAPER summary: CORE4 only.
+def paper_summary_snapshot():
+    return core4_summary_snapshot()
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -9527,7 +10003,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.result_page('Google Drive OAuth 승인 실패', str(e))
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': ENABLE_PAPER_AUTO, 'paper_accounts': len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS), 'kr_paper_accounts': len(MULTI_AI_IDS) + 1, 'us_paper_accounts': len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + 1, 'paper_start_cash_each': MULTI_AI_START_CASH, 'guide_paper_enabled': GUIDE_PAPER_ENABLED, 'guide_paper': S.get('guide_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 4, 'kr_paper_accounts': 2, 'us_paper_accounts': 2, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -9582,7 +10058,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + 가상매매 + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS)}계좌 (KR {len(MULTI_AI_IDS)+1} + US {len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)+1})</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + CORE4 Forward PAPER + Drive 백업 전용</p><p>KR {len(ALL26_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER 4계좌 (KR 2 + US 2)</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
@@ -9590,6 +10066,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        return self.json_response({'ok': False, 'error': 'POST_DISABLED_CORE4_PAPER_ONLY'}, status=405)
         if path != '/arcpro_webhook':
             return self.json_response({'ok': False, 'error': 'POST_DISABLED_PAPER_ONLY'}, status=405)
         # Secret is required in production. TradingView can place it in the webhook URL query.
@@ -9736,7 +10213,7 @@ def acquire_single_instance_lock():
 def print_core_selfcheck():
     print('[CORE DATA/PAPER/BACKUP FROZEN]', flush=True)
     print('version=', OPERATING_VERSION, flush=True)
-    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'paper accounts=', len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS), '(KR=', len(MULTI_AI_IDS)+1, 'US=', len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)+1, ')', flush=True)
+    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'ACTIVE PAPER=', len(CORE4_ACCOUNT_IDS), CORE4_ACCOUNT_IDS, flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
     print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
     print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
@@ -9774,16 +10251,12 @@ def print_core_selfcheck():
         raise RuntimeError(f'KR 종목 수 오류: {len(ALL26_SYMBOLS)}')
     if len(US_SYMBOLS) != 14:
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
-    if len(MULTI_AI_IDS) != 93:
-        raise RuntimeError(f'KR 가상계좌 수 오류: {len(MULTI_AI_IDS)}')
-    if len(US_SEMI_PAPER_IDS) != 4:
-        raise RuntimeError(f'US U계열 가상계좌 수 오류: {len(US_SEMI_PAPER_IDS)}')
-    if len(US_SURGE_PAPER_IDS) != 4:
-        raise RuntimeError(f'US 급등 가상계좌 수 오류: {len(US_SURGE_PAPER_IDS)}')
-    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) != 101:
-        raise RuntimeError(f'기존 PAPER 계좌 수 오류: {len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS)}')
-    if len(MULTI_AI_IDS) + len(US_SEMI_PAPER_IDS) + len(US_SURGE_PAPER_IDS) + len(GUIDE_ACCOUNT_IDS) != 103:
-        raise RuntimeError('운영가이드 포함 전체 PAPER 계좌 수 오류')
+    if len(CORE4_ACCOUNT_IDS) != 4:
+        raise RuntimeError(f'CORE4 계좌 수 오류: {len(CORE4_ACCOUNT_IDS)}')
+    if tuple(CORE4_ACCOUNT_IDS) != ('KR_SURGE','KR_SEMI','US_SOXL','US_SURGE'):
+        raise RuntimeError(f'CORE4 계좌 구성 오류: {CORE4_ACCOUNT_IDS}')
+    if ENABLE_MULTI_PAPER_AI or ENABLE_PAPER_AUTO or US_SEMI_PAPER_ENABLED or US_SURGE_PAPER_ENABLED or GUIDE_PAPER_ENABLED:
+        raise RuntimeError('legacy PAPER 실행 플래그가 켜져 있습니다.')
 if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
