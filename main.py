@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_33_CORE4_PAPER_WITH_DASHBOARD'
+OPERATING_VERSION = 'OPERATING_V5_38_CORE4_PENDING_SESSION_FIX'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'CORE4_PAPER', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -759,15 +759,6 @@ def _us_calendar_info_from_payload(payload, key='today'):
         'regular_end': str(regular.get('endTime', '') or '') if regular else '',
     }
 
-def get_us_market_calendar_for_date(query_date):
-    """토스 공식 US market-calendar를 지정 거래일로 조회한다. 과거 재복구에도 사용한다."""
-    code, data = api_get('/api/v1/market-calendar/US', params={'date': str(query_date)}, timeout=8)
-    if code != 200:
-        return ({}, code)
-    cal = _us_calendar_info_from_payload(data, 'today')
-    if cal.get('date') != str(query_date):
-        return ({}, code)
-    return (cal, code)
 
 def _latest_completed_us_calendar(now_value=None):
     """현재 시각 기준 가장 최근 완료된 미국 정규장을 공식 캘린더로 결정한다."""
@@ -926,31 +917,6 @@ def us_regular_market_open_now():
         return (False, 'US_MARKET_CLOSED')
     return (start <= now_kst() <= end, 'OK' if start <= now_kst() <= end else 'OUTSIDE_US_REGULAR')
 
-def market_safety_gate(require_orderbook_symbol=None):
-    """가상/실거래 공통 차단. 휴장, 장외, 오래된 가격/호가를 정확히 해당 종목 기준으로 거부한다."""
-    if not ENABLE_MARKET_SAFETY_GATE:
-        return (True, 'GATE_DISABLED')
-    state = S.setdefault('market_data_capture', {})
-    ok, reason = regular_market_open_now()
-    if not ok:
-        state['gate_ok'], state['gate_reason'] = (False, reason)
-        return (False, reason)
-    price_ts = state.get('price_timestamp', {})
-    check_symbols = [require_orderbook_symbol] if require_orderbook_symbol else MARKET_DATA_CORE_SYMBOLS[:2]
-    for sym in [x for x in check_symbols if x]:
-        if data_age_seconds(price_ts.get(sym)) > MAX_PRICE_AGE_SEC or to_float(S.setdefault('prices', {}).get(sym, 0)) <= 0:
-            state['gate_ok'], state['gate_reason'] = (False, 'STALE_PRICE')
-            return (False, 'STALE_PRICE')
-    if require_orderbook_symbol and REQUIRE_FRESH_ORDERBOOK_FOR_PAPER:
-        ob = state.get('latest_orderbook', {}).get(require_orderbook_symbol, {})
-        if data_age_seconds(ob.get('timestamp')) > MAX_ORDERBOOK_AGE_SEC:
-            state['gate_ok'], state['gate_reason'] = (False, 'STALE_ORDERBOOK')
-            return (False, 'STALE_ORDERBOOK')
-        if to_float(ob.get('best_ask', 0)) <= 0 or to_float(ob.get('best_bid', 0)) <= 0:
-            state['gate_ok'], state['gate_reason'] = (False, 'INVALID_ORDERBOOK')
-            return (False, 'INVALID_ORDERBOOK')
-    state['gate_ok'], state['gate_reason'] = (True, 'OK')
-    return (True, 'OK')
 
 def set_status_once(key, msg, cooldown=300):
     with LOCK:
@@ -968,8 +934,6 @@ def day_dir():
 def summary_path():
     return os.path.join(day_dir(), f'summary_{today()}.csv')
 
-def paper_path():
-    return os.path.join(day_dir(), f'paper_trades_{today()}.csv')
 
 def alert_log_path():
     return os.path.join(day_dir(), f'alert_log_{today()}.csv')
@@ -994,11 +958,7 @@ def project_research_dir():
 def project_market_snapshot_path():
     return os.path.join(project_research_dir(), f'full_market_1m_{today()}.csv')
 
-def project_candidate_event_path():
-    return os.path.join(project_research_dir(), f'candidate_events_{today()}.csv')
 
-def project_orderbook_snapshot_path():
-    return os.path.join(project_research_dir(), f'project_orderbook_{today()}.csv')
 
 def project_daily_summary_path():
     return os.path.join(project_research_dir(), f'project_summary_{today()}.json')
@@ -1033,8 +993,6 @@ def candle_daily_path(sym):
 def stock_metadata_path(sym):
     return os.path.join(market_data_dir(), f'stock_metadata_{sym}_{today()}.csv')
 
-def multi_ai_state_path(ai_id):
-    return os.path.join(day_dir(), 'paper_accounts', f'paper_account_state_{ai_id}_{today()}.json')
 
 def data_quality_audit_path():
     return os.path.join(market_data_dir(), f'data_quality_audit_{today()}.csv')
@@ -1125,68 +1083,7 @@ def _us_replay_reset_if_new_day():
         st['last_dynamic_orderflow_ts'] = 0.0
         st['last_seen_epoch'] = time.time()
 
-def _us_replay_event_id(sym, session, event_time=None):
-    event_time = event_time or now_kst().isoformat()
-    raw = f'{us_trade_date_from_calendar()}|{session}|{sym}|{event_time}'
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]
 
-def _us_replay_register_candidate(f, meta=None):
-    """후보 발견 즉시 동적 추적 대상 등록. 후보는 해당 미국 거래일 끝까지 유지한다."""
-    if not US_REPLAY_DATA_ENABLED:
-        return ''
-    _us_replay_reset_if_new_day()
-    st = _us_replay_state()
-    sym = str(f.get('symbol') or f.get('candidate') or '').upper().strip()
-    if not sym:
-        return ''
-    session = str(f.get('session') or '')
-    event_time = now_kst().isoformat()
-    event_id = _us_replay_event_id(sym, session, event_time)
-    watch = st.setdefault('dynamic_watch', {})
-    if sym not in watch and len(watch) >= US_REPLAY_DYNAMIC_MAX_SYMBOLS:
-        # 가장 오래된 비보유 후보부터 밀어내되, 계좌 보유종목은 절대 제거하지 않는다.
-        held = {str((x.get('position') or {}).get('symbol','')).upper()
-                for x in S.get('us_surge_paper', {}).values() if isinstance(x, dict)}
-        removable = sorted(
-            ((k, to_float(v.get('first_seen_epoch'))) for k,v in watch.items()
-             if k not in held and isinstance(v, dict)),
-            key=lambda x: x[1]
-        )
-        if removable:
-            watch.pop(removable[0][0], None)
-    rec = watch.setdefault(sym, {
-        'symbol':sym, 'first_seen':event_time, 'first_seen_epoch':time.time(),
-        'session':session, 'event_ids':[]
-    })
-    rec['last_seen'] = event_time
-    rec['session'] = session
-    rec.setdefault('event_ids', []).append(event_id)
-    rec['event_ids'] = rec['event_ids'][-50:]
-    out = st.setdefault('outcomes', {}).setdefault(event_id, {
-        'event_id':event_id,'symbol':sym,'session':session,'signal_time':event_time,
-        'signal_price':to_float(f.get('price')),'max_price':to_float(f.get('price')),
-        'min_price':to_float(f.get('price')),'mfe_pct':0.0,'mae_pct':0.0,'last_price':to_float(f.get('price')),
-        'last_update':''
-    })
-    # 당시 판단 데이터와 사후 outcome은 파일을 분리한다.
-    row = {
-        'event_id':event_id,'saved_at':now_text(),'signal_time':event_time,'session':session,'symbol':sym,
-        'price':to_float(f.get('price')),'day_change_pct':to_float(f.get('day_change_pct')),
-        'turnover':to_float(f.get('turnover')),'r3':to_float(f.get('r3')),'r10':to_float(f.get('r10')),
-        'volume_ratio':to_float(f.get('volume_ratio')),'pullback_pct':to_float(f.get('pullback_pct')),
-        'score':to_float(f.get('score')),'eligible':bool(f.get('ok')),'decision':'ENTRY_OK' if f.get('ok') else 'REJECT',
-        'reject_reason':str(f.get('block','')) if not f.get('ok') else '',
-        'ranking_price':to_float((meta or {}).get('price')),'ranking_change_pct':to_float((meta or {}).get('change_pct')),
-        'ranking_turnover':to_float((meta or {}).get('turnover'))
-    }
-    write_row(
-        us_replay_path('signals'),
-        ['event_id','saved_at','signal_time','session','symbol','price','day_change_pct','turnover',
-         'r3','r10','volume_ratio','pullback_pct','score','eligible','decision','reject_reason',
-         'ranking_price','ranking_change_pct','ranking_turnover'],
-        row
-    )
-    return event_id
 
 def _us_replay_save_backfill(sym, count=None):
     """후보 등록 시 확정된 과거 1분봉만 append-only 저장한다."""
@@ -1213,33 +1110,6 @@ def _us_replay_save_backfill(sym, count=None):
         ok = write_row_unique(us_data_path('candles_1m',sym), headers, row, ['symbol','timestamp']) or ok
     return ok
 
-def _us_replay_capacity(event_id, f):
-    """같은 당시 호가를 여러 자금단계에 적용. 주문 희망액이 아니라 실제 체결가능액을 기록한다."""
-    if not US_REPLAY_DATA_ENABLED or not event_id:
-        return
-    fx = _us_replay_fx_usdkrw(False)
-    if fx <= 0:
-        write_row(us_replay_path('capacity'),
-                  ['saved_at','event_id','symbol','capital_krw','target_krw','fx_usdkrw','target_usd','fill_qty',
-                   'filled_usd','filled_krw','fill_ratio','avg_price','slippage_pct','levels_used','reason'],
-                  {'saved_at':now_text(),'event_id':event_id,'symbol':f.get('symbol',''),'capital_krw':'',
-                   'target_krw':'','fx_usdkrw':'','target_usd':'','fill_qty':0,'filled_usd':0,'filled_krw':0,
-                   'fill_ratio':0,'avg_price':0,'slippage_pct':0,'levels_used':0,'reason':'FX_UNAVAILABLE'})
-        return
-    headers = ['saved_at','event_id','symbol','capital_krw','target_krw','fx_usdkrw','target_usd','fill_qty',
-               'filled_usd','filled_krw','fill_ratio','avg_price','slippage_pct','levels_used','reason']
-    for capital in US_REPLAY_CAPITAL_TIERS_KRW:
-        target_krw = float(capital) * US_SURGE_ENTRY_RATIO
-        target_usd = target_krw / fx
-        fill = _us_surge_fill(str(f.get('symbol','')),'BUY',max_cash=target_usd,max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT)
-        write_row(us_replay_path('capacity'), headers, {
-            'saved_at':now_text(),'event_id':event_id,'symbol':f.get('symbol',''),'capital_krw':capital,
-            'target_krw':round(target_krw,2),'fx_usdkrw':round(fx,6),'target_usd':round(target_usd,6),
-            'fill_qty':int(to_float(fill.get('qty'))),'filled_usd':round(to_float(fill.get('gross')),6),
-            'filled_krw':round(to_float(fill.get('gross'))*fx,2),'fill_ratio':round(to_float(fill.get('fill_ratio')),6),
-            'avg_price':round(to_float(fill.get('avg_price')),6),'slippage_pct':round(to_float(fill.get('slippage_pct')),6),
-            'levels_used':int(to_float(fill.get('levels_used'))),'reason':fill.get('reason','')
-        })
 
 def _us_replay_update_outcomes(prices_by_symbol=None):
     if not US_REPLAY_DATA_ENABLED:
@@ -1608,10 +1478,17 @@ def _atomic_json_write(path, data):
                 pass
 
 def save_state():
-    """상태를 원자적으로 저장하고 직전 정상본을 .bak로 보존한다."""
+    """Persist only active CORE4 and infrastructure state."""
     try:
         with LOCK:
-            data = {'paper': S.get('paper', {}), 'paper_ais': S.get('paper_ais', {}), 'arcpro_paper': S.get('arcpro_paper', {}), 'google_drive': S.get('google_drive', {}), 'us_backup_completed': S.get('us_backup_completed', {}), 'kr_backup_completed': S.get('kr_backup_completed', {}), 'us_semi_paper': S.get('us_semi_paper', {}), 'us_surge_paper': S.get('us_surge_paper', {}), 'us_surge_scan': S.get('us_surge_scan', {}), 'us_replay': S.get('us_replay', {}), 'guide_paper': S.get('guide_paper', {})}
+            data = {
+                'google_drive': S.get('google_drive', {}),
+                'us_backup_completed': S.get('us_backup_completed', {}),
+                'kr_backup_completed': S.get('kr_backup_completed', {}),
+                'us_surge_scan': S.get('us_surge_scan', {}),
+                'us_replay': S.get('us_replay', {}),
+                'core4_paper': S.get('core4_paper', {}),
+            }
         if os.path.isfile(STATE_PATH):
             try:
                 with open(STATE_PATH, 'r', encoding='utf-8') as f:
@@ -1623,6 +1500,7 @@ def save_state():
     except Exception as e:
         set_error(f'state 저장 실패: {e}')
 
+
 def _load_state_file(path):
     if not os.path.isfile(path):
         return None
@@ -1631,7 +1509,7 @@ def _load_state_file(path):
     return data if isinstance(data, dict) else None
 
 def load_state():
-    """주 상태가 손상되면 직전 정상 .bak를 자동 복구한다."""
+    """Restore only active CORE4 and infrastructure state; fall back to .bak if needed."""
     data = None
     primary_error = ''
     try:
@@ -1648,49 +1526,30 @@ def load_state():
             set_error(f'state 백업 로드 실패: {e}')
             data = None
     if data is None:
-        with LOCK:
-            if S['paper'].get('start_cash', 0) <= 0:
-                S['paper'] = {'start_cash': VIRTUAL_BASE_CASH, 'cash': VIRTUAL_BASE_CASH, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': VIRTUAL_BASE_CASH, 'profit_rate': 0, 'last_action': '초기 1천만원'}
         return
     try:
         with LOCK:
-            paper = data.get('paper')
-            if isinstance(paper, dict):
-                S['paper'].update(paper)
-            paper_ais = data.get('paper_ais')
-            if isinstance(paper_ais, dict):
-                S['paper_ais'] = paper_ais
-            arcpro_paper = data.get('arcpro_paper')
-            if isinstance(arcpro_paper, dict):
-                S['arcpro_paper'].update(arcpro_paper)
             drive_state = data.get('google_drive')
             if isinstance(drive_state, dict):
-                S['google_drive'].update(drive_state)
+                S.setdefault('google_drive', {}).update(drive_state)
             us_done = data.get('us_backup_completed')
             if isinstance(us_done, dict):
                 S['us_backup_completed'] = us_done
             kr_done = data.get('kr_backup_completed')
             if isinstance(kr_done, dict):
                 S['kr_backup_completed'] = kr_done
-            us_semi = data.get('us_semi_paper')
-            if isinstance(us_semi, dict):
-                S['us_semi_paper'] = us_semi
-            us_surge = data.get('us_surge_paper')
-            if isinstance(us_surge, dict):
-                S['us_surge_paper'] = us_surge
             us_surge_scan = data.get('us_surge_scan')
             if isinstance(us_surge_scan, dict):
                 S['us_surge_scan'] = us_surge_scan
             us_replay = data.get('us_replay')
             if isinstance(us_replay, dict):
                 S['us_replay'] = us_replay
-            guide_paper = data.get('guide_paper')
-            if isinstance(guide_paper, dict):
-                S['guide_paper'] = guide_paper
-            if S['paper'].get('start_cash', 0) <= 0:
-                S['paper'] = {'start_cash': VIRTUAL_BASE_CASH, 'cash': VIRTUAL_BASE_CASH, 'positions': {}, 'trades': [], 'realized_pl': 0, 'asset': VIRTUAL_BASE_CASH, 'profit_rate': 0, 'last_action': '초기 1천만원'}
+            core4_paper = data.get('core4_paper')
+            if isinstance(core4_paper, dict):
+                S['core4_paper'] = core4_paper
     except Exception as e:
         set_error(f'state 적용 실패: {e}')
+
 
 def telegram_enabled():
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
@@ -2024,130 +1883,17 @@ def low_rise_pct(sym):
 def volume_ratio(sym):
     return S['wma'].get(sym, {}).get('volume_ratio', 1.0)
 
-def hhmm_tuple(hhmm):
-    h, m = parse_hhmm(hhmm)
-    return (h, m)
 
-def is_before_hhmm(hhmm):
-    h, m = hhmm_tuple(hhmm)
-    n = now_kst()
-    return (n.hour, n.minute) < (h, m)
 
-def is_after_or_equal_hhmm(hhmm):
-    h, m = hhmm_tuple(hhmm)
-    n = now_kst()
-    return (n.hour, n.minute) >= (h, m)
 
-def buy_time_blocked():
-    return is_before_hhmm(NO_BUY_BEFORE) or is_after_or_equal_hhmm(NO_NEW_BUY_AFTER)
 
-def paper_auto_time_open():
-    sh, sm = hhmm_tuple(PAPER_AUTO_START)
-    eh, em = hhmm_tuple(PAPER_AUTO_END)
-    n = now_kst()
-    cur = (n.hour, n.minute)
-    return cur >= (sh, sm) and cur <= (eh, em)
 
-def record_paper_wait_once(reason, mode):
-    key = f'PAPER_WAIT_{mode}_{reason}'
-    with LOCK:
-        last = S['last_alert'].get(key, 0)
-        if time.time() - last < PAPER_WAIT_LOG_COOLDOWN_SEC:
-            return False
-        S['last_alert'][key] = time.time()
-    record_paper('AI자동관망', '', 0, 0, reason, strategy='WAIT', mode=mode, source='AUTO')
-    return True
 
-def is_inverse_symbol(sym):
-    return sym in INVERSE_SYMBOLS or '인버스' in name_of(sym)
 
-def symbol_strength(sym):
-    price = S['prices'].get(sym, 0)
-    if price <= 0:
-        return 0
-    score = to_float(S['signals'].get(sym, {}).get('score', raw_symbol_score(sym)))
-    chg = price_change_pct(sym)
-    lrise = low_rise_pct(sym)
-    hdrop = high_drop_pct(sym)
-    vr = volume_ratio(sym)
-    strength = score
-    strength += max(chg, 0) * 8
-    strength += max(lrise, 0) * 2
-    strength -= max(-hdrop, 0) * 1.5 if hdrop < -4 else 0
-    strength += min(vr, 3) * 2
-    return strength
 
-def semiconductor_strong():
-    core = [LEV, HYNIX, '494310', '488080', '469150']
-    strong = 0
-    for sym in core:
-        score = to_float(S['signals'].get(sym, {}).get('score', raw_symbol_score(sym)))
-        chg = price_change_pct(sym)
-        lrise = low_rise_pct(sym)
-        if score >= 65 or chg >= 0.3 or lrise >= 1.0:
-            strong += 1
-    inverse_weak = True
-    for sym in [INV, '252670', '0193L0']:
-        score = to_float(S['signals'].get(sym, {}).get('score', raw_symbol_score(sym)))
-        chg = price_change_pct(sym)
-        if score >= 62 and chg > 0:
-            inverse_weak = False
-    return strong >= 2 and inverse_weak
 
-def inverse_market_confirmed():
-    weak_long = 0
-    for sym in [LEV, HYNIX, '494310', '488080', '122630', '069500', '233740']:
-        score = to_float(S['signals'].get(sym, {}).get('score', raw_symbol_score(sym)))
-        chg = price_change_pct(sym)
-        hdrop = high_drop_pct(sym)
-        if score <= 45 or chg <= -0.3 or hdrop <= -1.5:
-            weak_long += 1
-    strong_inv = 0
-    for sym in INVERSE_SYMBOLS:
-        score = to_float(S['signals'].get(sym, {}).get('score', raw_symbol_score(sym)))
-        chg = price_change_pct(sym)
-        lrise = low_rise_pct(sym)
-        if score >= 58 and (chg > 0 or lrise >= 0.7):
-            strong_inv += 1
-    return weak_long >= 4 and strong_inv >= 1
 
-def operating_market_mode():
-    market_total = to_float(S['market_score'].get('total', 50))
-    label = S['market_score'].get('label', '')
-    if semiconductor_strong() and market_total >= 42:
-        return 'SEMI_LEADER_UP'
-    if inverse_market_confirmed() and (market_total <= 42 or label == '하락장'):
-        return 'DOWN'
-    ups = downs = movers = 0
-    for sym in ALERT_SYMBOLS:
-        chg = price_change_pct(sym)
-        hdrop = high_drop_pct(sym)
-        lrise = low_rise_pct(sym)
-        if chg >= 0.25 or lrise >= 1.0:
-            ups += 1
-        if chg <= -0.25 or hdrop <= -1.0:
-            downs += 1
-        if abs(chg) >= 0.25 or abs(hdrop) >= 1.0 or abs(lrise) >= 1.0:
-            movers += 1
-    if market_total >= 65 or label == '상승장':
-        return 'UP'
-    if movers >= 3 and ups >= 1 and (downs >= 1):
-        return 'CHOPPY'
-    return 'NO_TRADE'
 
-def choose_best_symbol(candidates):
-    valid = []
-    for sym in candidates:
-        price = S['prices'].get(sym, 0)
-        if price <= 0:
-            continue
-        if price_volume_risk_detected(sym):
-            continue
-        valid.append((symbol_strength(sym), sym))
-    if not valid:
-        return None
-    valid.sort(reverse=True)
-    return valid[0][1]
 
 def raw_symbol_score(sym):
     price = S['prices'].get(sym, 0)
@@ -2266,40 +2012,6 @@ def calc_scores():
         for sym in ALL:
             S['signals'][sym] = build_signal(sym)
 
-def target_market_regime():
-    """시장상황 분류: RECOVERY/UP/DOWN/CHOPPY/NO_TRADE.
-    점수형 매수는 쓰지 않고, 롱/인버스 그룹의 실제 흐름으로 먼저 분류한다.
-    """
-    long_syms = [LEV, '494310', '0193W0', '122630', '233740']
-    inv_syms = ['252670', '251340', INV, '0193L0']
-
-    def avg_change(syms):
-        vals = [price_change_pct(s) for s in syms if S['prices'].get(s, 0) > 0]
-        return sum(vals) / len(vals) if vals else 0
-
-    def avg_low_rise(syms):
-        vals = [low_rise_pct(s) for s in syms if S['prices'].get(s, 0) > 0]
-        return sum(vals) / len(vals) if vals else 0
-
-    def avg_high_drop(syms):
-        vals = [high_drop_pct(s) for s in syms if S['prices'].get(s, 0) > 0]
-        return sum(vals) / len(vals) if vals else 0
-    long_chg = avg_change(long_syms)
-    inv_chg = avg_change(inv_syms)
-    long_drop = avg_high_drop(long_syms)
-    inv_drop = avg_high_drop(inv_syms)
-    long_rise = avg_low_rise(long_syms)
-    if inv_chg >= 0.4 and long_chg <= -0.25 and (long_drop <= -1.0):
-        return 'DOWN'
-    if long_chg >= 0.35 and inv_chg <= 0.2:
-        return 'UP'
-    if long_drop <= -TARGET_LONG_PULLBACK_PCT and long_rise >= 2.0 and (inv_chg < 1.0):
-        return 'RECOVERY'
-    movers = sum((1 for s in long_syms + inv_syms if abs(price_change_pct(s)) >= 0.3))
-    mixed = long_chg > 0 and inv_chg > 0 or (long_chg < 0 and inv_chg < 0)
-    if movers >= 3 and mixed:
-        return 'CHOPPY'
-    return 'NO_TRADE'
 
 def parse_hhmm(s, default_h=15, default_m=20):
     try:
@@ -2308,184 +2020,13 @@ def parse_hhmm(s, default_h=15, default_m=20):
     except Exception:
         return (default_h, default_m)
 
-def time_after_hhmm(hhmm):
-    h, m = parse_hhmm(hhmm)
-    n = now_kst()
-    return (n.hour, n.minute) >= (h, m)
 
-def paper_total_asset():
-    with LOCK:
-        total = S['paper'].get('cash', 0)
-        positions = dict(S['paper'].get('positions', {}))
-        prices = dict(S['prices'])
-    for sym, pos in positions.items():
-        total += to_float(pos.get('qty', 0)) * prices.get(sym, to_float(pos.get('avg', 0)))
-    return int(total)
 
-def update_paper_asset():
-    with LOCK:
-        asset = paper_total_asset()
-        S['paper']['asset'] = asset
-        start = S['paper'].get('start_cash', 0)
-        S['paper']['profit_rate'] = pct(asset, start) if start else 0
 
-def record_paper(action, sym, price, qty, reason, pl=0, strategy='', mode='', source='AUTO'):
-    update_paper_asset()
-    with LOCK:
-        row = {'time': now_short(), 'source': source, 'strategy': strategy, 'market_mode': mode or S.get('daytrade', {}).get('market_mode', ''), 'action': action, 'symbol': sym, 'name': name_of(sym), 'price': price, 'qty': qty, 'pl': pl, 'reason': reason, 'asset': S['paper'].get('asset', 0)}
-        S['paper']['trades'].insert(0, row)
-        S['paper']['trades'] = S['paper']['trades'][:100]
-    write_row(paper_path(), ['time', 'source', 'strategy', 'market_mode', 'action', 'symbol', 'name', 'price', 'qty', 'pl', 'reason', 'asset'], row)
-    save_state()
 
-def paper_invested_amount():
-    with LOCK:
-        positions = dict(S['paper'].get('positions', {}))
-        prices = dict(S['prices'])
-    total = 0
-    for sym, pos in positions.items():
-        total += to_float(pos.get('qty', 0)) * prices.get(sym, to_float(pos.get('avg', 0)))
-    return int(total)
 
-def paper_buy_amount(sym, amount, reason, strategy='SWING', mode=''):
-    if sym not in ALL:
-        return False
-    price = S['prices'].get(sym, 0)
-    if price <= 0 or amount <= 0:
-        return False
-    with LOCK:
-        cash = to_int(S['paper'].get('cash', 0))
-    spendable = max(0, cash - MIN_DEFENSE_CASH)
-    amount = min(int(amount), spendable)
-    if amount <= 0:
-        return False
-    qty = int(amount // price)
-    if qty <= 0:
-        return False
-    cost = qty * price
-    with LOCK:
-        pos = S['paper']['positions'].get(sym, {'qty': 0, 'avg': 0, 'stage': 0, 'strategy': strategy})
-        old_qty = to_float(pos.get('qty', 0))
-        old_avg = to_float(pos.get('avg', 0))
-        new_qty = old_qty + qty
-        new_avg = (old_qty * old_avg + cost) / new_qty if new_qty else price
-        stage = min(3, int(to_float(pos.get('stage', 0))) + 1)
-        S['paper']['cash'] -= cost
-        S['paper']['positions'][sym] = {'qty': new_qty, 'avg': new_avg, 'buy_time': pos.get('buy_time') or now_text(), 'high_after_buy': max(to_float(pos.get('high_after_buy', 0)), price, new_avg), 'stage': stage, 'strategy': strategy}
-        S['paper']['last_action'] = f'{now_short()} AI 자동가상매수 {name_of(sym)} {stage}단계'
-    record_paper('AI자동가상매수', sym, price, qty, reason, strategy=strategy, mode=mode or operating_market_mode(), source='AUTO')
-    return True
 
-def paper_sell(sym, ratio, reason):
-    with LOCK:
-        pos = S['paper']['positions'].get(sym)
-        price = S['prices'].get(sym, 0)
-    if not pos or price <= 0:
-        return False
-    have = int(to_float(pos.get('qty', 0)))
-    qty = have if ratio >= 1 else int(have * ratio)
-    if qty <= 0:
-        return False
-    proceeds = qty * price
-    avg = to_float(pos.get('avg', 0))
-    pl = int((price - avg) * qty)
-    with LOCK:
-        S['paper']['cash'] += proceeds
-        S['paper']['realized_pl'] += pl
-        remain = have - qty
-        if remain <= 0:
-            S['paper']['positions'].pop(sym, None)
-        else:
-            S['paper']['positions'][sym] = {'qty': remain, 'avg': avg, 'buy_time': pos.get('buy_time', ''), 'high_after_buy': pos.get('high_after_buy', avg)}
-        S['paper']['last_action'] = f'{now_short()} 가상매도 {name_of(sym)}'
-    record_paper('수동가상매도', sym, price, qty, reason, pl, strategy='MANUAL', mode=operating_market_mode(), source='MANUAL')
-    return True
 
-def run_paper_ai_if_enabled():
-    """AI 가상계좌 자동운영.
-    ENABLE_PAPER_AUTO=true 이면 사용자가 버튼을 누르지 않아도 2천만원 기준으로
-    AI가 스스로 단타/스윙/관망/인버스를 판단해 가상매수/가상매도한다.
-
-    중요:
-    - 데이터 저장은 계속 한다.
-    - AI 가상계좌가 돈을 움직이는 시간은 PAPER_AUTO_START~PAPER_AUTO_END 안에서만 허용한다.
-    - 장 마감/정산 시간 이후에는 가상매수/가상매도/가상관망 로그를 새로 만들지 않는다.
-    """
-    mode = target_market_regime()
-    with LOCK:
-        S['daytrade']['market_mode'] = mode
-    if not ENABLE_PAPER_AUTO:
-        update_paper_asset()
-        return
-    if not paper_auto_time_open():
-        update_paper_asset()
-        return
-    with LOCK:
-        positions = dict(S['paper'].get('positions', {}))
-        prices = dict(S['prices'])
-    for sym, pos in list(positions.items()):
-        price = prices.get(sym, 0)
-        avg = to_float(pos.get('avg', 0))
-        if price <= 0 or avg <= 0:
-            continue
-        high = max(to_float(pos.get('high_after_buy', avg)), price)
-        stage = int(to_float(pos.get('stage', 1)))
-        strategy = pos.get('strategy', 'SWING')
-        with LOCK:
-            if sym in S['paper']['positions']:
-                S['paper']['positions'][sym]['high_after_buy'] = high
-        profit = pct(price, avg)
-        drop = pct(price, high) if high else 0
-        sell_reason = ''
-        if profit <= -3.0:
-            sell_reason = f'AI 자동 손절 {profit:.2f}%'
-        elif is_inverse_symbol(sym) and mode in ['UP', 'SEMI_LEADER_UP']:
-            sell_reason = 'AI 자동매도: 인버스 보유 중 상승/반도체 주도 전환'
-        elif not is_inverse_symbol(sym) and mode == 'DOWN':
-            sell_reason = 'AI 자동매도: 롱 보유 중 DOWN 전환'
-        elif is_after_or_equal_hhmm(NO_NEW_BUY_AFTER) and profit >= 1.0 and (drop <= -1.5):
-            sell_reason = f'AI 자동 수익보호: 14:30 이후 고점대비 {drop:.2f}%'
-        elif profit >= 1.0 and drop <= -3.0:
-            sell_reason = f'AI 자동 추적익절: 고점대비 {drop:.2f}%'
-        elif strategy == 'DAYTRADE' and time_after_hhmm(PAPER_DAYTRADE_FORCE_EXIT_TIME):
-            sell_reason = 'AI 자동 단타 15:20 전 정리'
-        if sell_reason:
-            paper_sell(sym, 1.0, sell_reason)
-            continue
-        invested = paper_invested_amount()
-        if not buy_time_blocked() and strategy == 'SWING' and (mode in ['SEMI_LEADER_UP', 'UP']) and (stage < 3) and (invested < SWING_MAX_EXPOSURE):
-            if profit >= 0.5 or symbol_strength(sym) >= 72:
-                next_amount = SWING_BUY_STEP_AMOUNTS[min(stage, 2)]
-                paper_buy_amount(sym, next_amount, f'AI 자동 추가매수 {stage + 1}단계: {mode} 강세 유지', strategy='SWING', mode=mode)
-    with LOCK:
-        has = bool(S['paper'].get('positions'))
-    if has:
-        update_paper_asset()
-        save_state()
-        return
-    if buy_time_blocked():
-        record_paper_wait_once('09:05 전 또는 14:30 이후 신규 가상매수 금지', mode)
-        update_paper_asset()
-        return
-    if mode in ['CHOPPY', 'NO_TRADE']:
-        record_paper_wait_once(f'{mode}: 방향 없음, 가상매수 안 함', mode)
-        update_paper_asset()
-        return
-    if mode == 'SEMI_LEADER_UP':
-        sym = choose_best_symbol(SEMI_LONG_SYMBOLS)
-        if sym:
-            paper_buy_amount(sym, SWING_BUY_STEP_AMOUNTS[0], f'AI 자동 스윙 1차: 반도체 주도장 {sym}', strategy='SWING', mode=mode)
-    elif mode == 'UP':
-        sym = choose_best_symbol(UP_LONG_SYMBOLS)
-        if sym:
-            paper_buy_amount(sym, SWING_BUY_STEP_AMOUNTS[0], f'AI 자동 롱 1차: 상승장 {sym}', strategy='SWING', mode=mode)
-    elif mode == 'DOWN':
-        if not semiconductor_strong():
-            sym = choose_best_symbol(INVERSE_SYMBOLS)
-            if sym:
-                paper_buy_amount(sym, min(5000000, INVERSE_MAX_EXPOSURE), f'AI 자동 인버스 단타: DOWN {sym}', strategy='DAYTRADE', mode=mode)
-    update_paper_asset()
-    save_state()
 
 def _ranking_result(data):
     if not isinstance(data, dict):
@@ -2682,76 +2223,10 @@ def _scan_full_market_universe_impl(force=False):
     state['status'] = f"토스 랭킹시장 후보 {len(universe):,}개, 실시간가격 {len(quote_map):,}개, 최종 {len(state['ranked'])}개"
     return bool(state['ranked'])
 
-def ensure_live_orderbook(sym, force=False, max_age=None):
-    """신호 체결에 사용할 호가를 보장한다. fresh cache가 있으면 재사용해 429를 줄인다."""
-    state = S.setdefault('market_data_capture', {})
-    max_age = ARC_SIGNAL_FRESH_MAX_SEC if max_age is None else max(1, int(max_age))
-    ob = state.setdefault('latest_orderbook', {}).get(sym, {})
-    if (not force and data_age_seconds(ob.get('timestamp')) <= max_age and
-            to_float(ob.get('best_ask', 0)) > 0 and to_float(ob.get('best_bid', 0)) > 0):
-        return True
-    code, data = api_get('/api/v1/orderbook', params={'symbol': sym}, timeout=8)
-    if code != 200:
-        return False
-    result = _result_dict(data)
-    asks = result.get('asks', []) if isinstance(result, dict) and isinstance(result.get('asks', []), list) else []
-    bids = result.get('bids', []) if isinstance(result, dict) and isinstance(result.get('bids', []), list) else []
-    ts = str(result.get('timestamp', '')) if isinstance(result, dict) else ''
-    if not ts or not asks or not bids:
-        return False
-    state['latest_orderbook'][sym] = {'timestamp': ts, 'best_ask': to_float(asks[0].get('price', 0)), 'best_bid': to_float(bids[0].get('price', 0)), 'asks': asks, 'bids': bids}
-    return True
 
 
-def ensure_live_price(sym, force=False, max_age=None):
-    """Arc-pro 종목의 Toss 최신가격과 price_timestamp를 신호 직전에 보장한다."""
-    state = S.setdefault('market_data_capture', {})
-    max_age = ARC_SIGNAL_FRESH_MAX_SEC if max_age is None else max(1, int(max_age))
-    ts = state.setdefault('price_timestamp', {}).get(sym, '')
-    if not force and data_age_seconds(ts) <= max_age and to_float(S.setdefault('prices', {}).get(sym, 0)) > 0:
-        return True
-    code, data = api_get('/api/v1/prices', params={'symbols': sym}, timeout=8)
-    if code != 200:
-        return False
-    items = first_list(data)
-    for item in items:
-        if not isinstance(item, dict) or str(item.get('symbol','')) != sym:
-            continue
-        price = 0.0
-        for k in ['lastPrice','price','currentPrice','closePrice','tradePrice']:
-            if k in item:
-                price = to_float(item.get(k, 0)); break
-        api_ts = str(item.get('timestamp',''))
-        if price <= 0 or not api_ts:
-            continue
-        with LOCK:
-            old = to_float(S.setdefault('prices', {}).get(sym, price))
-            S.setdefault('prev_prices', {})[sym] = old
-            S['prices'][sym] = price
-            state.setdefault('price_timestamp', {})[sym] = api_ts
-        return True
-    return False
 
 
-def _arcpro_prepare_trade_market_data(sym):
-    """신호 직전 최신가격+호가를 확보하고 transient 오류는 짧게 재시도한다."""
-    last_reason = 'MARKET_DATA_PREP_FAILED'
-    for attempt in range(ARC_MARKET_PREP_RETRIES):
-        force = attempt > 0
-        price_ok = ensure_live_price(sym, force=force, max_age=ARC_SIGNAL_FRESH_MAX_SEC)
-        if not price_ok:
-            last_reason = 'PRICE_REFRESH_FAILED'
-        ob_ok = ensure_live_orderbook(sym, force=force, max_age=ARC_SIGNAL_FRESH_MAX_SEC)
-        if not ob_ok:
-            last_reason = 'ORDERBOOK_REFRESH_FAILED'
-        if price_ok and ob_ok:
-            gate_ok, gate_reason = market_safety_gate(sym)
-            if gate_ok:
-                return (True, 'OK')
-            last_reason = gate_reason
-        if attempt < ARC_MARKET_PREP_RETRIES - 1:
-            time.sleep(0.6 * (2 ** attempt) + random.uniform(0.05, 0.20))
-    return (False, last_reason)
 
 
 def scan_full_market_universe(force=False):
@@ -2883,156 +2358,16 @@ def _project_premarket_regular_features(sym, q):
             'reg_vs_pre': reg_vs_pre, 'reg_vs_open': reg_vs_open}
 
 
-def _project_intraday_volatility(sym, points=12):
-    hist = [to_float(x) for x in list(S.get('history', {}).get(sym, []) or [])[-points:] if to_float(x) > 0]
-    if len(hist) < 3:
-        return 0.0
-    rets = [abs(pct(hist[i], hist[i-1])) for i in range(1, len(hist)) if hist[i-1] > 0]
-    return sum(rets) / len(rets) if rets else 0.0
 
-def _project_adaptive_exit(sym):
-    # G05 주전 후보: 고정 목표가로 수익 상단을 잘라버리지 않고 변동성 기반 손절+추적청산으로 끝까지 따라간다.
-    v = _project_intraday_volatility(sym, 15)
-    sl = -min(1.10, max(0.50, 0.48 + v * 0.85))
-    trail_start = min(1.80, max(0.90, 1.05 + v * 0.70))
-    trail = -min(1.20, max(0.42, 0.45 + v * 0.75))
-    return {'tp': None, 'sl': sl, 'trail_start': trail_start, 'trail': trail, 'volatility': v}
 
-def _project_is_sell_action(action):
-    a = str(action or '').strip().upper()
-    return a in {'SELL','PARTIAL_SELL','가상매도','부분가상매도','수동가상매도'} or '매도' in a
 
-def _project_is_buy_action(action):
-    a = str(action or '').strip().upper()
-    return a in {'BUY','가상매수','AI자동가상매수'} or ('매수' in a and '매도' not in a)
 
-def _project_today_rows(ai_id):
-    ensure_multi_ai_states()
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        return [dict(r) for r in st.get('trades', []) if str(r.get('time','')).startswith(today())]
 
-def _project_row_epoch(row):
-    raw = str(row.get('time','')).strip()
-    for fmt in ('%Y-%m-%d %H:%M:%S','%Y-%m-%d %H:%M','%H:%M:%S','%H:%M'):
-        try:
-            dt = datetime.strptime(raw, fmt)
-            if fmt.startswith('%H'):
-                n = now_kst(); dt = dt.replace(year=n.year, month=n.month, day=n.day)
-            return KST.localize(dt).timestamp() if dt.tzinfo is None else dt.timestamp()
-        except Exception:
-            pass
-    return 0.0
 
-def _project_daily_stats(ai_id):
-    rows = _project_today_rows(ai_id)
-    sells = [r for r in rows if _project_is_sell_action(r.get('action'))]
-    sells_chrono = sorted(sells, key=_project_row_epoch)
-    realized = sum(to_float(r.get('pl', 0)) for r in sells)
-    start_cash = max(1.0, to_float(S['paper_ais'][ai_id].get('start_cash', MULTI_AI_START_CASH)))
-    cumulative = 0.0; peak = 0.0; streak = 0
-    for r in sells_chrono:
-        pl = to_float(r.get('pl',0)); cumulative += pl; peak = max(peak, cumulative)
-        streak = streak + 1 if pl < 0 else 0
-    buys = [r for r in rows if _project_is_buy_action(r.get('action'))]
-    return {
-        'buy_count': len(buys), 'sell_count': len(sells), 'realized_pl': realized, 'realized_pct': realized / start_cash * 100.0,
-        'peak_realized_pl': peak, 'peak_realized_pct': peak / start_cash * 100.0,
-        'giveback_pct': max(0.0, (peak - cumulative) / start_cash * 100.0),
-        'loss_streak': streak, 'last_sell_ts': _project_row_epoch(sells_chrono[-1]) if sells_chrono else 0.0,
-    }
 
-def _project_allow_new_entry(ai_id):
-    """G계열 계좌 공통 비상게이트. +1.4% 수익은 보고용이고 기본 강제종료하지 않는다."""
-    if not PROJECT_PAPER_LAB_ENABLED or not str(ai_id).startswith('G'):
-        return True
-    ds = _project_daily_stats(ai_id)
-    daily_limit = PROJECT_G_COMPARE_MAX_DAILY_ENTRIES if _multi_ai_parent_id(ai_id) == 'G06' else PROJECT_G_MAX_DAILY_ENTRIES
-    if ds.get('buy_count', 0) >= daily_limit:
-        return False
-    # 하루 손실 한도만 하드 스톱. 수익이 났다고 좋은 기회를 자동으로 닫지 않는다.
-    if ds['realized_pct'] <= PROJECT_DAILY_MAX_LOSS_PCT:
-        return False
-    if PROJECT_STOP_AFTER_DAILY_TARGET and ds['realized_pct'] >= PROJECT_DAILY_SOFT_TARGET_PCT:
-        return False
-    # 최고 실현수익을 크게 반납한 날은 2단계 보호로 신규진입을 완전히 중단한다.
-    if ds['peak_realized_pct'] >= PROJECT_G_PROFIT_PROTECT_MIN_PEAK_PCT and ds['giveback_pct'] >= PROJECT_G_PROFIT_HARD_GIVEBACK_PCT:
-        return False
-    # 3연속 손실 직후에는 잠깐 쉬어서 연속 추격을 막는다.
-    if ds['loss_streak'] >= PROJECT_G_LOSS_STREAK_PAUSE and time.time() - ds['last_sell_ts'] < PROJECT_G_LOSS_STREAK_PAUSE_SEC:
-        return False
-    return True
 
-def _project_symbol_reentry_state(ai_id, sym):
-    rows = sorted(_project_today_rows(ai_id), key=_project_row_epoch)
-    sells = [r for r in rows if _project_is_sell_action(r.get('action')) and str(r.get('symbol','')) == str(sym)]
-    last = sells[-1] if sells else None
-    return {'cycles': len(sells), 'last': last, 'last_ts': _project_row_epoch(last) if last else 0.0, 'last_pl': to_float(last.get('pl',0)) if last else 0.0}
 
-def _project_v1_candidate_ok(score, r3, r10, from_high, from_low):
-    """한국 급등 V1 고정 진입필터. 종목명/당일상승률이 아니라 진입 직전 지속강도만 본다."""
-    if score < PROJECT_G_V1_MIN_BASE_SCORE:
-        return (False, f'BASE_SCORE {score:.1f}<{PROJECT_G_V1_MIN_BASE_SCORE:.1f}')
-    if r10 < PROJECT_G_V1_MIN_R10_PCT:
-        return (False, f'R10 {r10:.2f}<{PROJECT_G_V1_MIN_R10_PCT:.2f}')
-    if r3 > PROJECT_G_V1_MAX_R3_PCT:
-        return (False, f'R3_OVERHEAT {r3:.2f}>{PROJECT_G_V1_MAX_R3_PCT:.2f}')
-    if from_low < PROJECT_G_V1_MIN_FROM_LOW_PCT:
-        return (False, f'FROM_LOW {from_low:.2f}<{PROJECT_G_V1_MIN_FROM_LOW_PCT:.2f}')
-    if from_high < PROJECT_G_V1_MIN_FROM_HIGH_PCT:
-        return (False, f'NOT_NEAR_HIGH {from_high:.2f}<{PROJECT_G_V1_MIN_FROM_HIGH_PCT:.2f}')
-    return (True, 'OK')
 
-def _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, from_low=0.0, signal_type=''):
-    """좋은 기회는 계속 허용하되 반복추격/수익반납/연속손실만 억제한다."""
-    if not str(ai_id).startswith('G'):
-        return (True, 'NON_G')
-    if not _project_allow_new_entry(ai_id):
-        return (False, 'DAILY_LOSS_OR_STREAK_GUARD')
-    # 08~09시는 연구/후보수집만. 실제 신규진입은 entry window가 09:00부터이며 이중 방어한다.
-    if _project_session_label() in {'PREMARKET','PREMARKET_AUCTION'}:
-        return (False, 'PREMARKET_WATCH_ONLY')
-    v1_ok, v1_reason = _project_v1_candidate_ok(score, r3, r10, from_high, from_low)
-    if not v1_ok:
-        return (False, 'V1_' + v1_reason)
-    if r10 < PROJECT_G_MIN_R10_PCT:
-        return (False, f'R10_WEAK {r10:.2f}<{PROJECT_G_MIN_R10_PCT:.2f}')
-    ds = _project_daily_stats(ai_id)
-    re = _project_symbol_reentry_state(ai_id, sym)
-    if re['cycles'] >= PROJECT_G_MAX_SYMBOL_CYCLES:
-        return (False, f'SYMBOL_MAX_CYCLES {re["cycles"]}')
-    change_now = price_change_pct(sym)
-    # 첫 진입도 고점에서 너무 멀어진 종목/이미 과도하게 뻗은 종목의 뒤늦은 추격은 막는다.
-    if not re['last']:
-        if from_high < PROJECT_G_FIRST_ENTRY_HIGH_GAP_PCT:
-            return (False, f'FIRST_ENTRY_NOT_NEAR_HIGH {from_high:.2f}')
-        if change_now >= PROJECT_G_MAX_CHASE_CHANGE_PCT and r3 < PROJECT_G_REENTRY_MIN_R3_PCT:
-            return (False, f'OVERHEAT_CHASE change={change_now:.2f} r3={r3:.2f}')
-    if re['last']:
-        elapsed = max(0.0, time.time() - re['last_ts'])
-        cooldown = PROJECT_G_LOSS_REENTRY_COOLDOWN_SEC if re['last_pl'] < 0 else PROJECT_G_WIN_REENTRY_COOLDOWN_SEC
-        if elapsed < cooldown:
-            return (False, f'REENTRY_COOLDOWN {elapsed:.0f}<{cooldown}s')
-        # 재진입은 재가속 + 직전 고점 근처/재돌파 조건을 동시에 요구한다.
-        if r3 < PROJECT_G_REENTRY_MIN_R3_PCT or from_high < PROJECT_G_REENTRY_HIGH_GAP_PCT:
-            return (False, f'REENTRY_NO_REBREAK r3={r3:.2f} high={from_high:.2f}')
-        # 재진입은 직전 진입보다 신호 강도가 실제로 좋아져야 한다.
-        prior_metric = 0.0
-        try:
-            m = re.search(r'metric=([-+]?\d+(?:\.\d+)?)', str(re['last'].get('entry_reason','')))
-            prior_metric = float(m.group(1)) if m else 0.0
-        except Exception:
-            prior_metric = 0.0
-        if prior_metric and metric < prior_metric + PROJECT_G_REENTRY_METRIC_IMPROVE:
-            return (False, f'REENTRY_NOT_STRONGER metric={metric:.1f} prior={prior_metric:.1f}')
-    # 2연속 손실 또는 당일 최고수익에서 큰 반납이면 보호모드: 후보 기준을 더 엄격하게.
-    protection = ds['loss_streak'] >= PROJECT_G_LOSS_STREAK_WARN or (
-        ds['peak_realized_pct'] >= PROJECT_G_PROFIT_PROTECT_MIN_PEAK_PCT and ds['giveback_pct'] >= PROJECT_G_PROFIT_GIVEBACK_PCT)
-    if protection and metric < PROJECT_ENTRY_MIN_SCORE + PROJECT_G_PROTECTION_SCORE_ADD:
-        return (False, f'PROTECTION_MODE metric={metric:.1f}')
-    if signal_type == 'PREMARKET_FADE_AVOID':
-        return (False, 'PREMARKET_FADE_AVOID')
-    return (True, 'OK_PROTECTION' if protection else 'OK')
 
 def _project_candidate_score(base_score, sym, q):
     hist = list(S.get('history', {}).get(sym, []) or [])
@@ -3104,16 +2439,7 @@ def project_capture_market_snapshot(force=False):
     st['status'] = f'시장연구 스냅샷 {len(ranked)}종목 저장'
     return True
 
-def project_write_candidate_event(ai_id, sym, metric, reason, event='CANDIDATE'):
-    if not PROJECT_RESEARCH_SAVE_ENABLED:
-        return
-    write_row(project_candidate_event_path(), ['time','event','ai_id','strategy','symbol','name','metric','price','reason'], {'time': now_text(), 'event': event, 'ai_id': ai_id, 'strategy': MULTI_AI_NAMES.get(ai_id,ai_id), 'symbol': sym, 'name': name_of(sym) if sym else '', 'metric': round(to_float(metric),4), 'price': to_float(S.get('prices',{}).get(sym,0)) if sym else 0, 'reason': str(reason)[:1500]})
 
-def _project_parse_time(value):
-    try:
-        return datetime.strptime(str(value), '%Y-%m-%d %H:%M:%S')
-    except Exception:
-        return None
 
 
 def _project_read_research_snapshots():
@@ -3334,1159 +2660,55 @@ def project_storage_housekeeping(force=False):
         )
     return removed
 
-def full_market_candidate(ai_id):
-    """G01~G06는 같은 시점의 같은 진입후보를 공유하고 청산법만 달리한다.
-    후보는 PREMARKET_CONTINUATION과 REGULAR_SURGE 두 경로를 동시에 경쟁시킨다.
-    """
-    st = _project_state()
-    fm = S.setdefault('full_market', {})
-    stale_after = max(20, _project_scan_interval_sec() * 2)
-    if time.time() - to_float(fm.get('last_scan_ts', 0)) > stale_after:
-        # worker 장애 시에만 안전 fallback. 정상 시에는 API를 추가 호출하지 않는다.
-        scan_full_market_universe(False)
-    project_capture_market_snapshot(False)
-    ranked = list(S.setdefault('full_market', {}).get('ranked', []))
-    scan_key = str(S.setdefault('full_market', {}).get('last_scan_text', ''))
-    cached = st.get('shared_candidate', {})
-    if cached.get('scan_key') == scan_key and cached.get('tuple'):
-        return tuple(cached['tuple'])
-    scored = []
-    for base_score, sym, q in ranked:
-        ps, r3, r10, from_high, from_low, sigtype, feat = _project_candidate_score(base_score, sym, q)
-        if sigtype == 'PREMARKET_FADE_AVOID':
-            continue
-        if _project_session_label() in {'OPEN_FAST', 'REGULAR'}:
-            v1_ok, _v1_reason = _project_v1_candidate_ok(base_score, r3, r10, from_high, from_low)
-            if not v1_ok:
-                continue
-        scored.append((ps, sym, base_score, r3, r10, from_high, from_low,
-                       min(30.0, max(to_float(q.get('turnover',0)),0.0) ** 0.5 / 20000.0), sigtype, feat))
-    best = max(scored, default=(-999.0, '', 0, 0, 0, 0, 0, 0, 'NONE', {}), key=lambda x: x[0])
-    # 기존 8개 반환 인터페이스를 유지하되 signal_type은 project state와 reason log에 보존한다.
-    out = best[:8]
-    st['shared_candidate'] = {'scan_key': scan_key, 'tuple': list(out), 'signal_type': best[8], 'features': best[9], 'symbol': best[1], 'metric': best[0], 'saved_at': now_text()}
-    if best[1]:
-        f = best[9]
-        project_write_candidate_event(ai_id, best[1], best[0],
-            f"type={best[8]} base={best[2]:.1f} r3={best[3]:.2f} r10={best[4]:.2f} high={best[5]:.2f} low={best[6]:.2f} pre_last={to_float(f.get('pre_last_chg',0)):.2f}% pre_peak={to_float(f.get('pre_peak_chg',0)):.2f}% reg_vs_pre={to_float(f.get('reg_vs_pre',0)):.2f}% reg_vs_open={to_float(f.get('reg_vs_open',0)):.2f}%",
-            'TOP_CANDIDATE')
-    return out
 
 def multi_ai_path(ai_id):
     return os.path.join(day_dir(), f'paper_ai_{ai_id}_{today()}.csv')
 
-def _multi_ai_default(ai_id):
-    return {'id': ai_id, 'name': MULTI_AI_NAMES.get(ai_id, ai_id), 'start_cash': MULTI_AI_START_CASH, 'cash': MULTI_AI_START_CASH, 'positions': {}, 'realized_pl': 0, 'asset': MULTI_AI_START_CASH, 'profit_rate': 0.0, 'trades': [], 'last_action': '초기화', 'last_decision_ts': 0, 'last_decision_date': '', 'group': MULTI_AI_GROUP.get(ai_id, ''), 'universe_type': MULTI_AI_UNIVERSE.get(ai_id, ''), 'parent_strategy': MULTI_AI_PARENT.get(ai_id, ai_id), 'mdd_pct': 0.0, 'peak_asset': MULTI_AI_START_CASH, 'loss_streak': 0, 'decision_data_end': '', 'combo_date': '', 'combo_phase': 0, 'combo_last_symbol': '', 'daily_assets': {}, 'selected_source': '', 'selected_sources': [], 'selection_date': '', 'selection_reason': ''}
 
-def ensure_multi_ai_states():
-    with LOCK:
-        states = S.setdefault('paper_ais', {})
-        for ai_id in MULTI_AI_IDS:
-            cur = states.get(ai_id)
-            if not isinstance(cur, dict):
-                states[ai_id] = _multi_ai_default(ai_id)
-                continue
-            default = _multi_ai_default(ai_id)
-            for k, v in default.items():
-                cur.setdefault(k, v)
-            cur['id'] = ai_id
-            cur['name'] = MULTI_AI_NAMES.get(ai_id, ai_id)
-            cur.setdefault('positions', {})
-            cur.setdefault('trades', [])
 
-def _multi_ai_asset(ai_id):
-    ensure_multi_ai_states()
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        total = to_float(st.get('cash', 0))
-        positions = dict(st.get('positions', {}))
-        prices = dict(S.get('prices', {}))
-    for sym, pos in positions.items():
-        total += to_float(pos.get('qty', 0)) * prices.get(sym, to_float(pos.get('avg', 0)))
-    return int(total)
 
-def _multi_ai_update(ai_id):
-    asset = _multi_ai_asset(ai_id)
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        st['asset'] = asset
-        st['profit_rate'] = pct(asset, st.get('start_cash', MULTI_AI_START_CASH))
-        peak = max(to_float(st.get('peak_asset', MULTI_AI_START_CASH)), asset)
-        st['peak_asset'] = peak
-        st['mdd_pct'] = min(to_float(st.get('mdd_pct', 0)), pct(asset, peak) if peak else 0)
 
-def _multi_ai_record(ai_id, action, sym, price, qty, fee, pl, reason, partial=False, extras=None):
-    _multi_ai_update(ai_id)
-    extra_keys = ('mfe_pct','mae_pct','hold_sec','entry_reason','target_cash','filled_gross','fill_ratio',
-                  'slippage_pct','orderbook_timestamp','levels_used','liquidity_limited','signal_price','best_price','position_ratio')
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        row = {'time': now_text(), 'ai_id': ai_id, 'ai_name': st.get('name', ai_id), 'action': action, 'symbol': sym, 'name': name_of(sym), 'price': round(to_float(price), 4), 'qty': int(qty), 'fee': int(fee), 'pl': int(pl), 'cash': int(to_float(st.get('cash', 0))), 'asset': int(to_float(st.get('asset', 0))), 'profit_rate': round(to_float(st.get('profit_rate', 0)), 4), 'reason': reason, 'partial': bool(partial), 'real_order': False, 'mfe_pct': '', 'mae_pct': '', 'hold_sec': '', 'entry_reason': '', 'target_cash': '', 'filled_gross': '', 'fill_ratio': '', 'slippage_pct': '', 'orderbook_timestamp': '', 'levels_used': '', 'liquidity_limited': '', 'signal_price': '', 'best_price': '', 'position_ratio': ''}
-        if isinstance(extras, dict):
-            for k in extra_keys:
-                if k in extras:
-                    row[k] = extras.get(k)
-        st.setdefault('trades', []).insert(0, row)
-        st['trades'] = st['trades'][:300]
-        st['last_action'] = f'{now_short()} {action} {name_of(sym)}'
-    headers = ['time', 'ai_id', 'ai_name', 'action', 'symbol', 'name', 'price', 'qty', 'fee', 'pl', 'cash', 'asset', 'profit_rate', 'reason', 'partial', 'real_order', 'mfe_pct', 'mae_pct', 'hold_sec', 'entry_reason', 'target_cash', 'filled_gross', 'fill_ratio', 'slippage_pct', 'orderbook_timestamp', 'levels_used', 'liquidity_limited', 'signal_price', 'best_price', 'position_ratio']
-    write_row(multi_ai_path(ai_id), headers, row)
-    save_state()
 
-def _multi_ai_buy(ai_id, sym, reason, ratio=None):
-    if str(ai_id).startswith('G') and not _project_allow_new_entry(ai_id):
-        return False
-    if not ensure_live_orderbook(sym, force=True):
-        return False
-    gate_ok, gate_reason = market_safety_gate(sym)
-    if not gate_ok:
-        return False
-    ensure_multi_ai_states()
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        if st.get('positions'):
-            return False
-        cash = int(to_float(st.get('cash', 0)))
-    is_g = str(ai_id).startswith('G')
-    max_ratio = PROJECT_G_TARGET_POSITION_RATIO if is_g else MULTI_AI_MAX_POSITION_RATIO
-    requested_ratio = max_ratio if ratio is None else max(0.05, min(max_ratio, ratio))
-    budget = int(cash * requested_ratio)
-    fee_rate = MULTI_AI_FEE_SIDE_PCT / 100
-    signal_price = to_float(S.get('prices', {}).get(sym, 0))
-    if is_g:
-        fill = simulated_orderbook_fill(
-            sym, 'BUY', max_cash=budget / (1 + fee_rate),
-            max_slippage_pct=PROJECT_G_MAX_ENTRY_SLIPPAGE_PCT,
-            depth_usage_ratio=PROJECT_G_MAX_DEPTH_USAGE_RATIO,
-            max_levels=PROJECT_G_ORDERBOOK_LEVELS,
-        )
-    else:
-        fill = simulated_orderbook_fill(sym, 'BUY', max_cash=budget / (1 + fee_rate))
-    if not fill.get('ok'):
-        if is_g:
-            project_save_orderbook_snapshot(sym, 'ENTRY_REJECT_NO_FILL', ai_id, budget, fill)
-        return False
-    qty = int(fill.get('qty', 0))
-    price = to_float(fill.get('avg_price', 0))
-    gross = int(round(fill.get('gross', 0)))
-    fee = int(round(gross * fee_rate))
-    total = gross + fee
-    while qty > 0 and total > cash:
-        qty -= 1
-        gross = int(round(qty * price))
-        fee = int(round(gross * fee_rate))
-        total = gross + fee
-    if qty <= 0:
-        return False
-    fill_ratio = to_float(fill.get('fill_ratio', 0.0))
-    if is_g and (gross < PROJECT_G_MIN_ORDER_NOTIONAL_KRW or fill_ratio < PROJECT_G_MIN_FILL_RATIO):
-        project_save_orderbook_snapshot(sym, 'ENTRY_REJECT_THIN', ai_id, budget, fill)
-        return False
-    liq_reason = (f' liquidity target={budget:,} gross={gross:,} fill={fill_ratio*100:.1f}% '
-                  f'slip={to_float(fill.get("slippage_pct",0)):.3f}% levels={int(fill.get("levels_used",0))}') if is_g else ''
-    reason2 = str(reason)[:1300] + liq_reason
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        st['cash'] = cash - total
-        st['positions'][sym] = {
-            'qty': qty, 'avg': price, 'entry_time': now_text(), 'entry_date': today(), 'entry_total_cost': total,
-            'entry_fee': fee, 'high_after_buy': price, 'low_after_buy': price, 'entry_reason': str(reason2)[:1500],
-            'partial_taken': False, 'protect_armed': False,
-            'entry_target_cash': budget, 'entry_gross': gross, 'entry_fill_ratio': fill_ratio,
-            'entry_slippage_pct': to_float(fill.get('slippage_pct',0)), 'entry_orderbook_timestamp': str(fill.get('orderbook_timestamp','')),
-        }
-    extras = {
-        'target_cash': budget, 'filled_gross': gross, 'fill_ratio': round(fill_ratio,4),
-        'slippage_pct': round(to_float(fill.get('slippage_pct',0)),4), 'orderbook_timestamp': fill.get('orderbook_timestamp',''),
-        'levels_used': int(fill.get('levels_used',0)), 'liquidity_limited': bool(fill.get('partial')),
-        'signal_price': round(signal_price,4), 'best_price': round(to_float(fill.get('best_price',0)),4),
-        'position_ratio': round(total / max(1,cash),4),
-    }
-    if is_g:
-        project_save_orderbook_snapshot(sym, 'ENTRY_FILLED', ai_id, budget, fill)
-    _multi_ai_record(ai_id, '가상매수', sym, price, qty, fee, 0, reason2, bool(fill.get('partial')), extras)
-    return True
 
-def _multi_ai_sell(ai_id, sym, reason, sell_ratio=1.0):
-    ensure_multi_ai_states()
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        pos = st.get('positions', {}).get(sym)
-        if not isinstance(pos, dict):
-            return False
-        qty = int(to_float(pos.get('qty', 0)))
-        avg = to_float(pos.get('avg', 0))
-        total_cost = int(to_float(pos.get('entry_total_cost', qty * avg)))
-        high_after_buy = max(avg, to_float(pos.get('high_after_buy', avg)))
-        low_after_buy = min(avg, to_float(pos.get('low_after_buy', avg)) or avg)
-        entry_time = str(pos.get('entry_time', ''))
-        entry_reason = str(pos.get('entry_reason', ''))
-    if qty <= 0:
-        return False
-    if not ensure_live_orderbook(sym, force=True):
-        return False
-    gate_ok, _ = market_safety_gate(sym)
-    if not gate_ok:
-        return False
-    target_qty = qty if sell_ratio >= 0.999 else max(1, min(qty, int(qty * max(0.01, min(1.0, sell_ratio)))))
-    is_g = str(ai_id).startswith('G')
-    if is_g:
-        fill = simulated_orderbook_fill(
-            sym, 'SELL', qty=target_qty,
-            max_slippage_pct=PROJECT_G_MAX_EXIT_SLIPPAGE_PCT,
-            depth_usage_ratio=PROJECT_G_MAX_DEPTH_USAGE_RATIO,
-            max_levels=PROJECT_G_ORDERBOOK_LEVELS,
-        )
-    else:
-        fill = simulated_orderbook_fill(sym, 'SELL', qty=target_qty)
-    if not fill.get('ok'):
-        if is_g:
-            project_save_orderbook_snapshot(sym, 'EXIT_REJECT_NO_FILL', ai_id, 0, fill)
-        return False
-    sold = int(fill.get('qty', 0))
-    price = to_float(fill.get('avg_price', 0))
-    gross = int(round(fill.get('gross', 0)))
-    fee = int(round(gross * MULTI_AI_FEE_SIDE_PCT / 100))
-    net = gross - fee
-    cost_part = int(round(total_cost * sold / max(1, qty)))
-    pl = net - cost_part
-    remain = qty - sold
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        st['cash'] = int(to_float(st.get('cash', 0))) + net
-        st['realized_pl'] = int(to_float(st.get('realized_pl', 0))) + pl
-        if remain <= 0:
-            st['positions'].pop(sym, None)
-        else:
-            pos['qty'] = remain
-            pos['entry_total_cost'] = max(0, total_cost - cost_part)
-            st['positions'][sym] = pos
-    try:
-        et = datetime.strptime(entry_time, '%Y-%m-%d %H:%M:%S') if entry_time else None
-        hold_sec = max(0, int((now_kst().replace(tzinfo=None) - et).total_seconds())) if et else ''
-    except Exception:
-        hold_sec = ''
-    extras = {
-        'mfe_pct': round(pct(high_after_buy, avg), 4) if avg > 0 else '',
-        'mae_pct': round(pct(low_after_buy, avg), 4) if avg > 0 else '',
-        'hold_sec': hold_sec, 'entry_reason': entry_reason,
-        'filled_gross': gross, 'fill_ratio': round(to_float(fill.get('fill_ratio',0)),4),
-        'slippage_pct': round(to_float(fill.get('slippage_pct',0)),4), 'orderbook_timestamp': fill.get('orderbook_timestamp',''),
-        'levels_used': int(fill.get('levels_used',0)), 'liquidity_limited': bool(fill.get('partial')),
-        'signal_price': round(to_float(S.get('prices',{}).get(sym,0)),4), 'best_price': round(to_float(fill.get('best_price',0)),4),
-    }
-    action = '가상매도' if remain <= 0 and target_qty >= qty else '부분가상매도'
-    if is_g:
-        project_save_orderbook_snapshot(sym, 'EXIT_FILLED', ai_id, 0, fill)
-    _multi_ai_record(ai_id, action, sym, price, sold, fee, pl, reason, remain > 0, extras)
-    return True
 
-def _multi_ai_recent_metrics(sym):
-    with LOCK:
-        hist = list(S.get('history', {}).get(sym, []) or [])
-        signals = dict(S.get('signals', {}))
-    sig = signals.get(sym, {}) if isinstance(signals.get(sym), dict) else {}
-    score = to_float(sig.get('score', 0))
 
-    def move(points):
-        if len(hist) >= points + 1 and to_float(hist[-points - 1]) > 0:
-            return pct(to_float(hist[-1]), to_float(hist[-points - 1]))
-        return 0.0
-    r3 = move(3)
-    r10 = move(10)
-    high = max([to_float(x) for x in hist[-30:] if to_float(x) > 0] or [0])
-    low = min([to_float(x) for x in hist[-30:] if to_float(x) > 0] or [0])
-    cur = to_float(hist[-1]) if hist else 0
-    from_high = pct(cur, high) if high else 0
-    from_low = pct(cur, low) if low else 0
-    return (score, r3, r10, from_high, from_low)
 
-def _learning_base_ids():
-    """학습 계좌가 비교할 실시간 가상계좌. 조합·학습계좌 자신은 제외한다."""
-    return [x for x in MULTI_AI_IDS if x.startswith(('RI', 'RE', 'WI', 'WE', 'G'))]
 
-def _record_multi_ai_daily_assets():
-    """매 루프 현재 자산을 오늘 날짜 스냅숏으로 저장한다. 다음날 선택에는 전일까지 값만 쓴다."""
-    d = today()
-    with LOCK:
-        for ai_id in MULTI_AI_IDS:
-            st = S.get('paper_ais', {}).get(ai_id, {})
-            st.setdefault('daily_assets', {})[d] = int(to_float(st.get('asset', st.get('cash', 0))))
-            keys = sorted(st.get('daily_assets', {}))
-            for old in keys[:-40]:
-                st['daily_assets'].pop(old, None)
 
-def _source_daily_returns(source_id, window=5, extra_cost_pct=0.0):
-    st = S.get('paper_ais', {}).get(source_id, {})
-    assets = st.get('daily_assets', {}) if isinstance(st.get('daily_assets'), dict) else {}
-    ds = sorted([d for d in assets if d < today()])
-    vals = []
-    for d0, d1 in zip(ds[:-1], ds[1:]):
-        a0 = to_float(assets.get(d0, 0))
-        a1 = to_float(assets.get(d1, 0))
-        if a0 > 0 and a1 > 0:
-            vals.append((d1, a1 / a0 - 1.0 - extra_cost_pct / 100.0))
-    return vals[-window:]
 
-def _learning_score(source_id, ai_id):
-    window = 7 if ai_id == 'L03' else 5
-    extra_cost = 0.1 if ai_id == 'L05' else 0.0
-    vals = _source_daily_returns(source_id, window, extra_cost)
-    if len(vals) < 2:
-        return -9999.0
-    rs = [r for _, r in vals]
-    equity = 1.0
-    peak = 1.0
-    mdd = 0.0
-    for r in rs:
-        equity *= 1 + r
-        peak = max(peak, equity)
-        mdd = min(mdd, equity / peak - 1)
-    total = equity - 1
-    if ai_id in ['L01', 'L02']:
-        w = [0.5 + i * (1.0 / max(1, len(rs) - 1)) for i in range(len(rs))]
-        return sum((r * x for r, x in zip(rs, w))) / sum(w) + 0.5 * mdd
-    if ai_id == 'L03':
-        return total
-    if ai_id == 'L04':
-        return total + 2.5 * mdd
-    return total + 4.0 * mdd - max(0, -min(rs)) * 1.5
 
-def _select_learning_sources(ai_id, force=False):
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        if not force and st.get('selection_date') == today():
-            return list(st.get('selected_sources', []) or [])
-    scored = []
-    for src in _learning_base_ids():
-        sc = _learning_score(src, ai_id)
-        if sc > -9990:
-            scored.append((sc, src))
-    scored.sort(reverse=True)
-    topn = 3 if ai_id == 'L02' else 1
-    chosen = [src for _, src in scored[:topn]]
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        st['selection_date'] = today()
-        st['selected_sources'] = chosen
-        st['selected_source'] = chosen[0] if chosen else ''
-        st['selection_reason'] = f'전일까지 최근성과 선택: ' + ', '.join((f'{src}={sc:.4f}' for sc, src in scored[:topn])) if chosen else '학습자료 부족'
-        st['last_action'] = f'{now_short()} 학습선택 ' + (','.join(chosen) if chosen else '자료부족 관망')
-    return chosen
 
-def _learning_effective_source(ai_id):
-    chosen = _select_learning_sources(ai_id, False)
-    return chosen[0] if chosen else ''
 
-def _multi_ai_parent_id(ai_id):
-    if str(ai_id).startswith('L'):
-        src = _learning_effective_source(ai_id)
-        return MULTI_AI_PARENT.get(src, src) if src else ai_id
-    return MULTI_AI_PARENT.get(ai_id, ai_id)
 
-def _multi_ai_index(ai_id):
-    parent = _multi_ai_parent_id(ai_id)
-    digits = ''.join((ch for ch in parent if ch.isdigit()))
-    return int(digits) if digits else 1
 
-def _multi_ai_family(ai_id):
-    parent = _multi_ai_parent_id(ai_id)
-    return parent[:1] if parent else ''
 
-def _multi_ai_universe_lists(ai_id, mode):
-    if str(ai_id).startswith('L'):
-        src = _learning_effective_source(ai_id)
-        if src:
-            ai_id = src
-    etf_long = ['122630', '233740', '069500', '229200', '494310', '488080', '469150']
-    etf_inv = ['252670', '251340']
-    samsung_hynix_long = ['0193T0', '000660', '0193W0', '005930']
-    samsung_hynix_inv = ['0197X0', '0193L0']
-    include_family = MULTI_AI_UNIVERSE.get(ai_id) == 'INCLUDE_SAMSUNG_HYNIX'
-    if mode == 'DOWN':
-        return etf_inv + (samsung_hynix_inv if include_family else [])
-    return etf_long + (samsung_hynix_long if include_family else [])
 
-def _multi_ai_candidate(ai_id, mode):
-    """그룹별 후보 선택. 학습형은 전일까지 선택한 원본 전략 규칙을 당일 고정 적용한다."""
-    if ai_id.startswith('L'):
-        chosen = _select_learning_sources(ai_id, False)
-        if not chosen:
-            return (0, '', 0, 0, 0, 0, 0, 0)
-        results = [_multi_ai_candidate(src, mode) for src in chosen]
-        return max(results, default=(0, '', 0, 0, 0, 0, 0, 0), key=lambda x: x[0])
-    if ai_id.startswith('G'):
-        return full_market_candidate(ai_id)
-    with LOCK:
-        prices = dict(S.get('prices', {}))
-    universe = _multi_ai_universe_lists(ai_id, mode)
-    market_ref = '252670' if mode == 'DOWN' else '069500'
-    _, _, market_r10, _, _ = _multi_ai_recent_metrics(market_ref)
-    scored = []
-    idx = _multi_ai_index(ai_id)
-    family = _multi_ai_family(ai_id)
-    parent = _multi_ai_parent_id(ai_id)
-    for sym in universe:
-        if prices.get(sym, 0) <= 0:
-            continue
-        score, r3, r10, from_high, from_low = _multi_ai_recent_metrics(sym)
-        rel = r10 - market_r10
-        if family == 'R':
-            methods = idx % 5
-            if methods == 1:
-                metric = score * 0.4 + r10 * 8 + rel * 4
-            elif methods == 2:
-                metric = score * 0.3 - r3 * 8 + from_low * 4
-            elif methods == 3:
-                metric = score * 0.25 + r3 * 14 + (10 if from_high >= -0.25 else -15)
-            elif methods == 4:
-                metric = score * 0.3 + from_low * 6 + r3 * 8 if -3.5 <= from_high <= -0.3 else -999
-            else:
-                metric = score * 0.55 + rel * 5 - abs(r3) * 2
-        else:
-            st = S.get('paper_ais', {}).get(ai_id, {})
-            own_penalty = max(0.0, -to_float(st.get('profit_rate', 0))) * 0.25
-            look = [3, 5, 7, 10][(idx - 1) % 4]
-            momentum = r3 if look <= 3 else r10
-            if parent == 'W13':
-                momentum = -r3
-            if parent == 'W15' and mode in ['CHOPPY', 'NO_TRADE', 'RECOVERY']:
-                metric = -999
-            else:
-                metric = score * 0.35 + momentum * 10 + rel * 5 + from_low * 2 - own_penalty
-        scored.append((metric, sym, score, r3, r10, from_high, from_low, rel))
-    return max(scored, default=(0, '', 0, 0, 0, 0, 0, 0), key=lambda x: x[0])
 
-def _multi_ai_entry_window(ai_id, hhmm):
-    if str(ai_id).startswith('L'):
-        src = _learning_effective_source(ai_id)
-        return _multi_ai_entry_window(src, hhmm) if src else False
-    family = _multi_ai_family(ai_id)
-    idx = _multi_ai_index(ai_id)
-    if family == 'G':
-        return PROJECT_OPENING_START <= hhmm < PROJECT_LAST_ENTRY
-    if family == 'E':
-        return ETF_LAB_START <= hhmm < ETF_LAB_LAST_ENTRY
-    if family == 'R':
-        fixed = {5: '09:15', 6: '10:00', 7: '11:00', 8: '12:30', 9: '13:00', 10: '13:30'}
-        if idx in fixed:
-            t = fixed[idx]
-            return t <= hhmm <= f'{t[:3]}{min(59, int(t[3:]) + 3):02d}'
-        if idx == 15:
-            return '14:45' <= hhmm <= '15:05'
-    return '09:15' <= hhmm < '14:30'
 
-def _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm):
-    logic_id = _learning_effective_source(ai_id) if str(ai_id).startswith('L') else ai_id
-    price = to_float(S.get('prices', {}).get(sym, 0))
-    avg = to_float(pos.get('avg', 0))
-    if price <= 0 or avg <= 0:
-        return ''
-    high = max(to_float(pos.get('high_after_buy', avg)), price)
-    low0 = to_float(pos.get('low_after_buy', avg)) or avg
-    low = min(low0, price)
-    with LOCK:
-        if sym in S['paper_ais'][ai_id]['positions']:
-            S['paper_ais'][ai_id]['positions'][sym]['high_after_buy'] = high
-            S['paper_ais'][ai_id]['positions'][sym]['low_after_buy'] = low
-    profit = pct(price, avg)
-    draw = pct(price, high)
-    parent = _multi_ai_parent_id(logic_id)
-    family = _multi_ai_family(logic_id)
-    if family == 'E':
-        if profit <= (ETF_LAB_E01_SL_PCT if parent == 'E01' else ETF_LAB_E02_SL_PCT):
-            sl = ETF_LAB_E01_SL_PCT if parent == 'E01' else ETF_LAB_E02_SL_PCT
-            return f'{ai_id} ETF 손절 {profit:.2f}% <= {sl:.2f}%'
-        if parent == 'E01' and profit >= ETF_LAB_E01_TP_PCT:
-            return f'{ai_id} ETF 목표익절 {profit:.2f}% >= {ETF_LAB_E01_TP_PCT:.2f}%'
-        if parent == 'E02' and profit >= ETF_LAB_E02_TRAIL_START_PCT and draw <= ETF_LAB_E02_TRAIL_DRAW_PCT:
-            return f'{ai_id} ETF 추적청산 profit={profit:.2f}% draw={draw:.2f}%'
-        if hhmm >= ETF_LAB_FORCE_EXIT:
-            return f'{ai_id} ETF 당일 {ETF_LAB_FORCE_EXIT} 청산'
-    elif family == 'G':
-        prof = PROJECT_G_EXIT_PROFILES.get(parent, PROJECT_G_EXIT_PROFILES['G02'])
-        if parent in {'G05','G06'}:
-            adaptive = _project_adaptive_exit(sym)
-            tp, sl, trail_start, trail = adaptive['tp'], adaptive['sl'], adaptive['trail_start'], adaptive['trail']
-        else:
-            tp, sl, trail_start, trail = prof['tp'], prof['sl'], prof['trail_start'], prof['trail']
-        if profit <= sl:
-            return f'{ai_id} PROJECT 손절 {profit:.2f}% <= {sl:.2f}%'
-        if tp is not None and profit >= tp:
-            return f'{ai_id} PROJECT 목표익절 {profit:.2f}% >= {tp:.2f}%'
-        if parent in {'G05','G06'} and profit >= trail_start and draw <= trail:
-            return f'{ai_id} PROJECT 자동추적청산 profit={profit:.2f}% draw={draw:.2f}%'
-        if hhmm >= '15:10':
-            return f'{ai_id} PROJECT 당일 15:10 청산'
-    elif parent == 'R14':
-        if profit >= 0.8 and draw <= -1.0:
-            return f'{ai_id} 추적청산 {draw:.2f}%'
-    else:
-        if profit <= -2.0:
-            return f'{ai_id} 손실제한 {profit:.2f}%'
-        if profit >= 0.8 and draw <= -1.0:
-            return f'{ai_id} 수익보호 {draw:.2f}%'
-        if parent != 'R15' and hhmm >= '15:10':
-            return f'{ai_id} 당일청산'
-    return ''
 
-def _combo_reset_daily(ai_id):
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        if st.get('combo_date') != today():
-            st['combo_date'] = today()
-            st['combo_phase'] = 0
-            st['combo_last_symbol'] = ''
-            st['last_decision_ts'] = 0
 
-def _combo_mode_for_phase(ai_id, phase, market_mode):
-    if ai_id == 'C01':
-        return 'DOWN' if phase == 0 else 'UP'
-    if ai_id == 'C02':
-        return 'DOWN'
-    if ai_id == 'C03':
-        return 'DOWN' if phase == 0 else 'UP'
-    return 'DOWN' if market_mode == 'DOWN' else 'UP'
 
-def _combo_times(ai_id):
-    if ai_id == 'C03':
-        return ('09:15', '11:30', '11:31', '14:00')
-    return ('09:15', '12:00', '12:01', '15:00')
 
-def _combo_pick_candidate(ai_id, direction):
-    metric, sym, score, r3, r10, from_high, from_low, rel = _multi_ai_candidate(ai_id, direction)
-    return (metric, sym, score, r3, r10, from_high, from_low, rel)
 
-def _run_combo_account(ai_id, market_mode, hhmm, now_ts):
-    _combo_reset_daily(ai_id)
-    entry1, exit1, entry2, exit2 = _combo_times(ai_id)
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        phase = int(to_float(st.get('combo_phase', 0)))
-        positions = dict(st.get('positions', {}))
-        last_ts = to_float(st.get('last_decision_ts', 0))
-    if phase == 1 and positions and (hhmm >= exit1):
-        for sym in list(positions):
-            ensure_live_orderbook(sym)
-            if _multi_ai_sell(ai_id, sym, f'{ai_id} 1차 구간 {exit1} 청산'):
-                with LOCK:
-                    st = S['paper_ais'][ai_id]
-                    st['combo_phase'] = 2
-                    st['last_decision_ts'] = 0
-        return True
-    if phase == 3 and positions and (hhmm >= exit2):
-        for sym in list(positions):
-            ensure_live_orderbook(sym)
-            if _multi_ai_sell(ai_id, sym, f'{ai_id} 2차 구간 {exit2} 청산'):
-                with LOCK:
-                    st = S['paper_ais'][ai_id]
-                    st['combo_phase'] = 4
-                    st['last_decision_ts'] = now_ts
-        return True
-    if positions:
-        return True
-    if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC:
-        return True
-    if phase == 0 and entry1 <= hhmm < exit1:
-        direction = _combo_mode_for_phase(ai_id, 0, market_mode)
-        metric, sym, score, r3, r10, from_high, from_low, rel = _combo_pick_candidate(ai_id, direction)
-        if sym and metric >= 35:
-            reason = f'{MULTI_AI_NAMES[ai_id]} 1차 direction={direction}, metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, rel={rel:.2f}%, decision_data_end={now_text()}'
-            if _multi_ai_buy(ai_id, sym, reason, 0.7):
-                with LOCK:
-                    st = S['paper_ais'][ai_id]
-                    st['combo_phase'] = 1
-                    st['combo_last_symbol'] = sym
-                    st['last_decision_ts'] = now_ts
-                return True
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            st['combo_phase'] = 2
-            st['last_decision_ts'] = 0
-            st['last_action'] = f'{now_short()} 1차 1회평가 관망 metric={metric:.1f}'
-        return True
-    if phase == 2 and entry2 <= hhmm < exit2:
-        direction = _combo_mode_for_phase(ai_id, 1, market_mode)
-        metric, sym, score, r3, r10, from_high, from_low, rel = _combo_pick_candidate(ai_id, direction)
-        if sym and metric >= 35:
-            reason = f'{MULTI_AI_NAMES[ai_id]} 2차 direction={direction}, metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, rel={rel:.2f}%, decision_data_end={now_text()}'
-            if _multi_ai_buy(ai_id, sym, reason, 0.7):
-                with LOCK:
-                    st = S['paper_ais'][ai_id]
-                    st['combo_phase'] = 3
-                    st['combo_last_symbol'] = sym
-                    st['last_decision_ts'] = now_ts
-                return True
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            st['combo_phase'] = 4
-            st['last_decision_ts'] = now_ts
-            st['last_action'] = f'{now_short()} 2차 1회평가 관망 metric={metric:.1f}'
-        return True
-    return True
 
-def _verified_candle_rows(sym):
-    """오늘 저장된 1분봉을 timestamp 기준으로 중복 제거하여 시간순 반환한다."""
-    path = candle_1m_path(sym)
-    if not os.path.exists(path):
-        return []
-    by_ts = {}
-    try:
-        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
-            for row in csv.DictReader(f):
-                ts = str(row.get('timestamp', ''))
-                dt = parse_api_datetime(ts)
-                close = to_float(row.get('close', 0))
-                if dt and close > 0 and (dt.strftime('%Y-%m-%d') == today()):
-                    by_ts[dt] = close
-    except Exception as e:
-        set_error(f'검증전략 1분봉 읽기 실패 {sym}: {e}')
-        return []
-    return sorted(by_ts.items(), key=lambda x: x[0])
 
-def _verified_ret(sym, minutes, end_hhmm):
-    rows = _verified_candle_rows(sym)
-    if not rows:
-        return 0.0
-    h, m = [int(x) for x in end_hhmm.split(':')]
-    end_dt = now_kst().replace(hour=h, minute=m, second=59, microsecond=999999)
-    start_dt = end_dt - __import__('datetime').timedelta(minutes=int(minutes))
-    end_vals = [(dt, px) for dt, px in rows if dt <= end_dt]
-    start_vals = [(dt, px) for dt, px in rows if dt <= start_dt]
-    if not end_vals or not start_vals:
-        return 0.0
-    return pct(end_vals[-1][1], start_vals[-1][1])
 
-def _verified_open_ret(sym, end_hhmm):
-    rows = _verified_candle_rows(sym)
-    if not rows:
-        return 0.0
-    h, m = [int(x) for x in end_hhmm.split(':')]
-    end_dt = now_kst().replace(hour=h, minute=m, second=59, microsecond=999999)
-    vals = [(dt, px) for dt, px in rows if dt <= end_dt]
-    if not vals:
-        return 0.0
-    return pct(vals[-1][1], vals[0][1])
 
-def _verified_rule_pick(ai_id, turn):
-    """사용자가 제공한 확정 규칙 파일을 코드로 그대로 옮긴 선택 함수."""
-    end = '09:45' if turn == 1 else '12:30'
-    if ai_id == 'V01':
-        if turn == 1:
-            h = _verified_ret('000660', 45, end)
-            s = _verified_ret('005930', 45, end)
-            a = _verified_ret('494310', 45, end)
-            b = _verified_ret('252670', 45, end)
-            spread = a - b
-            if h <= -2.92:
-                pick = '252670' if s > -1.99 or spread <= -7.3 else '494310'
-            else:
-                pick = '494310' if a <= 10.09 else '252670'
-            return (pick, f'V01-1 h45={h:.2f} s45={s:.2f} spread={spread:.2f}')
-        a = _verified_ret('494310', 5, end)
-        inv = _verified_ret('0193L0', 5, end)
-        pair = _verified_ret('0193T0', 5, end) - _verified_ret('0197X0', 5, end)
-        if a <= 0.51 and inv <= -0.34:
-            return ('494310', f'V01-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}')
-        if a <= 0.51 and pair <= -0.58:
-            return ('252670', f'V01-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}')
-        return ('', f'V01-2 SKIP a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}')
-    if ai_id == 'V02':
-        if turn == 1:
-            lev = _verified_ret('0193T0', 45, end)
-            inv2 = _verified_ret('252670', 45, end)
-            underlying = _verified_ret('000660', 45, end) - _verified_ret('005930', 45, end)
-            pick = '494310' if lev > -7.66 and inv2 > -8.3 and (underlying > -1.73) else '252670'
-            return (pick, f'V02-1 lev45={lev:.2f} inv45={inv2:.2f} underlying={underlying:.2f}')
-        a = _verified_ret('494310', 5, end)
-        inv = _verified_ret('0193L0', 5, end)
-        pair = _verified_ret('0193T0', 5, end) - _verified_ret('0197X0', 5, end)
-        if a <= 0.51 and inv <= -0.34:
-            return ('494310', f'V02-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}')
-        if a <= 0.51 and pair <= -0.58:
-            return ('252670', f'V02-2 a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}')
-        return ('', f'V02-2 SKIP a5={a:.2f} inv5={inv:.2f} pair={pair:.2f}')
-    if ai_id == 'V03':
-        if turn == 1:
-            h45 = _verified_ret('000660', 45, end)
-            inv5 = _verified_ret('252670', 5, end)
-            u30 = _verified_ret('000660', 30, end) - _verified_ret('005930', 30, end)
-            t30 = _verified_ret('494310', 30, end) - _verified_ret('252670', 30, end)
-            op = _verified_open_ret('494310', end) - _verified_open_ret('252670', end)
-            h15 = _verified_ret('000660', 15, end)
-            if h45 <= -3.0:
-                if inv5 <= 1.0:
-                    if u30 <= 0.0:
-                        pick = '0193T0' if t30 <= -5.0 else '0193W0'
-                    else:
-                        pick = '0193L0'
-                else:
-                    pick = '0193T0'
-            elif op <= 14.0:
-                pick = '0197X0'
-            else:
-                pick = '0193W0' if h15 <= 0.0 else '0193L0'
-            return (pick, f'V03-1 h45={h45:.2f} inv5={inv5:.2f} u30={u30:.2f} t30={t30:.2f} open={op:.2f} h15={h15:.2f}')
-        a5 = _verified_ret('494310', 5, end)
-        w15 = _verified_ret('0193W0', 15, end)
-        a10 = _verified_ret('494310', 10, end)
-        l15 = _verified_ret('0193L0', 15, end)
-        pair60 = _verified_ret('0193T0', 60, end) - _verified_ret('0193L0', 60, end)
-        x90 = _verified_ret('0197X0', 90, end)
-        if a5 <= 1.0:
-            if w15 <= 1.0:
-                if a10 <= -1.0:
-                    if l15 <= 0.0:
-                        pick = '0193L0'
-                    else:
-                        pick = '0193T0' if pair60 <= 1.0 else ''
-                else:
-                    pick = '0193T0' if x90 <= -4.0 else '0193W0'
-            else:
-                pick = '0197X0'
-        else:
-            pick = '0193T0'
-        return (pick, f'V03-2 a5={a5:.2f} w15={w15:.2f} a10={a10:.2f} l15={l15:.2f} pair60={pair60:.2f} x90={x90:.2f}')
-    return ('', 'UNKNOWN_VERIFIED_RULE')
 
-def _run_verified_fixed_account(ai_id, hhmm, now_ts):
-    _combo_reset_daily(ai_id)
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        phase = int(to_float(st.get('combo_phase', 0)))
-        positions = dict(st.get('positions', {}))
-    if phase == 1 and positions and (hhmm >= '12:00'):
-        for sym in list(positions):
-            ensure_live_orderbook(sym)
-            if _multi_ai_sell(ai_id, sym, f'{ai_id} 1차 12:00 고정청산'):
-                with LOCK:
-                    S['paper_ais'][ai_id]['combo_phase'] = 2
-        return True
-    if phase == 3 and positions and (hhmm >= '15:20'):
-        for sym in list(positions):
-            ensure_live_orderbook(sym)
-            if _multi_ai_sell(ai_id, sym, f'{ai_id} 2차 15:20 고정청산'):
-                with LOCK:
-                    S['paper_ais'][ai_id]['combo_phase'] = 4
-        return True
-    if positions:
-        return True
-    if phase == 0 and '09:45' <= hhmm < '09:50':
-        sym, reason = _verified_rule_pick(ai_id, 1)
-        ok = bool(sym) and _multi_ai_buy(ai_id, sym, reason + f' decision_data_end={now_text()}', 0.9)
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            st['combo_phase'] = 1 if ok else 2
-            st['last_decision_ts'] = now_ts
-            if not ok:
-                st['last_action'] = f'{now_short()} 1차 관망 {reason}'
-        return True
-    if phase == 2 and '12:30' <= hhmm < '12:35':
-        sym, reason = _verified_rule_pick(ai_id, 2)
-        ok = bool(sym) and _multi_ai_buy(ai_id, sym, reason + f' decision_data_end={now_text()}', 0.9)
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            st['combo_phase'] = 3 if ok else 4
-            st['last_decision_ts'] = now_ts
-            if not ok:
-                st['last_action'] = f'{now_short()} 2차 관망 {reason}'
-        return True
-    return True
 
-def _csv_daily_closes(sym, limit=30):
-    path = os.path.join(market_data_dir(), f'candles_1d_{sym}.csv')
-    if not os.path.exists(path):
-        return []
-    out = []
-    try:
-        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
-            for row in csv.DictReader(f):
-                d = str(row.get('date') or row.get('time') or row.get('timestamp') or row.get('dt') or '')
-                c = to_float(row.get('close') or row.get('closingPrice') or row.get('price') or row.get('close_price'), 0)
-                if c > 0:
-                    out.append((d, c))
-    except Exception as e:
-        set_error(f'daily close read {sym}: {e}')
-    return out[-limit:]
 
-def _daily_consensus_signal():
-    votes = []
-    detail = []
-    for sym in ['005930', '000660', '069500']:
-        vals = _csv_daily_closes(sym, 20)
-        if len(vals) < 11:
-            return (0, f'DAILY_NOT_READY {sym} rows={len(vals)}')
-        closes = [x[1] for x in vals]
-        last, prev = (closes[-1], closes[-2])
-        ma10 = sum(closes[-10:]) / 10
-        vote = 1 if last > prev and last > ma10 else -1 if last < prev and last < ma10 else 0
-        votes.append(vote)
-        detail.append(f'{sym}:{vote}')
-    sig = 1 if votes == [1, 1, 1] else -1 if votes == [-1, -1, -1] else 0
-    return (sig, ' '.join(detail))
 
-def _intraday_direction(end_hhmm='09:30', minutes=15):
-    rs = {s: _verified_ret(s, minutes, end_hhmm) for s in ['005930', '000660', '069500']}
-    up = sum((1 for v in rs.values() if v > 0.05))
-    down = sum((1 for v in rs.values() if v < -0.05))
-    sig = 1 if up >= 2 else -1 if down >= 2 else 0
-    return (sig, rs)
 
-def _same_direction_pick(direction, end_hhmm, minutes=15, allow_single=True):
-    if direction > 0:
-        cands = ['0193T0', '0193W0', '494310', '122630', '233740']
-        ranked = sorted(((_verified_ret(s, minutes, end_hhmm), s) for s in cands), reverse=True)
-    elif direction < 0:
-        cands = ['0197X0', '0193L0', '252670', '251340']
-        ranked = sorted(((_verified_ret(s, minutes, end_hhmm), s) for s in cands), reverse=True)
-    else:
-        return ('', 'NO_DIRECTION')
-    best_ret, best_sym = ranked[0]
-    if not allow_single and best_ret <= 0:
-        return ('', f'NO_POSITIVE_STRENGTH best={best_ret:.2f}')
-    return (best_sym, f'direction={direction} strength={best_ret:.2f}')
-
-def _data_trade_filter(end_hhmm):
-    for sym in ['005930', '000660', '069500', '494310', '252670']:
-        if to_float(S.get('prices', {}).get(sym, 0)) <= 0:
-            return (False, f'MISSING_PRICE {sym}')
-    h = _verified_ret('000660', 10, end_hhmm)
-    s = _verified_ret('005930', 10, end_hhmm)
-    if h * s < 0 and abs(h - s) > 0.5:
-        return (False, f'MIXED_UNDERLYING h={h:.2f} s={s:.2f}')
-    return (True, f'FILTER_OK h={h:.2f} s={s:.2f}')
 EXPANDED_SCHEDULES = {'V04': [('09:05', '15:10')], 'V05': [('09:25', '12:00'), ('12:35', '15:10')], 'V06': [('09:30', '12:00'), ('12:30', '15:10')], 'V07': [('09:30', '12:00'), ('12:30', '15:10')], 'V08': [('09:30', '12:00'), ('12:30', '15:10')], 'V09': [('09:15', '10:15')], 'V10': [('10:00', '11:30')], 'V11': [('11:00', '12:30')], 'V12': [('11:00', '12:30')], 'V14': [('09:20', '10:20'), ('10:30', '11:30'), ('12:30', '13:30'), ('14:00', '15:10')], 'V15': [('09:30', '11:30'), ('12:30', '15:10')]}
 
-def _expanded_pick(ai_id, slot, entry_hhmm):
-    daily_sig, daily_reason = _daily_consensus_signal()
-    intraday_sig, rs = _intraday_direction(entry_hhmm, 15 if entry_hhmm < '11:00' else 30)
-    ok_filter, filter_reason = _data_trade_filter(entry_hhmm)
-    if ai_id == 'V04':
-        sym, why = _same_direction_pick(daily_sig, entry_hhmm, 15, False)
-        return (sym, f'V04 {daily_reason} {why}')
-    if ai_id == 'V05':
-        if daily_sig == 0:
-            return ('', f'V05 DAILY_NO_TRADE {daily_reason}')
-        h20 = _verified_ret('000660', 20, entry_hhmm)
-        h5 = _verified_ret('000660', 5, entry_hhmm)
-        s20 = _verified_ret('005930', 20, entry_hhmm)
-        s5 = _verified_ret('005930', 5, entry_hhmm)
-        reentry = h20 * daily_sig > 0 and h5 * daily_sig > 0 and (s20 * daily_sig > 0) and (s5 * daily_sig > 0)
-        if not reentry:
-            return ('', f'V05 NO_REENTRY h20={h20:.2f} h5={h5:.2f} s20={s20:.2f} s5={s5:.2f}')
-        sym, why = _same_direction_pick(daily_sig, entry_hhmm, 10, False)
-        return (sym, f'V05 {daily_reason} {why}')
-    if ai_id == 'V06':
-        direction = daily_sig or intraday_sig
-        sym, why = _same_direction_pick(direction, entry_hhmm, 30, False)
-        return (sym, f'V06 daily={daily_sig} intra={intraday_sig} {why}')
-    if ai_id == 'V07':
-        h = _verified_ret('000660', 15, entry_hhmm)
-        s = _verified_ret('005930', 15, entry_hhmm)
-        direction = 1 if h > 0.05 and s > 0.05 else -1 if h < -0.05 and s < -0.05 else 0
-        sym, why = _same_direction_pick(direction, entry_hhmm, 15, False)
-        return (sym, f'V07 h={h:.2f} s={s:.2f} {why}')
-    if ai_id == 'V08':
-        if not ok_filter:
-            return ('', f'V08 {filter_reason}')
-        sym, why = _same_direction_pick(intraday_sig, entry_hhmm, 15, False)
-        return (sym, f'V08 {filter_reason} {why}')
-    if ai_id in ['V09', 'V10', 'V11']:
-        sym, why = _same_direction_pick(intraday_sig, entry_hhmm, 15, False)
-        return (sym, f'{ai_id} fixed {why} rs={rs}')
-    if ai_id == 'V12':
-        sym, why = _same_direction_pick(intraday_sig, entry_hhmm, 30, False)
-        return (sym, f'V12 consensus90 {why} rs={rs}')
-    if ai_id == 'V14':
-        sym, why = _same_direction_pick(intraday_sig, entry_hhmm, 10, False)
-        return (sym, f'V14 slot={slot + 1} {why}')
-    if ai_id == 'V15':
-        sym, why = _same_direction_pick(intraday_sig, entry_hhmm, 20, False)
-        return (sym, f'V15 slot={slot + 1} direction_switch_or_reentry {why}')
-    return ('', 'UNKNOWN_EXPANDED')
 
-def _expanded_reset(ai_id):
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        if st.get('expanded_date') != today():
-            st['expanded_date'] = today()
-            st['expanded_slot'] = 0
-            st['last_decision_ts'] = 0
 
-def _run_expanded_account(ai_id, hhmm, now_ts):
-    if ai_id == 'V13':
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            positions = dict(st.get('positions', {}))
-            last_date = st.get('overnight_entry_date', '')
-        if positions and last_date and (last_date != today()) and (hhmm >= '09:05'):
-            for sym in list(positions):
-                ensure_live_orderbook(sym)
-                _multi_ai_sell(ai_id, sym, 'V13 다음 거래일 09:05 오버나이트 청산')
-            return True
-        if not positions and '15:10' <= hhmm < '15:15':
-            sig, rs = _intraday_direction('15:10', 30)
-            sym, why = _same_direction_pick(sig, '15:10', 30, False)
-            if sym and _multi_ai_buy(ai_id, sym, f'V13 오버나이트 진입 {why} rs={rs}', 0.9):
-                with LOCK:
-                    S['paper_ais'][ai_id]['overnight_entry_date'] = today()
-            return True
-        return True
-    _expanded_reset(ai_id)
-    schedule = EXPANDED_SCHEDULES.get(ai_id, [])
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        slot = int(to_float(st.get('expanded_slot', 0)))
-        positions = dict(st.get('positions', {}))
-    if slot >= len(schedule):
-        return True
-    entry, exit_ = schedule[slot]
-    if positions and hhmm >= exit_:
-        for sym in list(positions):
-            ensure_live_orderbook(sym)
-            _multi_ai_sell(ai_id, sym, f'{ai_id} {slot + 1}차 {exit_} 고정청산')
-        with LOCK:
-            S['paper_ais'][ai_id]['expanded_slot'] = slot + 1
-        return True
-    if positions:
-        return True
-    if hhmm > exit_:
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            st['expanded_slot'] = slot + 1
-            st['last_action'] = f'{now_short()} {slot + 1}차 시간누락 관망'
-        return True
-    if entry <= hhmm <= (entry[:3] + str(min(9, int(entry[3:]) + 4)) if int(entry[3:]) <= 5 else entry):
-        sym, reason = _expanded_pick(ai_id, slot, entry)
-        ok = bool(sym) and _multi_ai_buy(ai_id, sym, reason + f' decision_data_end={now_text()}', 0.9)
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            st['last_decision_ts'] = now_ts
-            if not ok:
-                st['expanded_slot'] = slot + 1
-                st['last_action'] = f'{now_short()} {slot + 1}차 관망 {reason}'
-        return True
-    return True
 
-def _etf_lab_candidate():
-    """5개 ETF를 동일한 변동성 단위로 비교해 1배/2배 상품의 단순 변동폭 편향을 줄인다."""
-    rows = []
-    for sym in ETF_LAB_SYMBOLS:
-        if to_float(S.get('prices', {}).get(sym, 0)) <= 0:
-            continue
-        score, r3, r10, from_high, from_low = _multi_ai_recent_metrics(sym)
-        vol = max(0.08, _project_intraday_volatility(sym, 15))
-        n3, n10 = r3 / vol, r10 / vol
-        high_bonus = 8.0 if from_high >= -0.20 else (4.0 if from_high >= ETF_LAB_HIGH_GAP_PCT else -8.0)
-        metric = 50.0 + min(18.0, n3 * 5.0) + min(18.0, n10 * 2.5) + high_bonus + min(6.0, score * 0.06)
-        rows.append((metric, sym, score, r3, r10, from_high, from_low, vol))
-    return max(rows, default=(0,'',0,0,0,0,0,0), key=lambda x: x[0])
 
-def _etf_lab_target_done(ai_id):
-    with LOCK:
-        return str(S['paper_ais'][ai_id].get('etf_done_date','')) == today()
 
-def _run_etf_lab_account(ai_id, hhmm, now_ts):
-    """E01=첫 +1.4% 목표익절 성공 후 당일 종료, E02=같은 진입후보를 추적청산으로 비교."""
-    ensure_multi_ai_states()
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        positions = dict(st.get('positions', {}))
-        last_ts = to_float(st.get('last_decision_ts', 0))
-    if positions:
-        for sym, pos in list(positions.items()):
-            reason = _multi_ai_exit_reason(ai_id, sym, pos, target_market_regime(), hhmm)
-            if reason:
-                ensure_live_orderbook(sym)
-                if _multi_ai_sell(ai_id, sym, reason):
-                    if ai_id == 'E01' and 'ETF 목표익절' in reason:
-                        with LOCK:
-                            S['paper_ais'][ai_id]['etf_done_date'] = today()
-                            S['paper_ais'][ai_id]['last_action'] = f'{now_short()} ETF +1.4% 성공, 당일 신규진입 종료'
-        return True
-    if ai_id == 'E01' and _etf_lab_target_done(ai_id):
-        return True
-    if not (ETF_LAB_START <= hhmm < ETF_LAB_LAST_ENTRY):
-        return True
-    if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC:
-        return True
-    ds = _project_daily_stats(ai_id)
-    if ds['realized_pct'] <= ETF_LAB_DAILY_MAX_LOSS_PCT:
-        with LOCK:
-            st['last_action'] = f'{now_short()} ETF 일일손실한도 관망 {ds["realized_pct"]:.2f}%'
-        return True
-    metric, sym, score, r3, r10, from_high, from_low, vol = _etf_lab_candidate()
-    if (not sym or metric < ETF_LAB_MIN_METRIC or r3 < ETF_LAB_MIN_R3_PCT or
-            r10 < ETF_LAB_MIN_R10_PCT or from_high < ETF_LAB_HIGH_GAP_PCT):
-        with LOCK:
-            st['last_decision_ts'] = now_ts
-            st['last_action'] = f'{now_short()} ETF 관망 metric={metric:.1f} r3={r3:.2f} r10={r10:.2f} high={from_high:.2f}'
-        return True
-    re_state = _project_symbol_reentry_state(ai_id, sym)
-    if re_state['last'] and time.time() - re_state['last_ts'] < ETF_LAB_REENTRY_COOLDOWN_SEC:
-        with LOCK:
-            st['last_decision_ts'] = now_ts
-            st['last_action'] = f'{now_short()} ETF 재진입쿨다운 {name_of(sym)}'
-        return True
-    reason = (f'{MULTI_AI_NAMES[ai_id]} ETF5 best={sym} metric={metric:.1f}, score={score:.1f}, '
-              f'r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, vol={vol:.3f}, decision_data_end={now_text()}')
-    if ensure_live_orderbook(sym) and _multi_ai_buy(ai_id, sym, reason, ETF_LAB_ENTRY_RATIO):
-        with LOCK:
-            st['last_decision_ts'] = now_ts
-            st['last_decision_date'] = today()
-            st['decision_data_end'] = now_text()
-    return True
 
-def _project_manage_g05_position(ai_id, sym, pos, hhmm):
-    """급등 V1 공통 청산(G05/G06): +1% 보호, +1.5% 절반익절, 나머지는 +2% 이후 0.7% 추적."""
-    price = to_float(S.get('prices', {}).get(sym, 0)); avg = to_float(pos.get('avg', 0))
-    if price <= 0 or avg <= 0:
-        return False
-    high = max(to_float(pos.get('high_after_buy', avg)), price)
-    low0 = to_float(pos.get('low_after_buy', avg)) or avg
-    low = min(low0, price)
-    profit = pct(price, avg); draw = pct(price, high)
-    with LOCK:
-        live = S['paper_ais'][ai_id].get('positions', {}).get(sym)
-        if isinstance(live, dict):
-            live['high_after_buy'] = high; live['low_after_buy'] = low
-            if profit >= PROJECT_G_V1_PROTECT_ARM_PCT:
-                live['protect_armed'] = True
-            protect_armed = bool(live.get('protect_armed', False))
-            partial_taken = bool(live.get('partial_taken', False))
-        else:
-            return False
-    if profit <= PROJECT_G_V1_HARD_SL_PCT:
-        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 손절 {profit:.2f}% <= {PROJECT_G_V1_HARD_SL_PCT:.2f}%')
-    if (not partial_taken) and profit >= PROJECT_G_V1_PARTIAL_TP_PCT:
-        ok = _multi_ai_sell(ai_id, sym, f'{ai_id} V1 1차익절 {profit:.2f}% >= {PROJECT_G_V1_PARTIAL_TP_PCT:.2f}%', sell_ratio=PROJECT_G_V1_PARTIAL_RATIO)
-        if ok:
-            with LOCK:
-                live = S['paper_ais'][ai_id].get('positions', {}).get(sym)
-                if isinstance(live, dict):
-                    live['partial_taken'] = True; live['protect_armed'] = True
-            save_state()
-        return ok
-    if protect_armed and profit <= PROJECT_G_V1_PROTECT_FLOOR_PCT:
-        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 수익보호 {profit:.2f}% <= {PROJECT_G_V1_PROTECT_FLOOR_PCT:.2f}%')
-    if profit >= PROJECT_G_V1_TRAIL_START_PCT and draw <= -PROJECT_G_V1_TRAIL_DRAW_PCT:
-        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 추적청산 profit={profit:.2f}% draw={draw:.2f}%')
-    if hhmm >= '15:10':
-        return _multi_ai_sell(ai_id, sym, f'{ai_id} V1 당일 15:10 청산')
-    return False
 
-def run_multi_paper_ais():
-    """독립 가상계좌들을 실행한다. 실제 주문 함수는 절대 호출하지 않는다."""
-    ensure_multi_ai_states()
-    for ai_id in MULTI_AI_IDS:
-        _multi_ai_update(ai_id)
-    _record_multi_ai_daily_assets()
-    for ai_id in [x for x in MULTI_AI_IDS if x.startswith('L')]:
-        _select_learning_sources(ai_id, False)
-    if not ENABLE_MULTI_PAPER_AI or not paper_auto_time_open():
-        return
-    mode = target_market_regime()
-    now_ts = time.time()
-    hhmm = now_kst().strftime('%H:%M')
-    # V5.08: G계열은 전용 project_scanner_worker가 만든 최신 스냅샷만 소비한다.
-    # worker가 늦거나 죽었을 때의 fallback은 full_market_candidate 내부에서만 수행한다.
-    for ai_id in MULTI_AI_IDS:
-        if ai_id in {'E01','E02'}:
-            _run_etf_lab_account(ai_id, hhmm, now_ts)
-            continue
-        if ai_id in {'V01', 'V02', 'V03'}:
-            _run_verified_fixed_account(ai_id, hhmm, now_ts)
-            continue
-        if ai_id.startswith('V'):
-            _run_expanded_account(ai_id, hhmm, now_ts)
-            continue
-        if ai_id.startswith('C'):
-            _run_combo_account(ai_id, mode, hhmm, now_ts)
-            continue
-        with LOCK:
-            st = S['paper_ais'][ai_id]
-            positions = dict(st.get('positions', {}))
-            last_ts = to_float(st.get('last_decision_ts', 0))
-        if positions:
-            for sym, pos in list(positions.items()):
-                if _multi_ai_parent_id(ai_id) in {'G05','G06'}:
-                    _project_manage_g05_position(ai_id, sym, pos, hhmm)
-                    continue
-                reason = _multi_ai_exit_reason(ai_id, sym, pos, mode, hhmm)
-                if reason:
-                    ensure_live_orderbook(sym, force=True)
-                    _multi_ai_sell(ai_id, sym, reason)
-            continue
-        if now_ts - last_ts < MULTI_AI_DECISION_COOLDOWN_SEC:
-            continue
-        if not _multi_ai_entry_window(ai_id, hhmm):
-            continue
-        if _multi_ai_family(ai_id) == 'G' and not _project_allow_new_entry(ai_id):
-            with LOCK:
-                st = S['paper_ais'][ai_id]
-                st['last_action'] = f'{now_short()} PROJECT 일일목표/손실/횟수 게이트 관망'
-            continue
-        parent = _multi_ai_parent_id(ai_id)
-        family = _multi_ai_family(ai_id)
-        if parent == 'W15' and mode in ['CHOPPY', 'NO_TRADE', 'RECOVERY']:
-            with LOCK:
-                st['last_decision_ts'] = now_ts
-                st['last_action'] = f'{now_short()} 현금관망 {mode}'
-            continue
-        metric, sym, score, r3, r10, from_high, from_low, rel = _multi_ai_candidate(ai_id, mode)
-        threshold = 46 if ai_id.startswith('L') else PROJECT_ENTRY_MIN_SCORE if family == 'G' else 42 if family == 'W' else 40
-        if not sym or metric < threshold:
-            with LOCK:
-                st['last_decision_ts'] = now_ts
-                st['decision_data_end'] = now_text()
-                st['last_action'] = f'{now_short()} 관망 mode={mode} metric={metric:.1f}'
-            continue
-        if family == 'G' and (not ensure_live_orderbook(sym)):
-            with LOCK:
-                st['last_decision_ts'] = now_ts
-                st['last_action'] = f'{now_short()} 호가미수신 관망 {sym}'
-            continue
-        ratios = {'G01': PROJECT_G_TARGET_POSITION_RATIO, 'G02': PROJECT_G_TARGET_POSITION_RATIO, 'G03': PROJECT_G_TARGET_POSITION_RATIO, 'G04': PROJECT_G_TARGET_POSITION_RATIO, 'G05': PROJECT_G_TARGET_POSITION_RATIO, 'G06': PROJECT_G_TARGET_POSITION_RATIO, 'W15': 0.3, 'R12': 0.35, 'R13': 0.4, 'L01': 0.7, 'L02': 0.55, 'L03': 0.65, 'L04': 0.5, 'L05': 0.35}
-        ratio = ratios.get(parent, 0.7)
-        project_type = _project_state().get('shared_candidate', {}).get('signal_type', '') if family == 'G' else ''
-        if family == 'G':
-            allow, guard_reason = _project_entry_guard(ai_id, sym, metric, score, r3, r10, from_high, from_low, project_type)
-            if not allow:
-                with LOCK:
-                    st['last_decision_ts'] = now_ts
-                    st['last_action'] = f'{now_short()} PROJECT 진입차단 {guard_reason} {name_of(sym)}'
-                project_write_candidate_event(ai_id, sym, metric, f'ENTRY_BLOCK {guard_reason} score={score:.1f} r3={r3:.2f} r10={r10:.2f} high={from_high:.2f}', 'ENTRY_BLOCK')
-                continue
-        reason = f'{MULTI_AI_NAMES[ai_id]} group={MULTI_AI_GROUP[ai_id]}, universe={MULTI_AI_UNIVERSE[ai_id]}, parent={parent}, mode={mode}, project_type={project_type}, metric={metric:.1f}, score={score:.1f}, r3={r3:.2f}%, r10={r10:.2f}%, high={from_high:.2f}%, low={from_low:.2f}%, rel={rel:.2f}%, decision_data_end={now_text()}'
-        if _multi_ai_buy(ai_id, sym, reason, ratio):
-            with LOCK:
-                st['last_decision_ts'] = now_ts
-                st['last_decision_date'] = today()
-                st['decision_data_end'] = now_text()
 
-def project_save_orderbook_snapshot(sym, event, ai_id='', target_cash=0, fill=None):
-    """G 급등 PAPER 의사결정 순간의 호가를 작게 저장한다. 전 종목 틱 저장은 하지 않는다."""
-    if not PROJECT_G_LIQUIDITY_SNAPSHOT_ENABLED:
-        return
-    ob = S.setdefault('market_data_capture', {}).get('latest_orderbook', {}).get(sym, {})
-    if not isinstance(ob, dict) or not ob:
-        return
-    asks = list(ob.get('asks', []) or [])[:PROJECT_G_ORDERBOOK_LEVELS]
-    bids = list(ob.get('bids', []) or [])[:PROJECT_G_ORDERBOOK_LEVELS]
-    fill = fill if isinstance(fill, dict) else {}
-    row = {
-        'time': now_text(), 'event': str(event), 'ai_id': str(ai_id), 'symbol': str(sym), 'name': name_of(sym),
-        'api_timestamp': str(ob.get('timestamp','')), 'signal_price': to_float(S.get('prices',{}).get(sym,0)),
-        'best_ask': to_float(ob.get('best_ask',0)), 'best_bid': to_float(ob.get('best_bid',0)),
-        'target_cash': int(to_float(target_cash,0)), 'fill_qty': int(to_float(fill.get('qty',0))),
-        'fill_gross': round(to_float(fill.get('gross',0)),4), 'avg_price': round(to_float(fill.get('avg_price',0)),4),
-        'fill_ratio': round(to_float(fill.get('fill_ratio',0)),6), 'slippage_pct': round(to_float(fill.get('slippage_pct',0)),6),
-        'levels_used': int(to_float(fill.get('levels_used',0))), 'partial': bool(fill.get('partial',False)),
-        'asks_json': json.dumps(asks, ensure_ascii=False, separators=(',',':')),
-        'bids_json': json.dumps(bids, ensure_ascii=False, separators=(',',':')),
-    }
-    headers = ['time','event','ai_id','symbol','name','api_timestamp','signal_price','best_ask','best_bid','target_cash','fill_qty','fill_gross','avg_price','fill_ratio','slippage_pct','levels_used','partial','asks_json','bids_json']
-    write_row(project_orderbook_snapshot_path(), headers, row)
 
 def simulated_orderbook_fill(sym, side, max_cash=0, qty=0, max_slippage_pct=None, depth_usage_ratio=1.0, max_levels=None):
     """현재 호가를 실제처럼 위에서부터 소진하되, PAPER에서는 표시잔량 일부와 슬리피지 한도를 적용할 수 있다."""
@@ -4506,7 +2728,12 @@ def simulated_orderbook_fill(sym, side, max_cash=0, qty=0, max_slippage_pct=None
     if not valid:
         return {'ok': False, 'reason': 'ORDERBOOK_INVALID', 'qty': 0, 'avg_price': 0, 'gross': 0, 'fill_ratio': 0.0, 'slippage_pct': 0.0, 'levels_used': 0}
     best = valid[0][0]
-    target_qty = int(float(max_cash) // best) if side == 'BUY' else int(qty)
+    if side == 'BUY':
+        cash_qty = int(float(max_cash) // best) if float(max_cash) > 0 else 0
+        qty_cap = int(qty) if int(qty) > 0 else 0
+        target_qty = min(cash_qty, qty_cap) if cash_qty > 0 and qty_cap > 0 else (cash_qty or qty_cap)
+    else:
+        target_qty = int(qty)
     if target_qty <= 0:
         return {'ok': False, 'reason': 'TARGET_ZERO', 'qty': 0, 'avg_price': 0, 'gross': 0, 'fill_ratio': 0.0, 'slippage_pct': 0.0, 'levels_used': 0, 'best_price': best}
     remain_cash = float(max_cash); remain_qty = target_qty
@@ -4737,40 +2964,10 @@ def capture_orderbook_and_trades(symbols=None):
     return stats
 
 
-def _us_semi_default(ai_id):
-    return {
-        'id': ai_id, 'name': US_SEMI_PAPER_NAMES.get(ai_id, ai_id),
-        'start_cash': US_SEMI_START_CASH, 'cash': US_SEMI_START_CASH,
-        'position': None, 'realized_pl': 0.0, 'asset': US_SEMI_START_CASH,
-        'profit_rate': 0.0, 'trades': [], 'last_action': '초기화',
-        'last_decision_ts': 0.0, 'last_exit_ts': 0.0, 'trade_count': 0,
-        'trade_date': '', 'peak_asset': US_SEMI_START_CASH, 'mdd_pct': 0.0,
-        'last_daily_decision_date': '', 'last_daily_signal': '', 'last_daily_features': {},
-        'last_regime': 'UNKNOWN', 'last_regime_date': '', 'same_day_entry_block': '',
-    }
 
-def ensure_us_semi_paper_states():
-    with LOCK:
-        root = S.setdefault('us_semi_paper', {})
-        for ai_id in US_SEMI_PAPER_IDS:
-            cur = root.get(ai_id)
-            if not isinstance(cur, dict):
-                root[ai_id] = _us_semi_default(ai_id)
-            else:
-                for k, v in _us_semi_default(ai_id).items():
-                    cur.setdefault(k, v)
-                cur['name'] = US_SEMI_PAPER_NAMES.get(ai_id, ai_id)
 
-def us_semi_paper_dir():
-    path = os.path.join(us_day_dir(), 'paper_us_semi')
-    os.makedirs(path, exist_ok=True)
-    return path
 
-def us_semi_log_path():
-    return os.path.join(us_semi_paper_dir(), f'us_semi_reversal_{us_trade_date_from_calendar()}.csv')
 
-def us_semi_state_path(ai_id):
-    return os.path.join(us_semi_paper_dir(), f'paper_account_state_{ai_id}_{us_trade_date_from_calendar()}.json')
 
 def _us_session_bounds():
     """Regular-session timestamps remain the official anchor used by legacy code."""
@@ -4817,778 +3014,55 @@ def us_market_session_status():
         return ('AFTER_HOURS', overnight_start, pre_start, reg_start, reg_end, after_end)
     return ('CLOSED', overnight_start, pre_start, reg_start, reg_end, after_end)
 
-def _us_session_start_for_features(session, overnight_start, pre_start, reg_start, reg_end):
-    return {'OVERNIGHT': overnight_start, 'PREMARKET': pre_start,
-            'REGULAR': reg_start, 'AFTER_HOURS': reg_end}.get(session)
-
-def _read_us_candles(sym, limit=240):
-    rows = _read_csv_rows(us_data_path('candles_1m', sym))
-    out = []
-    for r in rows[-max(limit * 2, limit):]:
-        dt = parse_api_datetime(r.get('timestamp'))
-        close = to_float(r.get('close', 0))
-        if dt and close > 0:
-            out.append({
-                'dt': dt, 'close': close, 'high': to_float(r.get('high', close)),
-                'low': to_float(r.get('low', close)), 'volume': to_float(r.get('volume', 0))
-            })
-    out.sort(key=lambda x: x['dt'])
-    return out[-limit:]
-
-def _us_daily_date(raw_ts):
-    text = str(raw_ts or '').strip()
-    m = re.match(r'^(\d{4}-\d{2}-\d{2})', text)
-    if m:
-        return m.group(1)
-    dt = parse_api_datetime(text)
-    return dt.strftime('%Y-%m-%d') if dt else ''
-
-def _read_us_daily_closes(sym, limit=220):
-    rows = _read_csv_rows(us_data_path('candles_1d', sym))
-    by_date = {}
-    for r in rows:
-        d = _us_daily_date(r.get('timestamp'))
-        close = to_float(r.get('close', 0))
-        if d and close > 0:
-            by_date[d] = {'date': d, 'close': close}
-    out = [by_date[k] for k in sorted(by_date)]
-    return out[-limit:]
-
-def _us_regime_daily_features():
-    """확정 일봉 기반 U03/U04 특징.
-    진입 레짐에 쓰는 MA/MOM/DD는 당일(cur)이 아니라 전일(prev)까지의 확정 데이터로 계산한다.
-    당일 수익률은 cur vs prev이며 AFTER_HOURS 확정종가 판단에만 사용한다.
-    """
-    long_rows = _read_us_daily_closes('SOXL', 260)
-    inv_rows = _read_us_daily_closes('SOXS', 260)
-    inv_map = {x['date']: x['close'] for x in inv_rows}
-    common = [dict(x, soxs=inv_map[x['date']]) for x in long_rows if x['date'] in inv_map]
-    need = max(US_REGIME_MA_WINDOW + 2, US_REGIME_DD_WINDOW + 2, US_REGIME_MOM_WINDOW + 3)
-    if len(common) < need:
-        return {'ok': False, 'block': f'INSUFFICIENT_DAILY_{len(common)}'}
-    i = len(common) - 1
-    cur, prev = common[i], common[i-1]
-    r_soxl = pct(cur['close'], prev['close'])
-    r_soxs = pct(cur['soxs'], prev['soxs'])
-
-    ma_slice = common[i-US_REGIME_MA_WINDOW:i]          # prev 포함, cur 제외
-    ma_prev = sum(x['close'] for x in ma_slice) / max(1, len(ma_slice))
-    ma2_slice = common[i-1-US_REGIME_MA_WINDOW:i-1]     # prev2 포함, prev 제외
-    ma_prev2 = sum(x['close'] for x in ma2_slice) / max(1, len(ma2_slice))
-    mom_base = common[i-1-US_REGIME_MOM_WINDOW]['close']
-    mom_prev = pct(prev['close'], mom_base)
-    dd_slice = common[i-US_REGIME_DD_WINDOW:i]
-    peak_prev = max(x['close'] for x in dd_slice)
-    dd_prev = pct(prev['close'], peak_prev)
-
-    if prev['close'] > ma_prev and ma_prev > ma_prev2 and mom_prev > 0:
-        prev_regime = 'BULL_TREND'
-    elif prev['close'] < ma_prev and mom_prev <= US_REGIME_MOM_MAX_PCT and dd_prev <= US_REGIME_DD_MAX_PCT:
-        prev_regime = 'BEAR_TREND'
-    else:
-        prev_regime = 'CHOP'
-
-    regime_short = prev_regime == 'BEAR_TREND'
-    soxl_close_entry = r_soxl <= US_REGIME_SOXL_DROP_PCT
-    soxs_entry = (regime_short and r_soxl >= US_REGIME_SOXL_REBOUND_MIN_PCT and r_soxs <= US_REGIME_SOXS_DROP_PCT)
-    candidate = 'SOXL' if soxl_close_entry else ('SOXS' if soxs_entry else '')
-    signal = 'SOXL_DROP_CLOSE' if soxl_close_entry else ('SOXS_REGIME_BUY' if soxs_entry else 'NO_ENTRY')
-    return {
-        'ok': True, 'block': signal, 'session': 'DAILY_CLOSE', 'trade_date': cur['date'],
-        'candidate': candidate, 'opposite': 'SOXS' if candidate == 'SOXL' else ('SOXL' if candidate == 'SOXS' else ''),
-        'price': cur['close'] if candidate == 'SOXL' else (cur['soxs'] if candidate == 'SOXS' else 0.0),
-        'soxl_close': cur['close'], 'soxs_close': cur['soxs'],
-        'soxl_day_pct': r_soxl, 'soxs_day_pct': r_soxs,
-        'prev_soxl_close': prev['close'], 'prev_ma20': ma_prev, 'prev_ma20_prior': ma_prev2,
-        'prev_mom15_pct': mom_prev, 'prev_dd20_pct': dd_prev,
-        'prev_regime': prev_regime, 'regime_short': regime_short,
-        'entry_ratio': US_REGIME_ENTRY_RATIO,
-    }
-
-
-def _us_latest_completed_regime():
-    """현재 시점에서 알 수 있는 가장 최근 완료 일봉만으로 다음 장의 레짐을 분류한다."""
-    long_rows = _read_us_daily_closes('SOXL', 260)
-    inv_rows = _read_us_daily_closes('SOXS', 260)
-    inv_map = {x['date']: x['close'] for x in inv_rows}
-    common = [dict(x, soxs=inv_map[x['date']]) for x in long_rows if x['date'] in inv_map]
-    trade_date = us_trade_date_from_calendar()
-    # 정규장 중 파일에 미완성 당일봉이 섞이는 경우를 방지한다.
-    if common and common[-1]['date'] == trade_date and us_market_session_status()[0] in {'OVERNIGHT','PREMARKET','REGULAR'}:
-        common = common[:-1]
-    need = max(US_REGIME_MA_WINDOW + 2, US_REGIME_DD_WINDOW + 1, US_REGIME_MOM_WINDOW + 2)
-    if len(common) < need:
-        return {'ok': False, 'regime': 'UNKNOWN', 'block': f'INSUFFICIENT_DAILY_{len(common)}'}
-    i = len(common) - 1
-    cur, prev = common[i], common[i-1]
-    day_ret = pct(cur['close'], prev['close'])
-    ma = sum(x['close'] for x in common[i-US_REGIME_MA_WINDOW+1:i+1]) / US_REGIME_MA_WINDOW
-    ma_prev = sum(x['close'] for x in common[i-US_REGIME_MA_WINDOW:i]) / US_REGIME_MA_WINDOW
-    mom = pct(cur['close'], common[i-US_REGIME_MOM_WINDOW]['close'])
-    peak = max(x['close'] for x in common[i-US_REGIME_DD_WINDOW+1:i+1])
-    dd = pct(cur['close'], peak)
-    if day_ret <= US_REGIME_SOXL_DROP_PCT:
-        regime = 'PANIC_DROP'
-    elif cur['close'] > ma and ma > ma_prev and mom > 0:
-        regime = 'BULL_TREND'
-    elif cur['close'] < ma and mom <= US_REGIME_MOM_MAX_PCT and dd <= US_REGIME_DD_MAX_PCT:
-        regime = 'BEAR_TREND'
-    else:
-        regime = 'CHOP'
-    return {
-        'ok': True, 'regime': regime, 'date': cur['date'], 'soxl_close': cur['close'], 'soxs_close': cur['soxs'],
-        'day_ret': day_ret, 'ma20': ma, 'ma20_prev': ma_prev, 'mom15_pct': mom, 'dd20_pct': dd,
-    }
-
-def _us_regime_log(ai_id, event, f, reason=''):
-    headers = ['time_kst','trade_date','account','event','symbol','price','soxl_close','soxs_close',
-               'soxl_day_pct','soxs_day_pct','prev_soxl_close','prev_ma20','prev_mom15_pct','prev_dd20_pct',
-               'regime_short','signal','reason','paper_only']
-    path = os.path.join(us_semi_paper_dir(), f'us_regime_adaptive_{us_trade_date_from_calendar()}.csv')
-    write_row(path, headers, {
-        'time_kst': now_text(), 'trade_date': f.get('trade_date',''), 'account': ai_id, 'event': event,
-        'symbol': f.get('candidate',''), 'price': round(to_float(f.get('price')), 6),
-        'soxl_close': round(to_float(f.get('soxl_close')), 6), 'soxs_close': round(to_float(f.get('soxs_close')), 6),
-        'soxl_day_pct': round(to_float(f.get('soxl_day_pct')), 4), 'soxs_day_pct': round(to_float(f.get('soxs_day_pct')), 4),
-        'prev_soxl_close': round(to_float(f.get('prev_soxl_close')), 6), 'prev_ma20': round(to_float(f.get('prev_ma20')), 6),
-        'prev_mom15_pct': round(to_float(f.get('prev_mom15_pct')), 4), 'prev_dd20_pct': round(to_float(f.get('prev_dd20_pct')), 4),
-        'regime_short': bool(f.get('regime_short')), 'signal': f.get('block',''), 'reason': reason or f.get('block',''),
-        'paper_only': True,
-    })
-
-def _us_return(candles, minutes):
-    if len(candles) < minutes + 1:
-        return 0.0
-    return pct(candles[-1]['close'], candles[-1-minutes]['close'])
-
-def _us_session_open_return(candles, session_start):
-    valid = [x for x in candles if x['dt'] >= session_start]
-    if not valid:
-        return 0.0
-    return pct(valid[-1]['close'], valid[0]['close'])
-
-def _us_volume_ratio(candles, short=3, base=20):
-    if len(candles) < max(short, base):
-        return 0.0
-    recent = sum(x['volume'] for x in candles[-short:]) / short
-    baseline_rows = candles[-base:-short] or candles[-base:]
-    baseline = sum(x['volume'] for x in baseline_rows) / max(1, len(baseline_rows))
-    return recent / baseline if baseline > 0 else 0.0
-
-def _us_turn_stopped(candles, side):
-    """For a rebound-long candidate, require fresh lows to stop; for inverse rebound, same rule on that ETF."""
-    n = US_SEMI_TURN_LOOKBACK_MIN
-    if len(candles) < n + 3:
-        return False
-    recent = candles[-n:]
-    prior = candles[-(n+3):-n]
-    if not prior:
-        return False
-    # Entry ETF itself must stop printing lower lows and close away from its recent low.
-    prior_low = min(x['low'] for x in prior)
-    recent_low = min(x['low'] for x in recent)
-    last = recent[-1]['close']
-    return recent_low >= prior_low and last > recent_low
-
-def _us_pair_features():
-    session, overnight_start, pre_start, reg_start, reg_end, after_end = us_market_session_status()
-    if session not in {'OVERNIGHT', 'PREMARKET', 'REGULAR', 'AFTER_HOURS'}:
-        return {'ok': False, 'block': 'SESSION_CLOSED', 'session': session}
-    start = _us_session_start_for_features(session, overnight_start, pre_start, reg_start, reg_end)
-    pair = {}
-    for sym in US_SEMI_SYMBOLS:
-        c = _read_us_candles(sym)
-        if len(c) < 21:
-            return {'ok': False, 'block': f'INSUFFICIENT_CANDLES_{sym}', 'session': session}
-        age_sec = max(0.0, (now_kst() - c[-1]['dt']).total_seconds())
-        if age_sec > US_SEMI_STALE_DATA_SEC:
-            return {'ok': False, 'block': f'STALE_DATA_{sym}_{int(age_sec)}s', 'session': session}
-        pair[sym] = {
-            'candles': c, 'price': c[-1]['close'], 'move': _us_session_open_return(c, start),
-            'm3': _us_return(c, 3), 'm5': _us_return(c, 5), 'm10': _us_return(c, 10),
-            'vol_ratio': _us_volume_ratio(c), 'turn_stopped': _us_turn_stopped(c, sym),
-        }
-    pair_spread = pair['SOXL']['move'] - pair['SOXS']['move']
-    # The more beaten-down member is the mean-reversion candidate.
-    candidate = 'SOXL' if pair['SOXL']['move'] < pair['SOXS']['move'] else 'SOXS'
-    opposite = 'SOXS' if candidate == 'SOXL' else 'SOXL'
-    c, o = pair[candidate], pair[opposite]
-    extreme = c['move'] <= -US_SEMI_EXTREME_MOVE_PCT or abs(pair_spread) >= US_SEMI_PAIR_SPREAD_PCT
-    momentum = c['m3'] >= US_SEMI_MOM3_MIN_PCT and c['m5'] >= US_SEMI_MOM5_MIN_PCT and c['m10'] >= US_SEMI_MOM10_MIN_PCT
-    relative_weakening = o['m3'] <= -US_SEMI_RELATIVE_WEAKEN_PCT or c['m3'] > o['m3']
-    volume_ok = c['vol_ratio'] >= US_SEMI_VOLUME_RATIO_MIN
-    turn_ok = bool(c['turn_stopped'])
-    ok = extreme and momentum and relative_weakening and volume_ok and turn_ok
-    blocks = []
-    if not extreme: blocks.append('NOT_EXTREME')
-    if not momentum: blocks.append('MOMENTUM_NOT_CONFIRMED')
-    if not turn_ok: blocks.append('NEW_EXTREME_STILL_UPDATING')
-    if not relative_weakening: blocks.append('OPPOSITE_ETF_NOT_WEAKENING')
-    if not volume_ok: blocks.append('VOLUME_NOT_EXPANDING')
-    return {
-        'ok': ok, 'block': '|'.join(blocks) if blocks else 'ENTRY_OK', 'session': session,
-        'candidate': candidate, 'opposite': opposite, 'pair_spread_pct': pair_spread,
-        'candidate_move_pct': c['move'], 'opposite_move_pct': o['move'],
-        'm3': c['m3'], 'm5': c['m5'], 'm10': c['m10'],
-        'opposite_m3': o['m3'], 'volume_ratio': c['vol_ratio'], 'turn_stopped': turn_ok,
-        'price': c['price'],
-    }
-
-def _us_semi_log(ai_id, event, f, pnl_pct=0.0, mfe=0.0, mae=0.0, reason=''):
-    headers = ['time_kst','trade_date','account','event','session','symbol','opposite',
-               'price','candidate_move_pct','opposite_move_pct','pair_spread_pct',
-               'm3','m5','m10','opposite_m3','turn_stopped','volume_ratio',
-               'reason','mfe_pct','mae_pct','return_pct','real_order_enabled']
-    write_row(us_semi_log_path(), headers, {
-        'time_kst': now_text(), 'trade_date': us_trade_date_from_calendar(), 'account': ai_id,
-        'event': event, 'session': f.get('session',''), 'symbol': f.get('candidate',''),
-        'opposite': f.get('opposite',''), 'price': f.get('price',0),
-        'candidate_move_pct': round(to_float(f.get('candidate_move_pct')),4),
-        'opposite_move_pct': round(to_float(f.get('opposite_move_pct')),4),
-        'pair_spread_pct': round(to_float(f.get('pair_spread_pct')),4),
-        'm3': round(to_float(f.get('m3')),4), 'm5': round(to_float(f.get('m5')),4),
-        'm10': round(to_float(f.get('m10')),4), 'opposite_m3': round(to_float(f.get('opposite_m3')),4),
-        'turn_stopped': bool(f.get('turn_stopped')), 'volume_ratio': round(to_float(f.get('volume_ratio')),4),
-        'reason': reason or f.get('block',''), 'mfe_pct': round(mfe,4), 'mae_pct': round(mae,4),
-        'return_pct': round(pnl_pct,4), 'real_order_enabled': False,
-    })
-
-def _us_semi_mark_price(sym):
-    c = _read_us_candles(sym, 5)
-    return c[-1]['close'] if c else 0.0
-
-
-def update_us_semi_paper_asset(ai_id, save=False):
-    """U01/U02/U03/U04 PAPER 계좌를 최신 수집가격으로 시가평가하고 수익률/MDD를 갱신한다."""
-    ensure_us_semi_paper_states()
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        cash = to_float(st.get('cash', 0))
-        pos = dict(st.get('position') or {})
-        start = max(1.0, to_float(st.get('start_cash', US_SEMI_START_CASH)))
-    asset = cash
-    if pos:
-        sym = str(pos.get('symbol', ''))
-        qty = to_int(pos.get('qty'))
-        mark = _us_semi_mark_price(sym)
-        if mark <= 0:
-            mark = to_float(pos.get('avg', 0))
-        fx = _us_replay_fx_usdkrw(False)
-        if fx > 0:
-            asset += qty * mark * fx
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        st['asset'] = round(asset, 4)
-        st['profit_rate'] = round((asset / start - 1.0) * 100.0, 6)
-        peak = max(to_float(st.get('peak_asset', start)), asset)
-        st['peak_asset'] = round(peak, 4)
-        dd = ((asset / peak) - 1.0) * 100.0 if peak > 0 else 0.0
-        st['mdd_pct'] = round(min(to_float(st.get('mdd_pct', 0.0)), dd), 6)
-        out = st['asset']
-    if save:
-        save_state()
-    return out
-
-
-def _us_semi_buy(ai_id, f):
-    ensure_us_semi_paper_states()
-    price = to_float(f.get('price'))
-    if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
-        return False
-    fx = _us_replay_fx_usdkrw(False)
-    if fx <= 0:
-        return False
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        cash = to_float(st.get('cash'))
-        entry_ratio = max(0.10, min(1.0, to_float(f.get('entry_ratio', US_SEMI_ENTRY_RATIO))))
-        budget_krw = cash * entry_ratio
-        budget_usd = budget_krw / fx
-        qty = int(budget_usd / price)
-        if qty <= 0:
-            return False
-        gross_krw = qty * price * fx
-        fee = gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
-        cost = gross_krw + fee
-        if cost > cash:
-            qty = max(0, int(cash / (price * fx * (1 + US_SEMI_FEE_SIDE_PCT/100.0))))
-            gross_krw = qty * price * fx
-            fee = gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
-            cost = gross_krw + fee
-        if qty <= 0:
-            return False
-        st['cash'] = cash - cost
-        st['position'] = {'symbol': f['candidate'], 'qty': qty, 'avg': price, 'entry_fee': fee,
-                          'entry_time': now_text(), 'peak_price': price, 'trough_price': price, 'trailing_armed': False,
-                          'entry_features': dict(f)}
-        st['trade_count'] = to_int(st.get('trade_count')) + 1
-        st['last_decision_ts'] = time.time()
-        st['last_action'] = f"{now_short()} PAPER BUY {f['candidate']} {qty}@{price:.4f}"
-    _us_semi_log(ai_id, 'PAPER_ENTRY', f, reason=f.get('block','ENTRY_OK'))
-    return True
-
-def _us_semi_buy_ratio(ai_id, symbol, price, cash_ratio, reason, entry_features=None, allow_add=False, stage=1, strategy=''):
-    """PAPER 전용 비율매수/추가매수.
-    cash_ratio는 현재 가용현금 비율이다. U03 1차는 0.20, 종가확인은 남은 현금 1.00을 사용한다.
-    """
-    ensure_us_semi_paper_states()
-    symbol = str(symbol or '').upper()
-    price = to_float(price)
-    cash_ratio = max(0.0, min(1.0, to_float(cash_ratio)))
-    if symbol not in US_SEMI_SYMBOLS or price <= 0 or cash_ratio <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
-        return False
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        old = dict(st.get('position') or {})
-        if old and (not allow_add or str(old.get('symbol')) != symbol):
-            return False
-        cash = to_float(st.get('cash'))
-        fx = _us_replay_fx_usdkrw(False)
-        if fx <= 0:
-            return False
-        budget_krw = cash * cash_ratio
-        budget_usd = budget_krw / fx
-        qty = int(budget_usd / (price * (1 + US_SEMI_FEE_SIDE_PCT / 100.0)))
-        if qty <= 0:
-            return False
-        gross_krw = qty * price * fx
-        fee = gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
-        cost = gross_krw + fee
-        if cost > cash:
-            return False
-        if old:
-            old_qty = to_int(old.get('qty'))
-            old_avg = to_float(old.get('avg'))
-            new_qty = old_qty + qty
-            new_avg = ((old_qty * old_avg) + (qty * price)) / max(1, new_qty)
-            old['qty'] = new_qty
-            old['avg'] = new_avg
-            old['entry_fee'] = to_float(old.get('entry_fee')) + fee
-            old['peak_price'] = max(to_float(old.get('peak_price', price)), price)
-            old['trough_price'] = min(to_float(old.get('trough_price', price)), price)
-            old['entry_stage'] = max(to_int(old.get('entry_stage', 1)), int(stage))
-            old['last_add_time'] = now_text()
-            old['last_add_reason'] = reason
-            if strategy:
-                old['strategy'] = strategy
-            if entry_features:
-                old.setdefault('entry_features', {}).update(dict(entry_features))
-            st['position'] = old
-            event = 'PAPER_ADD'
-        else:
-            trade_date = us_trade_date_from_calendar()
-            st['position'] = {
-                'symbol': symbol, 'qty': qty, 'avg': price, 'entry_fee': fee,
-                'entry_time': now_text(), 'first_entry_date': trade_date,
-                'peak_price': price, 'trough_price': price, 'trailing_armed': False,
-                'entry_stage': int(stage), 'strategy': strategy or ai_id,
-                'entry_reason': reason, 'entry_features': dict(entry_features or {}),
-            }
-            st['trade_count'] = to_int(st.get('trade_count')) + 1
-            event = 'PAPER_ENTRY'
-        st['cash'] = cash - cost
-        st['last_decision_ts'] = time.time()
-        st['last_action'] = f'{now_short()} {event} {symbol} {qty}@{price:.4f} {reason}'
-    f = dict(entry_features or {})
-    f.update({'candidate': symbol, 'price': price, 'block': reason, 'session': us_market_session_status()[0]})
-    _us_semi_log(ai_id, event, f, reason=reason)
-    return True
-
-
-def _us_intraday_prev_close():
-    rows = _read_us_daily_closes('SOXL', 5)
-    if not rows:
-        return 0.0
-    trade_date = us_trade_date_from_calendar()
-    # 당일봉이 이미 기록된 경우에는 직전 거래일 종가를 사용한다.
-    if rows[-1]['date'] == trade_date and len(rows) >= 2:
-        return to_float(rows[-2]['close'])
-    return to_float(rows[-1]['close'])
-
-
-def _us_touch_feature(symbol='SOXL'):
-    price = _us_semi_mark_price(symbol)
-    prev_close = _us_intraday_prev_close() if symbol == 'SOXL' else 0.0
-    if symbol == 'SOXS':
-        rows = _read_us_daily_closes('SOXS', 5)
-        trade_date = us_trade_date_from_calendar()
-        if rows:
-            prev_close = to_float(rows[-2]['close'] if rows[-1]['date'] == trade_date and len(rows) >= 2 else rows[-1]['close'])
-    move = pct(price, prev_close) if price > 0 and prev_close > 0 else 0.0
-    return {'candidate': symbol, 'price': price, 'prev_close': prev_close, 'intraday_pct': move,
-            'session': us_market_session_status()[0], 'trade_date': us_trade_date_from_calendar()}
-
-
-def _us_semi_sell(ai_id, reason, price_override=0.0):
-    ensure_us_semi_paper_states()
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        pos = dict(st.get('position') or {})
-    if not pos:
-        return False
-    sym = pos['symbol']
-    price = to_float(price_override) if to_float(price_override) > 0 else _us_semi_mark_price(sym)
-    if price <= 0 or US_REAL_ORDER_ENABLED or ENABLE_REAL_ORDER:
-        return False
-    qty, avg = to_int(pos.get('qty')), to_float(pos.get('avg'))
-    fx = _us_replay_fx_usdkrw(False)
-    if fx <= 0:
-        return False
-    entry_fee = to_float(pos.get('entry_fee'))
-    exit_gross_krw = qty * price * fx
-    exit_fee = exit_gross_krw * US_SEMI_FEE_SIDE_PCT / 100.0
-    entry_gross_krw = qty * avg * fx
-    pnl = qty * (price - avg) * fx - entry_fee - exit_fee
-    pnl_pct = (pnl / max(1e-9, entry_gross_krw + entry_fee)) * 100.0
-    mfe = pct(to_float(pos.get('peak_price', avg)), avg)
-    mae = pct(to_float(pos.get('trough_price', avg)), avg)
-    f = dict(pos.get('entry_features') or {})
-    f.update({'candidate': sym, 'price': price, 'session': us_market_session_status()[0]})
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        st['cash'] = to_float(st.get('cash')) + exit_gross_krw - exit_fee
-        st['realized_pl'] = to_float(st.get('realized_pl')) + pnl
-        st['position'] = None
-        st['last_exit_ts'] = time.time()
-        st['last_action'] = f'{now_short()} PAPER SELL {sym} {pnl_pct:.2f}% {reason}'
-        st['trades'].append({'time': now_text(), 'symbol': sym, 'qty': qty, 'entry': avg,
-                             'exit': price, 'pnl': pnl, 'return_pct': pnl_pct,
-                             'mfe_pct': mfe, 'mae_pct': mae, 'reason': reason})
-        st['trades'] = st['trades'][-200:]
-    _us_semi_log(ai_id, 'PAPER_EXIT', f, pnl_pct, mfe, mae, reason)
-    return True
 
 
 
-def _refresh_us_regime_daily_after_close():
-    """U03 전용: AFTER_HOURS 진입 직후 SOXL/SOXS 당일 일봉을 1회 강제 갱신한다.
-    6시간 메타데이터 주기 때문에 당일 종가 신호가 하루 늦어지는 문제를 막는다.
-    두 종목 모두 최신 일봉 날짜가 미국 캘린더 trade_date와 같을 때만 True.
-    """
-    expected = us_trade_date_from_calendar()
-    if not expected:
-        return False
-    state = S.setdefault('us_market_data_capture', {})
-    # 이미 오늘 성공 검증을 끝냈다면 파일 날짜를 한 번 더 확인하고 재사용한다.
-    if state.get('u03_daily_refresh_date') == expected:
-        ok_cached = True
-        for sym in US_SEMI_SYMBOLS:
-            rows = _read_us_daily_closes(sym, 3)
-            if not rows or rows[-1].get('date') != expected:
-                ok_cached = False
-                break
-        if ok_cached:
-            return True
-
-    daily_headers = ['requested_at','received_at','saved_at','latency_ms','symbol','timestamp','open','high','low','close','volume','currency']
-    success = True
-    for sym in US_SEMI_SYMBOLS:
-        req = now_kst()
-        t0 = time.time()
-        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1d', 'count': 240, 'adjusted': True}, timeout=12)
-        rec = now_kst()
-        latency = round((time.time() - t0) * 1000, 3)
-        if code != 200:
-            success = False
-            set_error(f'U03 {sym} 당일 일봉 강제갱신 실패 HTTP_{code}')
-            _market_data_request_gap()
-            continue
-        candles = _result_dict(data).get('candles', [])
-        rows = []
-        for c in reversed(candles if isinstance(candles, list) else []):
-            if not isinstance(c, dict):
-                continue
-            rows.append({'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': c.get('timestamp',''), 'open': c.get('openPrice',0), 'high': c.get('highPrice',0), 'low': c.get('lowPrice',0), 'close': c.get('closePrice',0), 'volume': c.get('volume',0), 'currency': c.get('currency','USD')})
-        if rows:
-            _rewrite_csv(us_data_path('candles_1d', sym), daily_headers, rows)
-        _market_data_request_gap()
-        chk = _read_us_daily_closes(sym, 3)
-        if not chk or chk[-1].get('date') != expected:
-            success = False
-            got = chk[-1].get('date') if chk else 'NONE'
-            set_error(f'U03 {sym} 당일종가 미확정 expected={expected} got={got}')
-    if success:
-        state['u03_daily_refresh_date'] = expected
-        state['u03_daily_refresh_at'] = now_text()
-    return success
-
-
-def sanitize_us_semi_legacy_unit_state():
-    """구버전 USD/KRW 단위 혼용으로 불가능한 수량이 남은 PAPER 상태를 격리 후 초기화한다.
-
-    전략 판단을 재작성하지 않고, 시작자금보다 큰 원화환산 포지션처럼 물리적으로 불가능한
-    PAPER 상태만 대상으로 한다. 원본 상태는 _quarantine에 보존한다.
-    """
-    if not US_SEMI_PAPER_ENABLED:
-        return []
-    fx = _us_replay_fx_usdkrw(True)
-    if fx <= 0:
-        return []
-    ensure_us_semi_paper_states()
-    repaired = []
-    for ai_id in US_SEMI_PAPER_IDS:
-        with LOCK:
-            st = S['us_semi_paper'][ai_id]
-            pos = dict(st.get('position') or {})
-            start_cash = max(1.0, to_float(st.get('start_cash', US_SEMI_START_CASH)))
-        if not pos:
-            continue
-        qty = to_int(pos.get('qty'))
-        avg = to_float(pos.get('avg'))
-        notional_krw = qty * avg * fx
-        # 정상 로직은 수수료 포함 가용현금 이하만 매수하므로 시작자금 110% 초과 포지션은
-        # 구버전 단위혼용 상태로 판정해 미래 PAPER 결과 오염을 차단한다.
-        if qty > 0 and avg > 0 and notional_krw > start_cash * 1.10:
-            snapshot = {
-                'detected_at': now_text(), 'version': OPERATING_VERSION, 'ai_id': ai_id,
-                'fx_usdkrw': fx, 'position_notional_krw': notional_krw,
-                'reason': 'LEGACY_USD_KRW_UNIT_CONTAMINATION', 'state': st,
-            }
-            qdir = os.path.join(LOG_ROOT, '_quarantine')
-            os.makedirs(qdir, exist_ok=True)
-            qpath = os.path.join(qdir, f'us_semi_{ai_id}_legacy_unit_{int(time.time())}.json')
-            _atomic_json_write(qpath, snapshot)
-            with LOCK:
-                clean = _us_semi_default(ai_id)
-                clean['last_action'] = f'{now_short()} RESET LEGACY_USD_KRW_UNIT_CONTAMINATION'
-                clean['legacy_quarantine_file'] = qpath
-                clean['legacy_quarantine_detected_at'] = now_text()
-                S['us_semi_paper'][ai_id] = clean
-            repaired.append({'ai_id': ai_id, 'notional_krw': round(notional_krw, 2), 'quarantine': qpath})
-    if repaired:
-        save_state()
-        S.setdefault('us_market_data_capture', {})['legacy_unit_repairs'] = repaired
-    return repaired
-
-
-def run_us_regime_paper():
-    """U03: SOXL -5% 장중 20% -> 종가도 -5% 이하면 남은 현금 추가.
-    진입일 당일에는 음봉 청산하지 않고, 다음 거래일부터 첫 음봉 종가에 전량 청산한다.
-    """
-    ai_id = 'U03'
-    ensure_us_semi_paper_states()
-    session = us_market_session_status()[0]
-    trade_date = us_trade_date_from_calendar()
-
-    # 1) 정규장 장중 -5% 터치: 20% 선매수. 실제 수집가격으로만 PAPER 체결한다.
-    if session == 'REGULAR':
-        with LOCK:
-            st = S['us_semi_paper'][ai_id]
-            pos = dict(st.get('position') or {})
-            blocked = st.get('same_day_entry_block') == trade_date
-        if not pos and not blocked:
-            tf = _us_touch_feature('SOXL')
-            if tf.get('prev_close', 0) > 0 and to_float(tf.get('intraday_pct')) <= US_U03_TOUCH_PCT:
-                _us_semi_buy_ratio(ai_id, 'SOXL', tf['price'], US_U03_TOUCH_RATIO,
-                                   'U03_TOUCH_MINUS_5', tf, allow_add=False, stage=1, strategy='U03_20_80')
-        return
-
-    # 2) 종가 판단은 확정 일봉이 생긴 AFTER_HOURS에서 하루 1회.
-    if session != 'AFTER_HOURS':
-        return
-    if not _refresh_us_regime_daily_after_close():
-        return
-    f = _us_regime_daily_features()
-    if not f.get('ok'):
-        return
-    d = f.get('trade_date', '')
-    if not d:
-        return
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        if st.get('last_daily_decision_date') == d:
-            return
-        st['last_daily_decision_date'] = d
-        st['last_daily_signal'] = f.get('block','')
-        st['last_daily_features'] = dict(f)
-        pos = dict(st.get('position') or {})
-
-    if pos:
-        sym = str(pos.get('symbol',''))
-        day_pct = to_float(f.get('soxl_day_pct' if sym == 'SOXL' else 'soxs_day_pct'))
-        close_px = to_float(f.get('soxl_close' if sym == 'SOXL' else 'soxs_close'))
-        first_date = str(pos.get('first_entry_date',''))
-        stage = to_int(pos.get('entry_stage', 1))
-        # 진입 당일: 종가도 -5% 이하이면 남은 현금을 모두 추가하여 20/80 구조를 완성한다.
-        if first_date == d:
-            if sym == 'SOXL' and stage == 1 and to_float(f.get('soxl_day_pct')) <= US_REGIME_SOXL_DROP_PCT:
-                added = _us_semi_buy_ratio(ai_id, 'SOXL', close_px, US_U03_CLOSE_ADD_CASH_RATIO,
-                                           'U03_CLOSE_CONFIRM_ADD', f, allow_add=True, stage=2, strategy='U03_20_80')
-                _us_regime_log(ai_id, 'PAPER_ADD' if added else 'ADD_FAIL', dict(f, candidate='SOXL', price=close_px), 'U03_CLOSE_CONFIRM_ADD')
-            else:
-                _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), 'ENTRY_DAY_NO_EXIT')
-            return
-        # 다음 거래일부터 첫 음봉 종가 청산.
-        if day_pct < 0:
-            sold = _us_semi_sell(ai_id, f'DAILY_FIRST_NEGATIVE {day_pct:.2f}%', price_override=close_px)
-            with LOCK:
-                S['us_semi_paper'][ai_id]['same_day_entry_block'] = d
-            _us_regime_log(ai_id, 'PAPER_EXIT' if sold else 'EXIT_FAIL', dict(f, candidate=sym, price=close_px), f'FIRST_NEGATIVE {day_pct:.2f}%')
-        else:
-            _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), f'POSITIVE_CLOSE {day_pct:.2f}%')
-        return
-
-    # 장중 터치를 관측하지 못한 날은 종가만 보고 가상의 20% 체결을 만들지 않는다.
-    _us_regime_log(ai_id, 'WAIT', f, 'NO_INTRADAY_TOUCH_POSITION')
-
-
-def run_us_adaptive_paper():
-    """U04 시장상태 적응형 PAPER.
-    - 당일 SOXL -5% 터치가 최우선(PANIC): 20% 선매수, 종가확인 시 남은 현금 추가.
-    - 전일까지 BULL: SOXL -3% 눌림에 80% PAPER 진입.
-    - 전일까지 BEAR: 종가에서 SOXL +7% & SOXS -5%일 때 SOXS 60% 진입.
-    - CHOP: 신규진입 없음.
-    모든 보유는 진입 다음 거래일부터 첫 음봉 종가 청산한다.
-    """
-    ai_id = 'U04'
-    ensure_us_semi_paper_states()
-    session = us_market_session_status()[0]
-    trade_date = us_trade_date_from_calendar()
-
-    if session == 'REGULAR':
-        with LOCK:
-            st = S['us_semi_paper'][ai_id]
-            pos = dict(st.get('position') or {})
-            blocked = st.get('same_day_entry_block') == trade_date
-        if pos or blocked:
-            return
-        reg = _us_latest_completed_regime()
-        with LOCK:
-            S['us_semi_paper'][ai_id]['last_regime'] = reg.get('regime','UNKNOWN')
-            S['us_semi_paper'][ai_id]['last_regime_date'] = reg.get('date','')
-        tf = _us_touch_feature('SOXL')
-        move = to_float(tf.get('intraday_pct'))
-        # 현재 당일 급락은 전일 레짐보다 우선한다.
-        if tf.get('prev_close', 0) > 0 and move <= US_U03_TOUCH_PCT:
-            _us_semi_buy_ratio(ai_id, 'SOXL', tf['price'], US_U04_PANIC_TOUCH_RATIO,
-                               'U04_PANIC_TOUCH', dict(tf, regime='PANIC_DROP'), False, 1, 'U04_PANIC_20_80')
-        elif reg.get('ok') and reg.get('regime') == 'BULL_TREND' and move <= US_U04_BULL_PULLBACK_PCT:
-            _us_semi_buy_ratio(ai_id, 'SOXL', tf['price'], US_U04_BULL_ENTRY_RATIO,
-                               'U04_BULL_PULLBACK', dict(tf, regime='BULL_TREND'), False, 1, 'U04_BULL_PULLBACK')
-        return
-
-    if session != 'AFTER_HOURS':
-        return
-    if not _refresh_us_regime_daily_after_close():
-        return
-    f = _us_regime_daily_features()
-    if not f.get('ok'):
-        return
-    d = f.get('trade_date','')
-    with LOCK:
-        st = S['us_semi_paper'][ai_id]
-        if st.get('last_daily_decision_date') == d:
-            return
-        st['last_daily_decision_date'] = d
-        st['last_daily_features'] = dict(f)
-        st['last_regime'] = f.get('prev_regime','UNKNOWN')
-        st['last_regime_date'] = d
-        pos = dict(st.get('position') or {})
-
-    if pos:
-        sym = str(pos.get('symbol',''))
-        close_px = to_float(f.get('soxl_close' if sym == 'SOXL' else 'soxs_close'))
-        day_pct = to_float(f.get('soxl_day_pct' if sym == 'SOXL' else 'soxs_day_pct'))
-        first_date = str(pos.get('first_entry_date',''))
-        stage = to_int(pos.get('entry_stage',1))
-        strat = str(pos.get('strategy',''))
-        if first_date == d:
-            if sym == 'SOXL' and strat == 'U04_PANIC_20_80' and stage == 1 and to_float(f.get('soxl_day_pct')) <= US_REGIME_SOXL_DROP_PCT:
-                added = _us_semi_buy_ratio(ai_id, 'SOXL', close_px, US_U04_PANIC_CLOSE_ADD_CASH_RATIO,
-                                           'U04_PANIC_CLOSE_ADD', dict(f, regime='PANIC_DROP'), True, 2, 'U04_PANIC_20_80')
-                _us_regime_log(ai_id, 'PAPER_ADD' if added else 'ADD_FAIL', dict(f, candidate='SOXL', price=close_px), 'U04_PANIC_CLOSE_ADD')
-            else:
-                _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), 'ENTRY_DAY_NO_EXIT')
-            return
-        if day_pct < 0:
-            sold = _us_semi_sell(ai_id, f'U04_DAILY_FIRST_NEGATIVE {day_pct:.2f}%', price_override=close_px)
-            with LOCK:
-                S['us_semi_paper'][ai_id]['same_day_entry_block'] = d
-            _us_regime_log(ai_id, 'PAPER_EXIT' if sold else 'EXIT_FAIL', dict(f, candidate=sym, price=close_px), f'U04_FIRST_NEGATIVE {day_pct:.2f}%')
-        else:
-            _us_regime_log(ai_id, 'HOLD', dict(f, candidate=sym, price=close_px), f'U04_POSITIVE_CLOSE {day_pct:.2f}%')
-        return
-
-    # 현금일 때 BEAR 레짐의 기존 SOXS 보조조건만 종가 진입 허용.
-    if f.get('prev_regime') == 'BEAR_TREND' and f.get('candidate') == 'SOXS':
-        ff = dict(f, entry_ratio=US_U04_BEAR_ENTRY_RATIO, regime='BEAR_TREND')
-        bought = _us_semi_buy_ratio(ai_id, 'SOXS', to_float(f.get('soxs_close')), US_U04_BEAR_ENTRY_RATIO,
-                                    'U04_BEAR_SOXS', ff, False, 1, 'U04_BEAR_SOXS')
-        _us_regime_log(ai_id, 'PAPER_ENTRY' if bought else 'ENTRY_FAIL', ff, 'U04_BEAR_SOXS')
-    else:
-        _us_regime_log(ai_id, 'WAIT', f, f"U04_CASH_{f.get('prev_regime','UNKNOWN')}")
 
 
 
-def _us_surge_default(ai_id):
-    return {
-        'id': ai_id, 'name': US_SURGE_PAPER_NAMES.get(ai_id, ai_id),
-        'start_cash': US_SURGE_START_CASH, 'cash': US_SURGE_START_CASH,
-        'position': None, 'realized_pl': 0.0, 'asset': US_SURGE_START_CASH,
-        'profit_rate': 0.0, 'trades': [], 'last_action': '초기화',
-        'trade_date': '', 'trade_count': 0, 'last_exit_ts': 0.0,
-        'peak_asset': US_SURGE_START_CASH, 'mdd_pct': 0.0,
-    }
 
 
-def ensure_us_surge_states():
-    with LOCK:
-        root = S.setdefault('us_surge_paper', {})
-        for ai_id in US_SURGE_PAPER_IDS:
-            cur = root.get(ai_id)
-            if not isinstance(cur, dict):
-                root[ai_id] = _us_surge_default(ai_id)
-            else:
-                for k, v in _us_surge_default(ai_id).items():
-                    cur.setdefault(k, v)
-                cur['name'] = US_SURGE_PAPER_NAMES.get(ai_id, ai_id)
-        scan = S.setdefault('us_surge_scan', {})
-        scan.setdefault('last_scan_ts', 0.0)
-        scan.setdefault('session', '')
-        scan.setdefault('ranked', [])
-        scan.setdefault('latest_orderbook', {})
-        scan.setdefault('last_error', '')
-        _us_replay_state()
 
 
-def us_surge_dir():
-    path = os.path.join(us_day_dir(), 'paper_us_surge')
-    os.makedirs(path, exist_ok=True)
-    return path
 
 
-def us_surge_state_path(ai_id):
-    return os.path.join(us_surge_dir(), f'paper_account_state_{ai_id}_{us_trade_date_from_calendar()}.json')
 
 
-def us_surge_trade_path(ai_id):
-    return os.path.join(us_surge_dir(), f'paper_us_surge_{ai_id}_{us_trade_date_from_calendar()}.csv')
 
 
-def us_surge_scan_path():
-    return os.path.join(us_surge_dir(), f'us_surge_candidates_{us_trade_date_from_calendar()}.csv')
 
 
-def _us_surge_log(ai_id, action, symbol, price=0.0, qty=0, fee=0.0, pl=0.0, reason='', extra=None):
-    ensure_us_surge_states()
-    extra = dict(extra or {})
-    st = S['us_surge_paper'][ai_id]
-    headers = ['time','trade_date','ai_id','ai_name','session','action','symbol','price','qty','fee','pl','cash','asset','profit_rate','reason','r3','r10','volume_ratio','turnover','score','target_cash','filled_gross','fill_ratio','slippage_pct','orderbook_timestamp','levels_used','mfe_pct','mae_pct','hold_sec','paper_only']
-    row = {
-        'time': now_text(), 'trade_date': us_trade_date_from_calendar(), 'ai_id': ai_id,
-        'ai_name': st.get('name', ai_id), 'session': extra.get('session', US_SURGE_SESSION_BY_ID.get(ai_id,'')),
-        'action': action, 'symbol': symbol, 'price': round(to_float(price), 6), 'qty': int(qty),
-        'fee': round(to_float(fee), 6), 'pl': round(to_float(pl), 6), 'cash': round(to_float(st.get('cash')), 4),
-        'asset': round(to_float(st.get('asset')), 4), 'profit_rate': round(to_float(st.get('profit_rate')), 6),
-        'reason': reason, 'r3': round(to_float(extra.get('r3')),4), 'r10': round(to_float(extra.get('r10')),4),
-        'volume_ratio': round(to_float(extra.get('volume_ratio')),4), 'turnover': round(to_float(extra.get('turnover')),2),
-        'score': round(to_float(extra.get('score')),4), 'target_cash': round(to_float(extra.get('target_cash')),2),
-        'filled_gross': round(to_float(extra.get('filled_gross')),2), 'fill_ratio': round(to_float(extra.get('fill_ratio')),4),
-        'slippage_pct': round(to_float(extra.get('slippage_pct')),4), 'orderbook_timestamp': extra.get('orderbook_timestamp',''),
-        'levels_used': int(to_float(extra.get('levels_used'))), 'mfe_pct': extra.get('mfe_pct',''), 'mae_pct': extra.get('mae_pct',''),
-        'hold_sec': extra.get('hold_sec',''), 'paper_only': True,
-    }
-    write_row(us_surge_trade_path(ai_id), headers, row)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _us_surge_rankings(session):
@@ -5637,7 +3111,7 @@ def _us_surge_fetch_snapshot(sym):
     ob={}
     if code2 == 200:
         result=_result_dict(data2); asks=result.get('asks',[]) if isinstance(result.get('asks',[]),list) else []; bids=result.get('bids',[]) if isinstance(result.get('bids',[]),list) else []
-        ob={'timestamp':str(result.get('timestamp','')),'asks':asks,'bids':bids,'best_ask':to_float(asks[0].get('price')) if asks else 0.0,'best_bid':to_float(bids[0].get('price')) if bids else 0.0}
+        ob={'timestamp':str(result.get('timestamp','')),'fetched_at_ts':time.time(),'asks':asks,'bids':bids,'best_ask':to_float(asks[0].get('price')) if asks else 0.0,'best_bid':to_float(bids[0].get('price')) if bids else 0.0}
         S.setdefault('us_surge_scan',{}).setdefault('latest_orderbook',{})[sym]=ob
     return candles, ob
 
@@ -5672,8 +3146,8 @@ def _us_surge_features(sym, session, meta=None):
     return {'ok':ok,'block':'ENTRY_OK' if ok else '|'.join(failed),'symbol':sym,'candidate':sym,'session':session,'price':price,'r3':r3,'r10':r10,'volume_ratio':vr,'pullback_pct':pullback,'score':score,'turnover':to_float((meta or {}).get('turnover')),'day_change_pct':to_float((meta or {}).get('change_pct')),'orderbook':ob}
 
 
-def _us_surge_fill(sym, side, max_cash=0.0, qty=0, max_slip=0.35):
-    ob=S.setdefault('us_surge_scan',{}).setdefault('latest_orderbook',{}).get(sym,{})
+def _us_surge_fill(sym, side, max_cash=0.0, qty=0, max_slip=0.35, max_qty=0, orderbook=None):
+    ob=orderbook if isinstance(orderbook,dict) else S.setdefault('us_surge_scan',{}).setdefault('latest_orderbook',{}).get(sym,{})
     levels=ob.get('asks' if side=='BUY' else 'bids',[]) if isinstance(ob,dict) else []
     valid=[]
     for x in (levels[:US_SURGE_MAX_LEVELS] if isinstance(levels,list) else []):
@@ -5682,7 +3156,13 @@ def _us_surge_fill(sym, side, max_cash=0.0, qty=0, max_slip=0.35):
             if px>0 and av>0: valid.append((px,av))
     if not valid:
         return {'ok':False,'reason':'ORDERBOOK_EMPTY','qty':0,'avg_price':0.0,'gross':0.0,'fill_ratio':0.0,'slippage_pct':0.0,'levels_used':0,'orderbook_timestamp':ob.get('timestamp','') if isinstance(ob,dict) else ''}
-    best=valid[0][0]; target_qty=int(max_cash//best) if side=='BUY' else int(qty)
+    best=valid[0][0]
+    if side=='BUY':
+        cash_qty=int(max_cash//best) if max_cash>0 else 0
+        cap=int(max_qty) if int(max_qty)>0 else 0
+        target_qty=min(cash_qty,cap) if cash_qty>0 and cap>0 else (cash_qty or cap)
+    else:
+        target_qty=int(qty)
     remain_qty=target_qty; remain_cash=float(max_cash); filled=0; gross=0.0; used=0
     for px,av in valid:
         impact=((px/best)-1)*100 if side=='BUY' else ((best/px)-1)*100
@@ -5703,201 +3183,23 @@ def _us_surge_mark(sym):
     return candles[-1]['close'] if candles else 0.0
 
 
-def _us_surge_update_asset(ai_id):
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]; cash=to_float(st.get('cash')); pos=dict(st.get('position') or {}); start=max(1.0,to_float(st.get('start_cash'),US_SURGE_START_CASH))
-    asset=cash
-    if pos:
-        mark=_us_surge_mark(pos.get('symbol','')) or to_float(pos.get('avg'))
-        fx = _us_replay_fx_usdkrw(False)
-        if fx > 0:
-            asset += to_int(pos.get('qty'))*mark*fx
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]; st['asset']=asset; st['profit_rate']=(asset/start-1)*100; st['peak_asset']=max(to_float(st.get('peak_asset'),start),asset); st['mdd_pct']=min(to_float(st.get('mdd_pct'),0.0), (asset/max(1e-9,st['peak_asset'])-1)*100)
 
 
-def _us_surge_buy(ai_id, f):
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]; cash=to_float(st.get('cash')); target_krw=cash*US_SURGE_ENTRY_RATIO
-    fx = _us_replay_fx_usdkrw(False)
-    if fx <= 0:
-        _us_surge_log(ai_id,'BLOCK',f['symbol'],reason='FX_UNAVAILABLE',extra=dict(f,target_cash=target_krw))
-        return False
-    target_usd = target_krw / fx
-    fill=_us_surge_fill(f['symbol'],'BUY',max_cash=target_usd,max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT)
-    if not fill.get('ok') or to_float(fill.get('fill_ratio')) < US_SURGE_MIN_FILL_RATIO:
-        _us_surge_log(ai_id,'BLOCK',f['symbol'],reason='LIQUIDITY_OR_SLIPPAGE',extra=dict(f,**fill,target_cash=target_krw))
-        return False
-    qty=int(fill['qty']); px=to_float(fill['avg_price']); gross_usd=to_float(fill['gross']); gross_krw=gross_usd*fx; fee=gross_krw*US_SURGE_FEE_SIDE_PCT/100.0; cost=gross_krw+fee
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]
-        if cost>to_float(st.get('cash')) or st.get('position'): return False
-        st['cash']=to_float(st.get('cash'))-cost
-        st['position']={'symbol':f['symbol'],'qty':qty,'avg':px,'entry_fee':fee,'entry_time':now_text(),'entry_ts':time.time(),'peak_price':px,'trough_price':px,'protected':False,'entry_features':dict(f)}
-        st['trade_count']=to_int(st.get('trade_count'))+1; st['last_action']=f"{now_short()} PAPER BUY {f['symbol']} {qty}@{px:.4f}"
-    _us_surge_log(ai_id,'PAPER_ENTRY',f['symbol'],px,qty,fee,0.0,'ENTRY',dict(f,**fill,target_cash=target_krw,filled_gross=gross_krw,fx_usdkrw=fx))
-    return True
 
 
-def _us_surge_sell(ai_id, reason):
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]; pos=dict(st.get('position') or {})
-    if not pos: return False
-    sym=pos['symbol']; _us_surge_fetch_snapshot(sym)
-    fill=_us_surge_fill(sym,'SELL',qty=to_int(pos.get('qty')),max_slip=US_SURGE_MAX_SELL_SLIPPAGE_PCT)
-    if not fill.get('ok'): return False
-    fx = _us_replay_fx_usdkrw(False)
-    if fx <= 0:
-        return False
-    qty=int(fill['qty']); px=to_float(fill['avg_price']); avg=to_float(pos.get('avg')); entry_fee=to_float(pos.get('entry_fee'))*(qty/max(1,to_int(pos.get('qty')))); exit_gross_krw=to_float(fill['gross'])*fx; exit_fee=exit_gross_krw*US_SURGE_FEE_SIDE_PCT/100.0; pnl=qty*(px-avg)*fx-entry_fee-exit_fee
-    mfe=pct(to_float(pos.get('peak_price',avg)),avg); mae=pct(to_float(pos.get('trough_price',avg)),avg); hold=max(0,int(time.time()-to_float(pos.get('entry_ts'),time.time())))
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]; st['cash']=to_float(st.get('cash'))+exit_gross_krw-exit_fee; st['realized_pl']=to_float(st.get('realized_pl'))+pnl; st['last_exit_ts']=time.time(); st['last_action']=f'{now_short()} PAPER SELL {sym} {reason}'
-        old_qty=to_int(pos.get('qty'))
-        if qty>=old_qty: st['position']=None
-        else:
-            pos['qty']=old_qty-qty; pos['entry_fee']=max(0.0,to_float(pos.get('entry_fee'))-entry_fee); st['position']=pos
-        st['trades'].append({'time':now_text(),'symbol':sym,'qty':qty,'entry':avg,'exit':px,'pnl':pnl,'mfe_pct':mfe,'mae_pct':mae,'reason':reason})
-    _us_surge_update_asset(ai_id)
-    _us_surge_log(ai_id,'PAPER_SELL',sym,px,qty,exit_fee,pnl,reason,dict(pos.get('entry_features') or {},**fill,filled_gross=fill.get('gross'),mfe_pct=round(mfe,4),mae_pct=round(mae,4),hold_sec=hold))
-    return True
 
 
-def _us_surge_manage_position(ai_id):
-    with LOCK:
-        st=S['us_surge_paper'][ai_id]; pos=dict(st.get('position') or {})
-    if not pos: return False
-    price=_us_surge_mark(pos['symbol'])
-    if price<=0: return True
-    with LOCK:
-        p=S['us_surge_paper'][ai_id]['position']; p['peak_price']=max(to_float(p.get('peak_price',price)),price); p['trough_price']=min(to_float(p.get('trough_price',price)),price); avg=to_float(p.get('avg')); peak=to_float(p.get('peak_price')); protected=bool(p.get('protected'))
-        profit=pct(price,avg)
-        if profit>=US_SURGE_PROTECT_START_PCT: p['protected']=True; protected=True
-    draw=pct(price,peak)
-    if profit<=US_SURGE_HARD_SL_PCT:
-        _us_surge_sell(ai_id,f'HARD_SL {profit:.2f}%')
-    elif protected and profit<=US_SURGE_PROTECT_FLOOR_PCT:
-        _us_surge_sell(ai_id,f'PROFIT_PROTECT {profit:.2f}%')
-    elif profit>=US_SURGE_TRAIL_START_PCT and draw<=-US_SURGE_TRAIL_DRAW_PCT:
-        _us_surge_sell(ai_id,f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
-    return True
 
 
-def run_us_surge_paper():
-    """미국 급등 PAPER: PREMARKET과 REGULAR을 서로 다른 계좌/필터로 독립 운영한다.
-    DAY MARKET/AFTER HOURS는 신규진입 금지. 기존 U01~U04와 자금/로그 완전 분리.
-    """
-    ensure_us_surge_states()
-    if not US_SURGE_PAPER_ENABLED: return
-    session=us_market_session_status()[0]
-    trade_date=us_trade_date_from_calendar()
-    # 포지션은 세션이 바뀌어도 관리하지만 신규진입은 PRE/REGULAR에서만 한다.
-    for ai_id in US_SURGE_PAPER_IDS:
-        with LOCK:
-            st=S['us_surge_paper'][ai_id]
-            if st.get('trade_date')!=trade_date:
-                st['trade_date']=trade_date; st['trade_count']=0
-        _us_surge_manage_position(ai_id)
-        _us_surge_update_asset(ai_id)
-    if session not in {'PREMARKET','REGULAR'}: return
-    scan=S.setdefault('us_surge_scan',{})
-    if time.time()-to_float(scan.get('last_scan_ts')) < US_SURGE_SCAN_SEC and scan.get('session')==session:
-        ranked=list(scan.get('ranked') or [])
-    else:
-        ranked=[]
-        for meta in _us_surge_rankings(session):
-            f=_us_surge_features(meta['symbol'],session,meta)
-            row=dict(meta); row.update(f); ranked.append(row)
-            write_row(us_surge_scan_path(), ['time','session','symbol','price','day_change_pct','turnover','r3','r10','volume_ratio','pullback_pct','score','eligible'], {'time':now_text(),'session':session,'symbol':meta['symbol'],'price':f.get('price',0),'day_change_pct':meta.get('change_pct',0),'turnover':meta.get('turnover',0),'r3':f.get('r3',0),'r10':f.get('r10',0),'volume_ratio':f.get('volume_ratio',0),'pullback_pct':f.get('pullback_pct',0),'score':f.get('score',0),'eligible':bool(f.get('ok'))})
-            event_id = _us_replay_register_candidate(f, meta)
-            if event_id:
-                _us_replay_save_backfill(meta['symbol'], US_REPLAY_CANDIDATE_BACKFILL_MIN)
-                _us_replay_capacity(event_id, f)
-        ranked.sort(key=lambda x: (bool(x.get('ok')),to_float(x.get('score'))),reverse=True)
-        scan['last_scan_ts']=time.time(); scan['session']=session; scan['ranked']=ranked
-    eligible=[x for x in ranked if x.get('ok')]
-    if not eligible: return
-    candidate=eligible[0]
-    for ai_id in US_SURGE_PAPER_IDS:
-        if US_SURGE_SESSION_BY_ID.get(ai_id)!=session: continue
-        with LOCK:
-            st=S['us_surge_paper'][ai_id]; pos=bool(st.get('position')); trades=to_int(st.get('trade_count')); last_exit=to_float(st.get('last_exit_ts'))
-        if pos or trades>=US_SURGE_MAX_TRADES_BY_ID[ai_id] or time.time()-last_exit<US_SURGE_REENTRY_COOLDOWN_SEC: continue
-        _us_surge_buy(ai_id,candidate)
-    for ai_id in US_SURGE_PAPER_IDS:
-        try:
-            _us_surge_update_asset(ai_id); _atomic_json_write(us_surge_state_path(ai_id), S['us_surge_paper'][ai_id])
-        except Exception as e:
-            set_error(f'{ai_id} state 저장 실패: {e}')
 
 
-def _guide_default_account(market):
-    return {
-        'market': market, 'start_cash': GUIDE_PAPER_START_CASH, 'cash': GUIDE_PAPER_START_CASH,
-        'position': None, 'realized_pl': 0.0, 'asset': GUIDE_PAPER_START_CASH,
-        'profit_rate': 0.0, 'peak_asset': GUIDE_PAPER_START_CASH, 'mdd_pct': 0.0,
-        'signal_date': '', 'signal': 'WAIT', 'signal_features': {},
-        'entry_done_date': '', 'last_action': '초기 1천만원', 'trades': [], 'errors': []
-    }
 
-def ensure_guide_paper_states():
-    with LOCK:
-        root = S.setdefault('guide_paper', {})
-        root.setdefault('version', 'AUTO_TRADING_PAPER_GUIDE_V1_0')
-        root.setdefault('paper_only', True)
-        root.setdefault('fee_side_pct', GUIDE_FEE_SIDE_PCT)
-        root.setdefault('slippage_pct', GUIDE_SLIPPAGE_PCT)
-        root.setdefault('kr_exit_policy', GUIDE_KR_EXIT_POLICY)
-        for aid, market in (('GUIDE_KR01','KR'), ('GUIDE_US01','US')):
-            cur = root.get(aid)
-            if not isinstance(cur, dict):
-                root[aid] = _guide_default_account(market)
-            else:
-                for k, v in _guide_default_account(market).items():
-                    cur.setdefault(k, v)
-                cur['market'] = market
 
-def _guide_dir(market, trade_date):
-    base = os.path.join(LOG_ROOT, 'US', str(trade_date)) if market == 'US' else os.path.join(LOG_ROOT, str(trade_date))
-    path = os.path.join(base, 'paper_guide_v1')
-    os.makedirs(path, exist_ok=True)
-    return path
 
-def _guide_event_path(market, trade_date):
-    return os.path.join(_guide_dir(market, trade_date), f'guide_events_{market}_{trade_date}.csv')
 
-def _guide_trade_path(market, trade_date):
-    return os.path.join(_guide_dir(market, trade_date), f'guide_trades_{market}_{trade_date}.csv')
 
-def _guide_state_path(aid, trade_date):
-    market = 'KR' if aid == 'GUIDE_KR01' else 'US'
-    return os.path.join(_guide_dir(market, trade_date), f'guide_state_{aid}_{trade_date}.json')
 
-def _guide_log_event(aid, trade_date, event, symbol='', price=0.0, qty=0, reason='', extra=None):
-    market = 'KR' if aid == 'GUIDE_KR01' else 'US'
-    extra = extra if isinstance(extra, dict) else {}
-    write_row(_guide_event_path(market, trade_date),
-              ['time','account','market','event','symbol','price','qty','reason','extra_json'],
-              {'time':now_text(),'account':aid,'market':market,'event':event,'symbol':symbol,
-               'price':price,'qty':qty,'reason':reason,
-               'extra_json':json.dumps(extra, ensure_ascii=False, separators=(',',':'))})
 
-def _guide_log_trade(aid, trade_date, pos, exit_price, exit_fee, pnl, reason):
-    market = 'KR' if aid == 'GUIDE_KR01' else 'US'
-    gross_cost = to_float(pos.get('gross_cost_krw'))
-    net_pct = (pnl / gross_cost * 100.0) if gross_cost > 0 else 0.0
-    st = S.setdefault('guide_paper', {}).get(aid, {})
-    write_row(_guide_trade_path(market, trade_date),
-              ['market','symbol','signal_time','signal_type','entry_time','entry_price','exit_time','exit_price',
-               'exit_reason','entry_fee','exit_fee','slippage_pct_side','net_profit_krw','net_profit_pct',
-               'cumulative_asset_krw','mdd_pct','note'],
-              {'market':market,'symbol':pos.get('symbol',''),'signal_time':pos.get('signal_time',''),
-               'signal_type':pos.get('signal',''),'entry_time':pos.get('entry_time',''),'entry_price':pos.get('avg',0),
-               'exit_time':now_text(),'exit_price':exit_price,'exit_reason':reason,'entry_fee':pos.get('entry_fee',0),
-               'exit_fee':exit_fee,'slippage_pct_side':GUIDE_SLIPPAGE_PCT,'net_profit_krw':round(pnl,2),
-               'net_profit_pct':round(net_pct,4),'cumulative_asset_krw':round(to_float(st.get('asset')),2),
-               'mdd_pct':round(to_float(st.get('mdd_pct')),4),
-               'note':'PAPER ONLY / next tradable snapshot / no future data'})
 
 def _guide_date_of_timestamp(value):
     dt = parse_api_datetime(value)
@@ -5921,393 +3223,18 @@ def _guide_fetch_completed_daily_closes(symbol, current_trade_date, count=80):
             out[d] = close
     return [(d, out[d]) for d in sorted(out)]
 
-def _guide_wilder_rsi(closes, period=2):
-    vals = [to_float(x) for x in closes if to_float(x) > 0]
-    if len(vals) < period + 2:
-        return None
-    changes = [vals[i]-vals[i-1] for i in range(1,len(vals))]
-    gains = [max(x,0.0) for x in changes]
-    losses = [max(-x,0.0) for x in changes]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain*(period-1))+gains[i]) / period
-        avg_loss = ((avg_loss*(period-1))+losses[i]) / period
-    if avg_loss <= 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    rs = avg_gain / avg_loss
-    return 100.0 - 100.0/(1.0+rs)
-
-def _guide_build_kr_signal(trade_date):
-    rows = _guide_fetch_completed_daily_closes(GUIDE_KR_SIGNAL_SYMBOL, trade_date, 80)
-    closes = [x[1] for x in rows]
-    need = max(GUIDE_KR_SMA_WINDOW, GUIDE_KR_RSI_WINDOW + 2)
-    if len(closes) < need:
-        return {'signal':'WAIT','reason':'DATA_MISSING','trade_date':trade_date,'rows':len(closes)}
-    prev_close = closes[-1]
-    sma = sum(closes[-GUIDE_KR_SMA_WINDOW:]) / GUIDE_KR_SMA_WINDOW
-    rsi = _guide_wilder_rsi(closes, GUIDE_KR_RSI_WINDOW)
-    if rsi is None:
-        sig='WAIT'; reason='RSI_UNAVAILABLE'
-    elif prev_close > sma and rsi <= GUIDE_KR_RSI_LONG_MAX:
-        sig='LONG'; reason='CLOSE_GT_SMA12_AND_RSI2_LE_50'
-    elif prev_close < sma and rsi >= GUIDE_KR_RSI_INVERSE_MIN:
-        sig='INVERSE'; reason='CLOSE_LT_SMA12_AND_RSI2_GE_60'
-    else:
-        sig='WAIT'; reason='CONDITIONS_NOT_MET'
-    return {'signal':sig,'reason':reason,'trade_date':trade_date,'source_symbol':GUIDE_KR_SIGNAL_SYMBOL,
-            'source_date':rows[-1][0],'prev_close':round(prev_close,6),'sma12':round(sma,6),
-            'rsi2_wilder':round(rsi,6) if rsi is not None else None,'rows':len(closes)}
-
-def _guide_build_us_signal(trade_date):
-    rows = _guide_fetch_completed_daily_closes(GUIDE_US_SIGNAL_SYMBOL, trade_date, 80)
-    closes = [x[1] for x in rows]
-    if len(closes) < GUIDE_US_SMA_WINDOW:
-        return {'signal':'WAIT','reason':'DATA_MISSING','trade_date':trade_date,'rows':len(closes)}
-    prev_close = closes[-1]
-    sma = sum(closes[-GUIDE_US_SMA_WINDOW:]) / GUIDE_US_SMA_WINDOW
-    if prev_close > sma:
-        sig='SOXL'; reason='SOXL_CLOSE_GT_SMA15'
-    elif prev_close < sma:
-        sig='SOXS'; reason='SOXL_CLOSE_LT_SMA15'
-    else:
-        sig='WAIT'; reason='EQUAL_OR_UNDECIDED'
-    return {'signal':sig,'reason':reason,'trade_date':trade_date,'source_symbol':GUIDE_US_SIGNAL_SYMBOL,
-            'source_date':rows[-1][0],'prev_close':round(prev_close,6),'sma15':round(sma,6),'rows':len(closes)}
-
-def _guide_live_fill(symbol, side, market):
-    """호가 우선, 실패 시 현재가. 호출 시점 스냅샷만 사용한다."""
-    c, d = api_get('/api/v1/orderbook', params={'symbol':symbol}, timeout=8)
-    base = 0.0
-    source = 'ORDERBOOK'
-    if c == 200:
-        r = _result_dict(d)
-        asks = r.get('asks',[]) if isinstance(r.get('asks',[]),list) else []
-        bids = r.get('bids',[]) if isinstance(r.get('bids',[]),list) else []
-        if side == 'BUY' and asks:
-            base = to_float(asks[0].get('price',0))
-        elif side == 'SELL' and bids:
-            base = to_float(bids[0].get('price',0))
-    if base <= 0:
-        c, d = api_get('/api/v1/prices', params={'symbols':symbol}, timeout=8)
-        source = 'PRICE_FALLBACK'
-        if c == 200:
-            arr = d.get('result',[]) if isinstance(d,dict) else []
-            if isinstance(arr,list) and arr:
-                base = to_float(arr[0].get('lastPrice', arr[0].get('price',0)))
-    if base <= 0:
-        return {'ok':False,'reason':'NO_EXECUTABLE_PRICE'}
-    slip = GUIDE_SLIPPAGE_PCT/100.0
-    fill = base*(1.0+slip) if side == 'BUY' else base*(1.0-slip)
-    fill = round(fill) if market == 'KR' else round(fill,4)
-    return {'ok':True,'base_price':base,'fill_price':fill,'source':source,'slippage_pct':GUIDE_SLIPPAGE_PCT}
-
-def _guide_usdkrw():
-    fx = _us_replay_fx_usdkrw(False)
-    return fx if fx > 0 else 0.0
-
-def _guide_update_asset(aid, mark_price=0.0):
-    with LOCK:
-        st=S['guide_paper'][aid]
-        pos=dict(st.get('position') or {})
-        cash=to_float(st.get('cash'))
-    asset=cash
-    if pos:
-        px=mark_price if mark_price>0 else to_float(pos.get('last_price',pos.get('avg',0)))
-        if aid=='GUIDE_US01':
-            fx=_guide_usdkrw()
-            asset += to_int(pos.get('qty'))*px*fx if fx>0 else to_float(pos.get('marked_value_krw',0))
-        else:
-            asset += to_int(pos.get('qty'))*px
-    with LOCK:
-        st=S['guide_paper'][aid]
-        st['asset']=asset
-        st['peak_asset']=max(to_float(st.get('peak_asset',GUIDE_PAPER_START_CASH)),asset)
-        peak=max(1.0,to_float(st.get('peak_asset')))
-        st['mdd_pct']=min(to_float(st.get('mdd_pct',0.0)),(asset/peak-1.0)*100.0)
-        st['profit_rate']=(asset/to_float(st.get('start_cash',GUIDE_PAPER_START_CASH))-1.0)*100.0
-    return asset
-
-def _guide_buy(aid, symbol, signal, trade_date, features):
-    market='KR' if aid=='GUIDE_KR01' else 'US'
-    fill=_guide_live_fill(symbol,'BUY',market)
-    if not fill.get('ok'):
-        _guide_log_event(aid,trade_date,'NO_FILL',symbol,0,0,fill.get('reason',''))
-        return False
-    with LOCK:
-        st=S['guide_paper'][aid]
-        cash=to_float(st.get('cash'))
-        if st.get('position'):
-            return False
-    px=to_float(fill.get('fill_price'))
-    if market=='US':
-        fx=_guide_usdkrw()
-        if fx<=0:
-            return False
-        unit_krw=px*fx
-    else:
-        fx=1.0
-        unit_krw=px
-    fee_rate=GUIDE_FEE_SIDE_PCT/100.0
-    qty=int(cash/(unit_krw*(1.0+fee_rate)))
-    if qty<=0:
-        return False
-    gross=qty*unit_krw
-    fee=gross*fee_rate
-    total=gross+fee
-    with LOCK:
-        st=S['guide_paper'][aid]
-        if total>to_float(st.get('cash')) or st.get('position'):
-            return False
-        st['cash']=to_float(st.get('cash'))-total
-        st['position']={'symbol':symbol,'qty':qty,'avg':px,'entry_fee':fee,'gross_cost_krw':gross,
-                        'entry_time':now_text(),'signal_time':now_text(),'signal':signal,'signal_features':dict(features),
-                        'peak_price':px,'trailing_armed':False,'last_price':px,'fx_entry':fx}
-        st['entry_done_date']=trade_date
-        st['last_action']=f"{now_short()} PAPER BUY {symbol} {qty}@{px}"
-    _guide_update_asset(aid,px)
-    _guide_log_event(aid,trade_date,'PAPER_ENTRY',symbol,px,qty,'ENTRY',dict(features,**fill,fee=fee,fx=fx))
-    return True
-
-def _guide_sell(aid, trade_date, reason):
-    market='KR' if aid=='GUIDE_KR01' else 'US'
-    with LOCK:
-        st=S['guide_paper'][aid]
-        pos=dict(st.get('position') or {})
-    if not pos:
-        return False
-    fill=_guide_live_fill(pos['symbol'],'SELL',market)
-    if not fill.get('ok'):
-        _guide_log_event(aid,trade_date,'SELL_NO_FILL',pos.get('symbol',''),0,0,fill.get('reason',''))
-        return False
-    px=to_float(fill.get('fill_price'))
-    qty=to_int(pos.get('qty'))
-    avg=to_float(pos.get('avg'))
-    if market=='US':
-        fx=_guide_usdkrw()
-        if fx<=0:
-            return False
-        gross=qty*px*fx
-        cost_basis=qty*avg*to_float(pos.get('fx_entry',fx))
-    else:
-        fx=1.0
-        gross=qty*px
-        cost_basis=qty*avg
-    exit_fee=gross*(GUIDE_FEE_SIDE_PCT/100.0)
-    pnl=gross-exit_fee-cost_basis-to_float(pos.get('entry_fee'))
-    with LOCK:
-        st=S['guide_paper'][aid]
-        st['cash']=to_float(st.get('cash'))+gross-exit_fee
-        st['realized_pl']=to_float(st.get('realized_pl'))+pnl
-        st['position']=None
-        st['last_action']=f"{now_short()} PAPER SELL {pos.get('symbol')} {reason}"
-        st.setdefault('trades',[]).append({'time':now_text(),'symbol':pos.get('symbol'),'entry':avg,'exit':px,'qty':qty,'pnl':pnl,'reason':reason})
-    _guide_update_asset(aid,0)
-    _guide_log_trade(aid,trade_date,pos,px,exit_fee,pnl,reason)
-    _guide_log_event(aid,trade_date,'PAPER_EXIT',pos.get('symbol',''),px,qty,reason,dict(fill,exit_fee=exit_fee,pnl=pnl,fx=fx))
-    return True
-
-def _guide_kr_run():
-    aid='GUIDE_KR01'
-    refresh_kr_market_calendar(False)
-    cal=S.setdefault('market_data_capture',{}).get('calendar',{})
-    trade_date=str(cal.get('date','') or today())
-    if not trade_date or not cal.get('is_business_day'):
-        return
-    with LOCK:
-        st=S['guide_paper'][aid]
-        need_signal=st.get('signal_date')!=trade_date
-    if need_signal:
-        f=_guide_build_kr_signal(trade_date)
-        with LOCK:
-            st=S['guide_paper'][aid]
-            st['signal_date']=trade_date
-            st['signal']=f.get('signal','WAIT')
-            st['signal_features']=f
-            st['last_action']=f"{now_short()} SIGNAL {st['signal']}"
-        _guide_log_event(aid,trade_date,'SIGNAL',reason=f.get('reason',''),extra=f)
-        save_state()
-    market_ok,_=regular_market_open_now()
-    if not market_ok:
-        _atomic_json_write(_guide_state_path(aid,trade_date),S['guide_paper'][aid])
-        return
-    with LOCK:
-        st=S['guide_paper'][aid]
-        sig=st.get('signal','WAIT')
-        pos=dict(st.get('position') or {})
-        entered=st.get('entry_done_date')==trade_date
-        f=dict(st.get('signal_features') or {})
-    desired = GUIDE_KR_LONG_SYMBOL if sig=='LONG' else (GUIDE_KR_INVERSE_SYMBOL if sig=='INVERSE' else '')
-    if pos and desired and pos.get('symbol')!=desired:
-        if _guide_sell(aid,trade_date,'NEXT_DAILY_OPPOSITE_SIGNAL'):
-            pos={}
-    if (not pos) and desired and not entered:
-        _guide_buy(aid,desired,sig,trade_date,f)
-    with LOCK:
-        pos=dict(S['guide_paper'][aid].get('position') or {})
-    if pos:
-        c,d=api_get('/api/v1/prices',params={'symbols':pos['symbol']},timeout=8)
-        if c==200:
-            arr=d.get('result',[]) if isinstance(d,dict) else []
-            if isinstance(arr,list) and arr:
-                px=to_float(arr[0].get('lastPrice',arr[0].get('price',0)))
-                if px>0:
-                    with LOCK:
-                        S['guide_paper'][aid]['position']['last_price']=px
-                    _guide_update_asset(aid,px)
-    _atomic_json_write(_guide_state_path(aid,trade_date),S['guide_paper'][aid])
-
-def _guide_us_run():
-    aid='GUIDE_US01'
-    refresh_us_market_calendar(False)
-    trade_date=us_trade_date_from_calendar()
-    if not trade_date:
-        return
-    with LOCK:
-        st=S['guide_paper'][aid]
-        need_signal=st.get('signal_date')!=trade_date
-    if need_signal:
-        f=_guide_build_us_signal(trade_date)
-        with LOCK:
-            st=S['guide_paper'][aid]
-            st['signal_date']=trade_date
-            st['signal']=f.get('signal','WAIT')
-            st['signal_features']=f
-            st['last_action']=f"{now_short()} SIGNAL {st['signal']}"
-        _guide_log_event(aid,trade_date,'SIGNAL',reason=f.get('reason',''),extra=f)
-        save_state()
-    session, overnight_start, pre_start, reg_start, reg_end, after_end = us_market_session_status()
-    nowv=now_kst()
-    with LOCK:
-        st=S['guide_paper'][aid]
-        sig=st.get('signal','WAIT')
-        pos=dict(st.get('position') or {})
-        entered=st.get('entry_done_date')==trade_date
-        f=dict(st.get('signal_features') or {})
-    if pos:
-        c,d=api_get('/api/v1/prices',params={'symbols':pos['symbol']},timeout=8)
-        price=0.0
-        if c==200:
-            arr=d.get('result',[]) if isinstance(d,dict) else []
-            if isinstance(arr,list) and arr:
-                price=to_float(arr[0].get('lastPrice',arr[0].get('price',0)))
-        if price>0:
-            with LOCK:
-                p=S['guide_paper'][aid]['position']
-                p['last_price']=price
-                p['peak_price']=max(to_float(p.get('peak_price',price)),price)
-                profit=pct(price,to_float(p.get('avg')))
-                if profit>=GUIDE_US_TRAIL_ARM_PCT:
-                    p['trailing_armed']=True
-                peak=to_float(p.get('peak_price'))
-                armed=bool(p.get('trailing_armed'))
-            draw=pct(price,peak)
-            _guide_update_asset(aid,price)
-            if profit<=GUIDE_US_HARD_SL_PCT:
-                _guide_sell(aid,trade_date,f'HARD_SL {profit:.2f}%')
-            elif profit>=GUIDE_US_TP_PCT:
-                _guide_sell(aid,trade_date,f'TP {profit:.2f}%')
-            elif armed and draw<=-GUIDE_US_TRAIL_DRAW_PCT:
-                _guide_sell(aid,trade_date,f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
-            elif reg_end and nowv >= reg_end - timedelta(seconds=max(20,REFRESH_SEC)):
-                _guide_sell(aid,trade_date,'EOD_REGULAR_CLOSE')
-        elif reg_end and nowv >= reg_end:
-            _guide_sell(aid,trade_date,'EOD_REGULAR_CLOSE_FALLBACK')
-    else:
-        if session=='REGULAR' and not entered:
-            desired=GUIDE_US_LONG_SYMBOL if sig=='SOXL' else (GUIDE_US_INVERSE_SYMBOL if sig=='SOXS' else '')
-            if desired:
-                _guide_buy(aid,desired,sig,trade_date,f)
-    _atomic_json_write(_guide_state_path(aid,trade_date),S['guide_paper'][aid])
-
-def run_guide_paper():
-    """운영가이드 v1.0 PAPER ONLY. 기존 101개 계좌와 완전 독립."""
-    ensure_guide_paper_states()
-    if not GUIDE_PAPER_ENABLED:
-        return
-    try:
-        _guide_kr_run()
-    except Exception as e:
-        S.setdefault('guide_paper',{}).setdefault('GUIDE_KR01',_guide_default_account('KR')).setdefault('errors',[]).append({'time':now_text(),'error':str(e)[:500]})
-        set_error(f'GUIDE KR PAPER 오류: {e}')
-    try:
-        _guide_us_run()
-    except Exception as e:
-        S.setdefault('guide_paper',{}).setdefault('GUIDE_US01',_guide_default_account('US')).setdefault('errors',[]).append({'time':now_text(),'error':str(e)[:500]})
-        set_error(f'GUIDE US PAPER 오류: {e}')
 
 
-def run_us_semi_paper():
-    """U01/U02 분봉 역추세 + U03 20/80 급락스윙 + U04 시장레짐 적응형 PAPER."""
-    ensure_us_semi_paper_states()
-    # V5.24: 미국 급등형은 기존 SOXL/SOXS 연구와 독립 실행한다.
-    run_us_surge_paper()
-    if not US_SEMI_PAPER_ENABLED:
-        return
-    # U03/U04는 분봉 역추세와 분리해 각자의 스윙/레짐 규칙으로 처리한다.
-    run_us_regime_paper()
-    run_us_adaptive_paper()
-    # U01/U02 연구는 기존대로 09:00 KST 이후의 활성 세션에서만 수행한다.
-    if now_kst().strftime('%H:%M') < US_SEMI_RESEARCH_KST_START:
-        return
-    f = _us_pair_features()
-    trade_date = us_trade_date_from_calendar()
-    for ai_id in US_SEMI_INTRADAY_IDS:
-        with LOCK:
-            st = S['us_semi_paper'][ai_id]
-            if st.get('trade_date') != trade_date:
-                st['trade_date'], st['trade_count'] = trade_date, 0
-            pos = dict(st.get('position') or {})
-        if pos:
-            price = _us_semi_mark_price(pos['symbol'])
-            if price <= 0:
-                continue
-            with LOCK:
-                p = S['us_semi_paper'][ai_id]['position']
-                p['peak_price'] = max(to_float(p.get('peak_price', price)), price)
-                p['trough_price'] = min(to_float(p.get('trough_price', price)), price)
-                avg, peak = to_float(p.get('avg')), to_float(p.get('peak_price'))
-                profit_now = pct(price, avg)
-                if ai_id == 'U02' and profit_now >= US_SEMI_U02_TRAIL_START_PCT:
-                    p['trailing_armed'] = True
-                trailing_armed = bool(p.get('trailing_armed', False))
-            profit = pct(price, avg)
-            draw = pct(price, peak)
-            if profit <= US_SEMI_HARD_SL_PCT:
-                _us_semi_sell(ai_id, f'HARD_SL {profit:.2f}%')
-            elif ai_id == 'U01' and profit >= US_SEMI_U01_TP_PCT:
-                _us_semi_sell(ai_id, f'TP {profit:.2f}%')
-            elif ai_id == 'U02' and trailing_armed and draw <= -US_SEMI_U02_TRAIL_DRAW_PCT:
-                _us_semi_sell(ai_id, f'TRAIL profit={profit:.2f}% draw={draw:.2f}%')
-            # 세션이 바뀌었다는 이유만으로 청산하지 않고 거의 24시간 연속 감시한다.
-            continue
-        if f.get('session') not in {'OVERNIGHT','PREMARKET','REGULAR','AFTER_HOURS'}:
-            continue
-        with LOCK:
-            st = S['us_semi_paper'][ai_id]
-            last_decision = to_float(st.get('last_decision_ts'))
-            last_exit = to_float(st.get('last_exit_ts'))
-            trades = to_int(st.get('trade_count'))
-        if trades >= US_SEMI_MAX_TRADES_PER_SESSION:
-            _us_semi_log(ai_id, 'BLOCK', f, reason='MAX_TRADES')
-            continue
-        if time.time() - last_exit < US_SEMI_REENTRY_COOLDOWN_SEC:
-            continue
-        if time.time() - last_decision < US_SEMI_DECISION_COOLDOWN_SEC:
-            continue
-        with LOCK:
-            S['us_semi_paper'][ai_id]['last_decision_ts'] = time.time()
-        if not f.get('ok'):
-            _us_semi_log(ai_id, 'BLOCK', f, reason=f.get('block','NOT_CONFIRMED'))
-            continue
-        _us_semi_buy(ai_id, f)
-    # Persist per-account snapshots for backup/selfcheck.
-    for ai_id in US_SEMI_PAPER_IDS:
-        try:
-            update_us_semi_paper_asset(ai_id, save=False)
-            _atomic_json_write(us_semi_state_path(ai_id), S['us_semi_paper'][ai_id])
-        except Exception as e:
-            set_error(f'{ai_id} state 저장 실패: {e}')
+
+
+
+
+
+
+
+
+
+
 
 
 def capture_us_market_data():
@@ -7328,9 +4255,6 @@ def google_drive_find_files_exact(access_token, filename):
     return [x for x in r.json().get('files', []) if str(x.get('name', '')) == filename]
 
 
-def google_drive_find_file(access_token, filename):
-    files = google_drive_find_files_exact(access_token, filename)
-    return files[0] if files else None
 
 def google_drive_download_file(access_token, file_meta, destination_path):
     """Drive 파일을 읽기 전용 alt=media 방식으로 다운로드하고 크기·MD5를 검증한다."""
@@ -7935,13 +4859,6 @@ def _fetch_us_session_candles_official(sym, cal, max_pages=8):
     coverage_complete = bool(reached_before_session and not failures)
     return (rows, coverage_complete, failures)
 
-def _verify_us_source_gap(sym, target, cal, retries=1):
-    """호환용 단일 검증. 공식 세션 전체 페이지 조회 결과로만 원천결측을 인정한다."""
-    rows, coverage_complete, failures = _fetch_us_session_candles_official(sym, cal)
-    wanted = target.replace(second=0, microsecond=0)
-    if wanted in rows:
-        return (rows[wanted], False, [{'coverage_complete': coverage_complete, 'failures': failures}])
-    return (None, bool(coverage_complete), [{'coverage_complete': coverage_complete, 'failures': failures}])
 
 def finalize_us_candles_grade1():
     state = S.setdefault('us_market_data_capture', {})
@@ -8724,14 +5641,85 @@ def _core4_update_asset(aid):
         st['profit_rate']=(asset/CORE4_START_CASH-1.0)*100.0
         st['last_update']=now_text()
 
-def _core4_schedule(aid, action, symbol, reason, features=None, ratio=1.0, max_qty=0):
+def _core4_trade_date(aid):
+    """Account business date: KR=KST calendar date, US=New York date."""
+    if aid.startswith('US_'):
+        return datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+    return today()
+
+def _core4_pending_required_session(aid, reason, action='BUY'):
+    if aid.startswith('KR_'):
+        return 'KR_REGULAR'
+    if aid=='US_SURGE':
+        return 'US_EXIT' if action in ('SELL','PARTIAL_SELL') else 'PREMARKET'
+    if 'PREMARKET' in str(reason):
+        return 'PREMARKET'
+    return 'REGULAR'
+
+def _core4_pending_market_ok(aid, p):
+    req=p.get('required_session') or _core4_pending_required_session(aid,p.get('reason',''))
+    if req=='KR_REGULAR':
+        try:
+            return bool(regular_market_open_now()[0])
+        except Exception:
+            return False
+    session=us_market_session_status()[0]
+    if req=='US_EXIT':
+        return session in ('PREMARKET','REGULAR')
+    return session==req
+
+def _core4_us_completed_bar(symbol, max_age_sec=180):
+    candles,_=_us_surge_fetch_snapshot(symbol)
+    if not candles:
+        return {'ok':False,'reason':'NO_COMPLETED_1M'}
+    bar=candles[-1]
+    dt=bar.get('dt')
+    try:
+        age=max(0.0,(now_kst()-dt.astimezone(KST)).total_seconds())
+    except Exception:
+        age=999999.0
+    if age>max_age_sec:
+        return {'ok':False,'reason':'STALE_COMPLETED_1M','age_sec':round(age,1),'bar':bar}
+    return {'ok':True,'bar':bar,'age_sec':round(age,1)}
+
+def _core4_us_prev_completed_volume(symbol):
+    candles,_=_us_surge_fetch_snapshot(symbol)
+    if not candles: return 0.0
+    # fetch_snapshot already excludes the still-forming minute, so [-1] is the immediately previous completed 1m bar.
+    return to_float(candles[-1].get('volume'))
+
+def _core4_second_following_bar_open_ts(bar_dt):
+    # Research convention: exit signal on completed bar t, fill at open of t+2 bar.
+    if not bar_dt:
+        return 0.0
+    try:
+        return bar_dt.timestamp() + 120.0
+    except Exception:
+        return 0.0
+
+def _core4_schedule(aid, action, symbol, reason, features=None, ratio=1.0, max_qty=0,
+                    ttl_sec=180, min_delay_sec=None, required_session=None, not_before_ts=None):
+    now_ts=time.time()
+    if min_delay_sec is None:
+        min_delay_sec=max(2.0,min(10.0,REFRESH_SEC/2.0))
     with LOCK:
         st=S['core4_paper'][aid]
         if st.get('pending'): return False
         st['pending']={'action':action,'symbol':symbol,'reason':reason,'features':features or {},
-                       'ratio':ratio,'max_qty':int(max(0,to_float(max_qty))),'created_ts':time.time()}
+                       'ratio':ratio,'max_qty':int(max(0,to_float(max_qty))),
+                       'created_ts':now_ts,'not_before_ts':(to_float(not_before_ts) if to_float(not_before_ts)>0 else now_ts+max(0.0,to_float(min_delay_sec))),
+                       'expires_ts':now_ts+max(5.0,to_float(ttl_sec)),
+                       'trade_date':_core4_trade_date(aid),
+                       'required_session':required_session or _core4_pending_required_session(aid,reason,action)}
         st['signal']=action; st['reason']=reason; st['signal_features']=features or {}
+        if action=='SELL':
+            st['liquidation_intent']={
+                'symbol':symbol,'reason':reason,'features':features or {},
+                'set_at':now_text(),'trade_date':_core4_trade_date(aid),
+                'required_session':required_session or _core4_pending_required_session(aid,reason,action)
+            }
     _core4_log(aid,'SIGNAL',symbol,reason=reason,extra=features or {})
+    save_state()
     return True
 
 def _core4_kr_fill(symbol, side, max_cash=0.0, qty=0):
@@ -8743,60 +5731,191 @@ def _core4_kr_fill(symbol, side, max_cash=0.0, qty=0):
         max_levels=PROJECT_G_ORDERBOOK_LEVELS
     )
 
-def _core4_us_fill(symbol, side, max_cash=0.0, qty=0):
-    _us_surge_fetch_snapshot(symbol)
+def _core4_parse_market_timestamp(value):
+    """Best-effort parse of provider/orderbook timestamp into aware datetime."""
+    if value is None:
+        return None
+    s=str(value).strip()
+    if not s:
+        return None
+    # epoch seconds / milliseconds
+    try:
+        x=float(s)
+        if x > 1e12:
+            x /= 1000.0
+        if x > 1e9:
+            return datetime.fromtimestamp(x, tz=pytz.UTC)
+    except Exception:
+        pass
+    # ISO-like
+    try:
+        ss=s.replace('Z','+00:00')
+        dt=datetime.fromisoformat(ss)
+        if dt.tzinfo is None:
+            # US quote timestamps without offset are interpreted in New York local time.
+            dt=pytz.timezone('America/New_York').localize(dt)
+        return dt
+    except Exception:
+        return None
+
+def _core4_orderbook_timestamp_age_sec(ob):
+    dt=_core4_parse_market_timestamp((ob or {}).get('timestamp'))
+    if not dt:
+        return None
+    try:
+        return max(0.0,(datetime.now(pytz.UTC)-dt.astimezone(pytz.UTC)).total_seconds())
+    except Exception:
+        return None
+
+def _core4_us_fill(symbol, side, max_cash=0.0, qty=0, max_qty=0):
+    candles,ob=_us_surge_fetch_snapshot(symbol)
+    if not isinstance(ob,dict) or not ob.get('asks') or not ob.get('bids'):
+        return {'ok':False,'reason':'FRESH_ORDERBOOK_UNAVAILABLE','qty':0,'avg_price':0.0,'gross':0.0,'fill_ratio':0.0}
+    age=max(0.0,time.time()-to_float(ob.get('fetched_at_ts')))
+    if age>15.0:
+        return {'ok':False,'reason':'STALE_ORDERBOOK_FETCH_TIME','age_sec':round(age,3),'qty':0,'avg_price':0.0,'gross':0.0,'fill_ratio':0.0}
+    market_age=_core4_orderbook_timestamp_age_sec(ob)
+    if market_age is None:
+        return {'ok':False,'reason':'ORDERBOOK_TIMESTAMP_INVALID','qty':0,'avg_price':0.0,'gross':0.0,'fill_ratio':0.0}
+    if market_age>15.0:
+        return {'ok':False,'reason':'STALE_ORDERBOOK_MARKET_TIME','market_age_sec':round(market_age,3),'qty':0,'avg_price':0.0,'gross':0.0,'fill_ratio':0.0}
     return _us_surge_fill(
-        symbol, side, max_cash=max_cash, qty=qty,
+        symbol, side, max_cash=max_cash, qty=qty, max_qty=max_qty, orderbook=ob,
         max_slip=US_SURGE_MAX_BUY_SLIPPAGE_PCT if side=='BUY' else US_SURGE_MAX_SELL_SLIPPAGE_PCT
     )
 
+def _core4_mark_liquidation_intent(aid, symbol, reason, features=None, required_session=None):
+    with LOCK:
+        st=S['core4_paper'][aid]
+        st['liquidation_intent']={
+            'symbol':symbol,
+            'reason':reason,
+            'features':features or {},
+            'set_at':now_text(),
+            'trade_date':_core4_trade_date(aid),
+            'required_session':required_session or _core4_pending_required_session(aid,reason,'SELL'),
+        }
+    save_state()
+
+def _core4_clear_liquidation_intent(aid):
+    with LOCK:
+        if aid in S.get('core4_paper',{}):
+            S['core4_paper'][aid]['liquidation_intent']=None
+    save_state()
+
+def _core4_resume_liquidation_intent(aid):
+    with LOCK:
+        st=S['core4_paper'][aid]
+        pos=dict(st.get('position') or {})
+        pending=dict(st.get('pending') or {})
+        intent=dict(st.get('liquidation_intent') or {})
+    if not pos:
+        if intent:
+            _core4_clear_liquidation_intent(aid)
+        return False
+    if pending or not intent:
+        return False
+    sym=pos.get('symbol') or intent.get('symbol')
+    if not sym:
+        return False
+    # Re-create a fresh full-exit request. It receives the current trade date/session.
+    return _core4_schedule(
+        aid,'SELL',sym,
+        intent.get('reason','LIQUIDATION_INTENT'),
+        intent.get('features') or {},
+        ratio=1.0,
+        ttl_sec=300,
+        required_session=intent.get('required_session') or _core4_pending_required_session(
+            aid,intent.get('reason','LIQUIDATION_INTENT'),'SELL'
+        )
+    )
+
 def _core4_execute_pending(aid):
-    # 신호와 같은 루프에서 체결하지 않는다.
     with LOCK:
         st=S['core4_paper'][aid]; p=dict(st.get('pending') or {}); pos=dict(st.get('position') or {}); cash=to_float(st.get('cash'))
     if not p: return False
-    if time.time()-to_float(p.get('created_ts')) < max(2.0,min(10.0,REFRESH_SEC/2.0)):
+    now_ts=time.time()
+    if now_ts < to_float(p.get('not_before_ts',p.get('created_ts',0))): return False
+    if now_ts > to_float(p.get('expires_ts',now_ts+1)):
+        is_liq=(p.get('action')=='SELL' and bool(pos))
+        with LOCK:
+            st=S['core4_paper'][aid]; st['pending']=None
+            st['signal']='SELL' if is_liq else ('WAIT' if not pos else 'HOLD')
+            st['reason']='PENDING_EXPIRED_RETRY_LIQUIDATION' if is_liq else 'PENDING_EXPIRED'
+        if is_liq:
+            _core4_mark_liquidation_intent(aid,p.get('symbol',''),p.get('reason','LIQUIDATION_INTENT'),p.get('features') or {},p.get('required_session'))
+        _core4_log(aid,'BLOCK',p.get('symbol',''),reason=st['reason'],extra=p); save_state(); return False
+    if p.get('trade_date') and p.get('trade_date')!=_core4_trade_date(aid):
+        is_liq=(p.get('action')=='SELL' and bool(pos))
+        with LOCK:
+            st=S['core4_paper'][aid]; st['pending']=None
+            st['signal']='SELL' if is_liq else ('WAIT' if not pos else 'HOLD')
+            st['reason']='TRADE_DATE_CHANGED_RETRY_LIQUIDATION' if is_liq else 'TRADE_DATE_CHANGED'
+        if is_liq:
+            _core4_mark_liquidation_intent(aid,p.get('symbol',''),p.get('reason','LIQUIDATION_INTENT'),p.get('features') or {},p.get('required_session'))
+        save_state(); return False
+    if not _core4_pending_market_ok(aid,p):
+        with LOCK:
+            S['core4_paper'][aid]['reason']='MARKET_NOT_TRADABLE'
         return False
     action=p.get('action'); sym=p.get('symbol',''); fx=_core4_fx(aid)
     if fx<=0: return False
+
+    # KR_SURGE 신규 매수는 15:10 이후 체결 금지.
+    # 15:10 이전에 만들어진 pending BUY라도 체결 직전 재검사해서 취소한다.
+    if aid=='KR_SURGE' and action=='BUY' and now_kst().strftime('%H:%M')>='15:10':
+        with LOCK:
+            st=S['core4_paper'][aid]
+            st['pending']=None
+            st['signal']='WAIT'
+            st['reason']='PENDING_BUY_CANCELLED_AFTER_1510'
+        _core4_log(aid,'BLOCK',sym,reason='PENDING_BUY_CANCELLED_AFTER_1510',extra=p)
+        save_state()
+        return False
     fee_rate=CORE4_FEE_SIDE_PCT/100.0
 
     if action=='BUY' and not pos:
+        # Reserve the fee before sizing so a valid fill cannot be rejected only because of commission.
+        max_spend_krw=max(0.0,cash/(1.0+fee_rate))
+        max_qty=to_int(p.get('max_qty',0))
         if aid.startswith('US_'):
-            fill=_core4_us_fill(sym,'BUY',max_cash=(cash/fx))
+            max_usd=max_spend_krw/fx
+            if max_qty>0:
+                candles,_=_us_surge_fetch_snapshot(sym); mark=to_float(candles[-1].get('close')) if candles else 0.0
+                if mark>0: max_usd=min(max_usd,max_qty*mark)
+            fill=_core4_us_fill(sym,'BUY',max_cash=max_usd,max_qty=max_qty)
             if not fill.get('ok') or to_float(fill.get('fill_ratio')) < US_SURGE_MIN_FILL_RATIO:
                 with LOCK:
                     st=S['core4_paper'][aid]; st['pending']=None; st['signal']='WAIT'; st['reason']='LIQUIDITY_OR_SLIPPAGE'
-                _core4_log(aid,'BLOCK',sym,reason='LIQUIDITY_OR_SLIPPAGE',extra=fill); return False
+                _core4_log(aid,'BLOCK',sym,reason='LIQUIDITY_OR_SLIPPAGE',extra=fill); save_state(); return False
             qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])*fx
         else:
-            buy_cash=cash
-            max_qty=to_int(p.get('max_qty',0))
+            buy_cash=max_spend_krw
             if max_qty>0:
                 mark=_core4_mark(aid,sym)
-                if mark>0:
-                    buy_cash=min(cash, max_qty*mark*1.02)
-            fill=_core4_kr_fill(sym,'BUY',max_cash=buy_cash)
-            if max_qty>0 and fill.get('ok') and to_int(fill.get('qty'))>max_qty:
-                # depth simulator의 목표수량은 현금기준이므로 정확한 1% cap을 다시 강제한다.
-                fill=_core4_kr_fill(sym,'BUY',max_cash=max_qty*max(1.0,to_float(fill.get('best_price',mark))))
+                if mark>0: buy_cash=min(buy_cash,max_qty*mark)
+            fill=_core4_kr_fill(sym,'BUY',max_cash=buy_cash,qty=max_qty)
             if not fill.get('ok') or to_float(fill.get('fill_ratio')) < PROJECT_G_MIN_FILL_RATIO:
                 with LOCK:
                     st=S['core4_paper'][aid]; st['pending']=None; st['signal']='WAIT'; st['reason']='LIQUIDITY_OR_SLIPPAGE'
-                _core4_log(aid,'BLOCK',sym,reason='LIQUIDITY_OR_SLIPPAGE',extra=fill); return False
+                _core4_log(aid,'BLOCK',sym,reason='LIQUIDITY_OR_SLIPPAGE',extra=fill); save_state(); return False
             qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])
         fee=gross*fee_rate; total=gross+fee
-        if qty<=0 or total>cash: return False
+        if qty<=0 or total>cash:
+            with LOCK: S['core4_paper'][aid]['reason']='BUY_SIZE_INVALID'
+            return False
+        td=_core4_trade_date(aid)
         with LOCK:
             st=S['core4_paper'][aid]
             st['cash']=cash-total
             st['position']={'symbol':sym,'qty':qty,'avg':px,'entry_fee':fee,'fx_entry':fx,
-                            'entry_time':now_text(),'entry_ts':time.time(),'peak_price':px,'trough_price':px,
-                            'partial_taken':False,'protected':False,'peak_completed_close':px,'entry_features':p.get('features',{})}
+                            'entry_time':now_text(),'entry_trade_date':td,'entry_ts':time.time(),
+                            'peak_price':px,'trough_price':px,'peak_completed_close':px,
+                            'partial_taken':False,'protected':False,'entry_features':p.get('features',{})}
             st['pending']=None; st['trade_count']=to_int(st.get('trade_count'))+1
             st['signal']='HOLD'; st['reason']='ENTRY_FILLED'; st['last_action']=f'BUY {sym} {qty}@{px}'
-            st['entry_done_date']=today()
-        _core4_trade(aid,'BUY',sym,qty,px,fee,0,p.get('reason',''),fx); return True
+            st['entry_done_date']=td
+        _core4_trade(aid,'BUY',sym,qty,px,fee,0,p.get('reason',''),fx); save_state(); return True
 
     if action in ('SELL','PARTIAL_SELL') and pos:
         held=to_int(pos.get('qty')); ratio=max(0.01,min(1.0,to_float(p.get('ratio',1.0))))
@@ -8809,25 +5928,39 @@ def _core4_execute_pending(aid):
             fill=_core4_kr_fill(sym,'SELL',qty=req)
             if not fill.get('ok'): return False
             qty=int(fill['qty']); px=to_float(fill['avg_price']); gross=to_float(fill['gross'])
+        if qty<=0: return False
         fee=gross*fee_rate
         entry_fee=to_float(pos.get('entry_fee'))*(qty/max(1,held))
         cost=qty*to_float(pos.get('avg'))*to_float(pos.get('fx_entry',fx))
-        pnl=gross-fee-cost-entry_fee
-        remain=held-qty
+        pnl=gross-fee-cost-entry_fee; remain=held-qty; td=_core4_trade_date(aid)
         with LOCK:
             st=S['core4_paper'][aid]
             st['cash']=to_float(st.get('cash'))+gross-fee
             st['realized_pl']=to_float(st.get('realized_pl'))+pnl
             if remain<=0:
-                st['position']=None; st['closed_trade_count']=to_int(st.get('closed_trade_count'))+1
-                st['exit_done_date']=today()
+                st['position']=None; st['closed_trade_count']=to_int(st.get('closed_trade_count'))+1; st['exit_done_date']=td; st['pending']=None; st['liquidation_intent']=None
             else:
                 st['position']['qty']=remain
                 st['position']['entry_fee']=max(0.0,to_float(st['position'].get('entry_fee'))-entry_fee)
-                st['position']['partial_taken']=True
-            st['pending']=None; st['signal']='WAIT' if remain<=0 else 'HOLD'
-            st['reason']=p.get('reason',''); st['last_action']=f'{action} {sym} {qty}@{px}'
-        _core4_trade(aid,action,sym,qty,px,fee,pnl,p.get('reason',''),fx); return True
+                # Full-exit signal + partial liquidity => keep the remainder as a live sell request.
+                if action=='SELL':
+                    p['created_ts']=time.time(); p['not_before_ts']=time.time()+max(2.0,min(10.0,REFRESH_SEC/2.0)); p['expires_ts']=time.time()+300
+                    p['trade_date']=_core4_trade_date(aid)
+                    # 원래 청산 세션을 그대로 유지한다. SOXL=REGULAR, US_SURGE=US_EXIT.
+                    if not p.get('required_session'):
+                        p['required_session']=_core4_pending_required_session(aid,p.get('reason','LIQUIDATION_INTENT'),'SELL')
+                    st['pending']=p; st['reason']='PARTIAL_EXIT_REMAINDER_PENDING'
+                    st['liquidation_intent']={
+                        'symbol':sym,'reason':p.get('reason','LIQUIDATION_INTENT'),
+                        'features':p.get('features') or {},'set_at':now_text(),'trade_date':td,
+                        'required_session':p.get('required_session')
+                    }
+                else:
+                    st['position']['partial_taken']=True; st['pending']=None
+            st['signal']='WAIT' if remain<=0 else ('SELL' if action=='SELL' else 'HOLD')
+            if remain<=0 or action!='SELL': st['reason']=p.get('reason','')
+            st['last_action']=f'{action} {sym} {qty}@{px}'
+        _core4_trade(aid,action,sym,qty,px,fee,pnl,p.get('reason',''),fx); save_state(); return True
     return False
 
 def _core4_rsi2_ewm(closes):
@@ -8854,36 +5987,62 @@ def _core4_soxl_signal(trade_date):
             'prev_close':prev,'ma5':ma5,'rsi2':rsi,'source_date':rows[-1][0],'retryable':False}
 
 def _core4_manage_us_soxl():
-    aid='US_SOXL'; et=datetime.now(pytz.timezone('America/New_York'))
-    trade_date=et.strftime('%Y-%m-%d')
-    f=_core4_soxl_signal(trade_date)
+    aid='US_SOXL'; et=datetime.now(pytz.timezone('America/New_York')); trade_date=et.strftime('%Y-%m-%d')
     with LOCK:
         st=S['core4_paper'][aid]; pos=dict(st.get('position') or {})
-        st['signal_features']=f
-    # 일봉 조회 실패는 signal_date를 확정하지 않음 -> 같은 날 재시도.
-    if not f.get('ok'):
-        with LOCK:
-            S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','DATA_MISSING')
-        return
+    # Risk management comes first. Daily-data failure must not disable an existing position's stop/trail.
     if pos:
-        price=_core4_mark(aid,'SOXL'); avg=to_float(pos.get('avg')); peak=max(to_float(pos.get('peak_price',avg)),price)
-        prof=pct(price,avg) if price>0 and avg>0 else 0.0; draw=pct(price,peak) if price>0 and peak>0 else 0.0
-        if prof<=CORE_US_SOXL_SL:
-            _core4_schedule(aid,'SELL','SOXL','HARD_SL_8',{'profit_pct':prof}); return
-        if draw<=-CORE_US_SOXL_TRAIL_DRAW:
-            _core4_schedule(aid,'SELL','SOXL','TRAIL_20',{'profit_pct':prof,'draw_pct':draw}); return
-    hhmm=et.strftime('%H:%M')
-    if et.weekday()<5 and CORE_US_SOXL_DECISION_ET<=hhmm<'16:00':
-        with LOCK:
-            st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); entered=st.get('entry_done_date')==trade_date; exited=st.get('exit_done_date')==trade_date
-        if pos and f['signal']!='BUY':
-            _core4_schedule(aid,'SELL','SOXL','DAILY_CONDITION_OFF',f)
-        elif (not pos) and f['signal']=='BUY' and not entered and not exited:
-            _core4_schedule(aid,'BUY','SOXL','DAILY_ENTRY_0932',f)
+        livebar=_core4_us_completed_bar('SOXL',max_age_sec=180)
+        if livebar.get('ok'):
+            px=to_float(livebar['bar'].get('close')); avg=to_float(pos.get('avg'))
+            with LOCK:
+                live=S['core4_paper'][aid].get('position')
+                if live and px>0:
+                    live['peak_completed_close']=max(to_float(live.get('peak_completed_close',avg)),px)
+                    peak=to_float(live.get('peak_completed_close',avg))
+                else: peak=avg
+            prof=pct(px,avg) if px>0 and avg>0 else 0.0; draw=pct(px,peak) if px>0 and peak>0 else 0.0
+            if prof<=CORE_US_SOXL_SL:
+                _core4_schedule(aid,'SELL','SOXL','HARD_SL_8',{'completed_close':px,'profit_pct':prof,'signal_bar_ts':str(livebar['bar'].get('dt'))},ttl_sec=300,required_session='REGULAR',not_before_ts=_core4_second_following_bar_open_ts(livebar['bar'].get('dt'))); return
+            if draw<=-CORE_US_SOXL_TRAIL_DRAW:
+                _core4_schedule(aid,'SELL','SOXL','TRAIL_20',{'completed_close':px,'profit_pct':prof,'draw_pct':draw,'signal_bar_ts':str(livebar['bar'].get('dt'))},ttl_sec=300,required_session='REGULAR',not_before_ts=_core4_second_following_bar_open_ts(livebar['bar'].get('dt'))); return
         else:
             with LOCK:
-                S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'
-                S['core4_paper'][aid]['reason']=f.get('reason','WAIT')
+                S['core4_paper'][aid]['data_health']='ERROR'; S['core4_paper'][aid]['data_health_reason']=livebar.get('reason','STALE_STOP_PRICE')
+            # Never fabricate an exit from stale/no price.
+
+    f=_core4_soxl_signal(trade_date)
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); st['signal_features']=f
+    if not f.get('ok'):
+        with LOCK:
+            S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','DATA_MISSING')
+        return
+    hhmm=et.strftime('%H:%M')
+    with LOCK:
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); entered=st.get('entry_done_date')==trade_date; exited=st.get('exit_done_date')==trade_date
+
+    # Daily-condition exit is not limited to the narrow entry window. If daily data recovers later,
+    # exit can still be scheduled during the regular session.
+    if pos and f['signal']!='BUY' and et.weekday()<5 and '09:32'<=hhmm<'16:00':
+        _core4_schedule(aid,'SELL','SOXL','DAILY_CONDITION_OFF',f,ttl_sec=180,required_session='REGULAR'); return
+
+    # New entry remains narrow: research decision 09:32 ET, catch-up allowed only through 09:35.
+    if et.weekday()<5 and '09:32'<=hhmm<='09:35':
+        if (not pos) and f['signal']=='BUY' and not entered and not exited:
+            prev_vol=_core4_us_prev_completed_volume('SOXL'); max_qty=max(0,int(prev_vol*0.01))
+            if max_qty<=0:
+                with LOCK: S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='PREV_MINUTE_VOLUME_MISSING'
+                return
+            ff=dict(f); ff['prev_completed_1m_volume']=prev_vol; ff['max_qty_1pct']=max_qty
+            _core4_schedule(aid,'BUY','SOXL','DAILY_ENTRY_0932',ff,max_qty=max_qty,ttl_sec=180,required_session='REGULAR'); return
+    elif (not pos) and f.get('signal')=='BUY' and hhmm>'09:35':
+        with LOCK:
+            S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='MISSED_0932_ENTRY_WINDOW'
+        return
+    with LOCK:
+        S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','WAIT')
+
 
 def _core4_latest_kr_completed_rows(symbol, n=6):
     rows=_read_csv_rows(candle_1m_path(symbol))
@@ -8913,16 +6072,9 @@ def _core4_kr_semi_signal(trade_date):
 
 def _core4_manage_kr_semi():
     aid='KR_SEMI'; trade_date=today()
-    f=_core4_kr_semi_signal(trade_date)
     with LOCK:
-        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); st['signal_features']=f
-    # 일봉 데이터 실패는 같은 날 계속 재시도한다.
-    if not f.get('ok'):
-        with LOCK:
-            S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','DATA_MISSING')
-        return
-
-    # 보유 중: 완료된 1분봉 close로 -8% stop / 최고 완료 close 대비 -20% trail 신호.
+        st=S['core4_paper'][aid]; pos=dict(st.get('position') or {})
+    # 보유 중 위험관리를 일봉 조회보다 먼저 수행한다.
     if pos:
         rows=_core4_latest_kr_completed_rows(CORE_KR_SEMI_SYMBOL,8)
         if rows:
@@ -8937,9 +6089,17 @@ def _core4_manage_kr_semi():
             prof=pct(px,avg) if px>0 and avg>0 else 0.0
             draw=pct(px,peak) if px>0 and peak>0 else 0.0
             if prof<=CORE_KR_SEMI_SL:
-                _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_HARD_SL_8',{'completed_close':px,'profit_pct':prof}); return
+                _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_HARD_SL_8',{'completed_close':px,'profit_pct':prof,'signal_bar_ts':str(rows[-1].get('timestamp',''))},not_before_ts=_core4_second_following_bar_open_ts(_parse_iso(rows[-1].get('timestamp'))),ttl_sec=300,required_session='KR_REGULAR'); return
             if draw<=-CORE_KR_SEMI_TRAIL_DRAW:
-                _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_TRAIL_20',{'completed_close':px,'draw_pct':draw}); return
+                _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_TRAIL_20',{'completed_close':px,'draw_pct':draw,'signal_bar_ts':str(rows[-1].get('timestamp',''))},not_before_ts=_core4_second_following_bar_open_ts(_parse_iso(rows[-1].get('timestamp'))),ttl_sec=300,required_session='KR_REGULAR'); return
+
+    f=_core4_kr_semi_signal(trade_date)
+    with LOCK:
+        S['core4_paper'][aid]['signal_features']=f
+    if not f.get('ok'):
+        with LOCK:
+            S['core4_paper'][aid]['signal']='HOLD' if pos else 'WAIT'; S['core4_paper'][aid]['reason']=f.get('reason','DATA_MISSING')
+        return
 
     # swing.py는 전일 완료 일봉 신호를 사용하고 한국 3번째 거래분봉 open(09:03)에 진입/조건해제 청산.
     if now_kst().strftime('%H:%M') < CORE_KR_SEMI_DECISION_KST:
@@ -8952,6 +6112,9 @@ def _core4_manage_kr_semi():
     if pos and f.get('signal')!='BUY':
         _core4_schedule(aid,'SELL',CORE_KR_SEMI_SYMBOL,'KR_SEMI_DAILY_CONDITION_OFF',f); return
     if (not pos) and f.get('signal')=='BUY' and not entered and not exited:
+        if now_kst().strftime('%H:%M') > '09:06':
+            with LOCK: S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='MISSED_0903_ENTRY_WINDOW'
+            return
         rows=_core4_latest_kr_completed_rows(CORE_KR_SEMI_SYMBOL,4)
         # 09:03 진입 시 직전 완료봉(09:02)의 거래량 1%를 수량 상한으로 사용.
         prev_vol=to_float(rows[-1].get('volume')) if rows else 0.0
@@ -8984,6 +6147,11 @@ def _core4_manage_kr_surge():
         elif prof>=CORE_KR_SURGE_TRAIL_ARM and draw<=-CORE_KR_SURGE_TRAIL_DRAW: _core4_schedule(aid,'SELL',pos['symbol'],'TRAIL',{'profit_pct':prof,'draw_pct':draw})
         elif now_kst().strftime('%H:%M')>='15:10': _core4_schedule(aid,'SELL',pos['symbol'],'EOD_1510')
         return
+    if now_kst().strftime('%H:%M')>='15:10':
+        with LOCK:
+            S['core4_paper'][aid]['signal']='WAIT'
+            S['core4_paper'][aid]['reason']='NO_NEW_ENTRY_AFTER_1510'
+        return
     ranked=list(S.setdefault('full_market',{}).get('ranked',[]))[:50]
     for base_score,sym,q in ranked:
         score,r3,r10,fh,fl,sigtype,feat=_project_candidate_score(base_score,sym,q)
@@ -9011,28 +6179,50 @@ def _core4_manage_us_surge():
     with LOCK:
         st=S['core4_paper'][aid]; pos=dict(st.get('position') or {}); watch=dict(st.get('watch') or {})
     if pos:
-        px=_core4_mark(aid,pos['symbol']); avg=to_float(pos.get('avg')); peak=max(to_float(pos.get('peak_price',avg)),px)
+        livebar=_core4_us_completed_bar(pos['symbol'],max_age_sec=180)
+        if not livebar.get('ok'):
+            with LOCK:
+                S['core4_paper'][aid]['data_health']='ERROR'; S['core4_paper'][aid]['data_health_reason']=livebar.get('reason','STALE_EXIT_PRICE')
+            return
+        px=to_float(livebar['bar'].get('close')); avg=to_float(pos.get('avg')); peak=max(to_float(pos.get('peak_completed_close',avg)),px)
+        with LOCK:
+            live=S['core4_paper'][aid].get('position')
+            if live:
+                live['peak_completed_close']=peak
         prof=pct(px,avg) if px>0 and avg>0 else 0.0; draw=pct(px,peak) if px>0 and peak>0 else 0.0
         if prof>=CORE_US_SURGE_PROTECT_ARM:
             with LOCK:
                 if S['core4_paper'][aid].get('position'): S['core4_paper'][aid]['position']['protected']=True
         protected=bool(S['core4_paper'][aid].get('position',{}).get('protected'))
-        if prof<=CORE_US_SURGE_SL: _core4_schedule(aid,'SELL',pos['symbol'],'HARD_SL',{'profit_pct':prof})
-        elif protected and prof<=CORE_US_SURGE_PROTECT_FLOOR: _core4_schedule(aid,'SELL',pos['symbol'],'PROFIT_PROTECT',{'profit_pct':prof})
-        elif prof>=CORE_US_SURGE_TRAIL_ARM and draw<=-CORE_US_SURGE_TRAIL_DRAW: _core4_schedule(aid,'SELL',pos['symbol'],'TRAIL',{'profit_pct':prof,'draw_pct':draw})
+        fill_ts=_core4_second_following_bar_open_ts(livebar['bar'].get('dt'))
+        extra={'completed_close':px,'profit_pct':prof,'draw_pct':draw,'signal_bar_ts':str(livebar['bar'].get('dt'))}
+        if prof<=CORE_US_SURGE_SL:
+            _core4_schedule(aid,'SELL',pos['symbol'],'HARD_SL',extra,ttl_sec=300,required_session='US_EXIT',not_before_ts=fill_ts)
+        elif protected and prof<=CORE_US_SURGE_PROTECT_FLOOR:
+            _core4_schedule(aid,'SELL',pos['symbol'],'PROFIT_PROTECT',extra,ttl_sec=300,required_session='US_EXIT',not_before_ts=fill_ts)
+        elif prof>=CORE_US_SURGE_TRAIL_ARM and draw<=-CORE_US_SURGE_TRAIL_DRAW:
+            _core4_schedule(aid,'SELL',pos['symbol'],'TRAIL',extra,ttl_sec=300,required_session='US_EXIT',not_before_ts=fill_ts)
         return
     if session!='PREMARKET':
         with LOCK:
             S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='PREMARKET_ONLY'
         return
+    trade_date=_core4_trade_date(aid)
     scan=S.setdefault('us_surge_scan',{})
-    ranked=list(scan.get('ranked') or []) if scan.get('session')=='PREMARKET' else []
-    if not ranked:
+    with LOCK:
+        st=S['core4_paper'][aid]
+        if st.get('watch_trade_date')!=trade_date:
+            st['watch']={}; watch={}; st['watch_trade_date']=trade_date
+    refresh_due=(scan.get('core4_trade_date')!=trade_date or scan.get('session')!='PREMARKET' or time.time()-to_float(scan.get('last_scan_ts'))>=US_SURGE_SCAN_SEC)
+    ranked=[]
+    if refresh_due:
         for meta in _us_surge_rankings('PREMARKET'):
             f=_us_surge_features(meta['symbol'],'PREMARKET',meta)
             row=dict(meta); row.update(f); ranked.append(row)
         ranked.sort(key=lambda x:(bool(x.get('ok')),to_float(x.get('score'))),reverse=True)
-        scan['ranked']=ranked; scan['session']='PREMARKET'; scan['last_scan_ts']=time.time()
+        scan['ranked']=ranked; scan['session']='PREMARKET'; scan['last_scan_ts']=time.time(); scan['core4_trade_date']=trade_date
+    else:
+        ranked=list(scan.get('ranked') or [])
     for f in ranked:
         if not f.get('ok'): continue
         sym=f.get('symbol',''); px=to_float(f.get('price')); w=watch.get(sym,{})
@@ -9051,6 +6241,10 @@ def _core4_manage_us_surge():
 def run_core4_paper():
     if not CORE4_ENABLED: return
     ensure_core4_states()
+    # Persistent liquidation intent survives pending expiry/date rollover/restart.
+    for aid in CORE4_ACCOUNT_IDS:
+        try: _core4_resume_liquidation_intent(aid)
+        except Exception as e: set_error(f'{aid} liquidation intent 복구 오류: {e}')
     # pending 먼저 처리 -> 신호 루프와 체결 루프 분리.
     for aid in CORE4_ACCOUNT_IDS:
         try: _core4_execute_pending(aid)
@@ -9089,6 +6283,8 @@ def core4_summary_snapshot():
                      'start_cash':CORE4_START_CASH,'cash':round(to_float(st.get('cash')),2),
                      'asset':round(to_float(st.get('asset')),2),'profit_rate':round(to_float(st.get('profit_rate')),6),
                      'realized_pl':round(to_float(st.get('realized_pl')),2),'mdd_pct':round(to_float(st.get('mdd_pct')),6),
+                     'performance_basis':'PRE_TAX','tax_estimate_krw':None,'after_tax_profit_rate':None,
+                     'tax_status':'NOT_CALCULATED_INCOMPLETE_TAX_DATA',
                      'trade_count':to_int(st.get('trade_count')),'closed_trade_count':to_int(st.get('closed_trade_count')),
                      'positions':{} if not pos else {pos.get('symbol','POSITION'):pos},
                      'position_count':0 if not pos else 1,'signal':st.get('signal'),'reason':st.get('reason'),
@@ -9152,11 +6348,6 @@ def loop():
                 calc_scores()
                 start_project_scanner_worker_once()
                 start_market_data_workers_once()
-                # 구버전 PAPER 단위오염이 있으면 원본을 격리하고 미래 결과에 전파되지 않게 한다.
-                try:
-                    sanitize_us_semi_legacy_unit_state()
-                except Exception as e:
-                    set_error(f'US PAPER legacy unit 점검 오류: {e}')
                 initialized = True
             refresh_kr_market_calendar(force=False)
             load_prices()
@@ -9226,63 +6417,10 @@ def backup_archive_index():
     return out
 
 
-def parse_arcpro_webhook_body(raw_body):
-    """TradingView Arc-pro webhook body parser. Never places a real order."""
-    if isinstance(raw_body, bytes):
-        body = raw_body.decode('utf-8', errors='replace').strip()
-    else:
-        body = str(raw_body or '').strip()
-    if not body:
-        raise ValueError('EMPTY_BODY')
-    symbol = action = ''
-    price = 0.0
-    signal_time = ''
-    payload = None
-    # JSON is preferred, but a compact pipe format is also accepted.
-    try:
-        payload = json.loads(body)
-    except Exception:
-        payload = None
-    if isinstance(payload, dict):
-        symbol = str(payload.get('symbol') or payload.get('ticker') or '').strip().upper()
-        action = str(payload.get('action') or payload.get('signal') or '').strip().upper()
-        price = to_float(payload.get('price') or payload.get('close') or 0, 0)
-        signal_time = str(payload.get('time') or payload.get('timenow') or '').strip()
-    else:
-        parts = [p.strip() for p in body.split('|') if p.strip()]
-        if len(parts) >= 2:
-            symbol, action = parts[0].upper(), parts[1].upper()
-        for p in parts[2:]:
-            if '=' not in p:
-                continue
-            k, v = p.split('=', 1)
-            k = k.strip().lower(); v = v.strip()
-            if k in {'price','close'}:
-                price = to_float(v, 0)
-            elif k in {'time','timenow'}:
-                signal_time = v
-    if symbol not in ARC_ALERT_ALLOWED_SYMBOLS:
-        raise ValueError(f'INVALID_SYMBOL:{symbol}')
-    if action not in ARC_ALERT_ALLOWED_ACTIONS:
-        raise ValueError(f'INVALID_ACTION:{action}')
-    if price <= 0:
-        raise ValueError('INVALID_PRICE')
-    return {'symbol': symbol, 'action': action, 'price': price, 'signal_time': signal_time, 'received_at': now_text(), 'raw': body[:2000]}
 
 
-def arcpro_webhook_log_path():
-    return os.path.join(day_dir(), f'arcpro_webhook_{today()}.csv')
 
 
-def record_arcpro_webhook(evt):
-    write_row(arcpro_webhook_log_path(),
-              ['received_at','signal_time','symbol','name','action','price','raw'],
-              {'received_at': evt.get('received_at',''), 'signal_time': evt.get('signal_time',''),
-               'symbol': evt.get('symbol',''), 'name': name_of(evt.get('symbol','')),
-               'action': evt.get('action',''), 'price': evt.get('price',0), 'raw': evt.get('raw','')})
-    write_alert_log('INFO','arcpro_webhook',evt.get('symbol',''),evt.get('price',0),0,
-                    evt.get('action',''),'TRADINGVIEW_ARCPRO_RECEIVED',True,evt.get('signal_time',''))
-    return True
 
 
 
@@ -9318,294 +6456,34 @@ def ensure_arcpro_paper_state():
             st['failed_sell'] = None
         return st
 
-def arcpro_event_id(evt):
-    base = '|'.join([
-        str(evt.get('symbol','')).strip(), str(evt.get('action','')).strip(),
-        str(evt.get('signal_time','')).strip(), f"{to_float(evt.get('price',0)):.8f}"
-    ])
-    return hashlib.sha256(base.encode('utf-8')).hexdigest()[:32]
 
 
-def arcpro_paper_log_path():
-    return os.path.join(day_dir(), f'arcpro_paper_trades_{today()}.csv')
 
 
-def _arcpro_mark_price(sym, pos=None):
-    p = to_float(S.get('prices', {}).get(sym, 0))
-    if p > 0:
-        return p
-    ob = S.setdefault('market_data_capture', {}).get('latest_orderbook', {}).get(sym, {})
-    bid = to_float(ob.get('best_bid', 0)) if isinstance(ob, dict) else 0
-    ask = to_float(ob.get('best_ask', 0)) if isinstance(ob, dict) else 0
-    if bid > 0 and ask > 0:
-        return (bid + ask) / 2
-    if isinstance(pos, dict):
-        return to_float(pos.get('avg', 0))
-    return 0.0
 
 
-def update_arcpro_paper_asset(save=False):
-    ensure_arcpro_paper_state()
-    with LOCK:
-        st = S['arcpro_paper']
-        asset = to_float(st.get('cash', 0))
-        for sym, pos in list(st.get('positions', {}).items()):
-            if not isinstance(pos, dict):
-                continue
-            qty = int(to_float(pos.get('qty', 0)))
-            if qty <= 0:
-                continue
-            asset += qty * _arcpro_mark_price(sym, pos)
-        st['asset'] = int(round(asset))
-        start = max(1, int(to_float(st.get('start_cash', ARC_PAPER_START_CASH))))
-        st['profit_rate'] = round((asset / start - 1.0) * 100.0, 6)
-        out = st['asset']
-    if save:
-        save_state()
-    return out
 
 
-def _arcpro_event_record(evt, status, reason='', extra=None):
-    ensure_arcpro_paper_state()
-    row = {
-        'received_at': evt.get('received_at',''), 'signal_time': evt.get('signal_time',''),
-        'event_id': evt.get('event_id',''), 'symbol': evt.get('symbol',''), 'name': name_of(evt.get('symbol','')),
-        'action': evt.get('action',''), 'signal_price': round(to_float(evt.get('price',0)), 4),
-        'status': status, 'reason': reason or '', 'processed_at': now_text()
-    }
-    if isinstance(extra, dict):
-        row.update(extra)
-    with LOCK:
-        st = S['arcpro_paper']
-        st['last_event'] = dict(row)
-        st.setdefault('recent_events', []).insert(0, dict(row))
-        del st['recent_events'][ARC_PAPER_MAX_RECENT_EVENTS:]
-    return row
 
 
-def _arcpro_write_trade(action, evt, fill_price, qty, fee, pl, status, reason='', sell_tax=0):
-    update_arcpro_paper_asset(False)
-    with LOCK:
-        st = S['arcpro_paper']
-        row = {'time': now_text(), 'signal_time': evt.get('signal_time',''), 'event_id': evt.get('event_id',''),
-               'cycle_id': evt.get('_cycle_id',''), 'action': action, 'symbol': evt.get('symbol',''), 'name': name_of(evt.get('symbol','')),
-               'signal_price': round(to_float(evt.get('price',0)),4), 'fill_price': round(to_float(fill_price),4),
-               'qty': int(qty), 'fee': int(fee), 'commission': int(fee), 'sell_tax': int(sell_tax),
-               'total_cost': int(fee) + int(sell_tax), 'pl': int(pl), 'cash': int(to_float(st.get('cash',0))),
-               'asset': int(to_float(st.get('asset',0))), 'profit_rate': round(to_float(st.get('profit_rate',0)),6),
-               'status': status, 'reason': reason, 'paper_only': True, 'real_order': False,
-               'cost_model': f'KRX_COMMISSION_{ARC_PAPER_KRX_COMMISSION_PCT:.3f}pct_SELL_TAX_{ARC_PAPER_SELL_TAX_PCT:.2f}pct'}
-        st.setdefault('trades', []).insert(0, dict(row))
-        del st['trades'][500:]
-    write_row(arcpro_paper_log_path(),
-              ['time','signal_time','event_id','cycle_id','action','symbol','name','signal_price','fill_price','qty','fee','commission','sell_tax','total_cost','pl','cash','asset','profit_rate','status','reason','paper_only','real_order','cost_model'], row)
-    save_state()
-    return row
-
-def _arcpro_notify_success(action, sym, row):
-    labels = {'BUY':'자동매수', 'ADD':'추매', 'PARTIAL':'반익', 'SELL':'전량매도'}
-    label = labels.get(action, action)
-    msg = (f"✅ {label} 성공 (가상매매)\n{name_of(sym)} {sym}\n"
-           f"체결가 {row.get('fill_price',0):,.0f}원 / {row.get('qty',0)}주\n"
-           f"현금 {row.get('cash',0):,}원 / 총자산 {row.get('asset',0):,}원")
-    if action in {'PARTIAL','SELL'}:
-        msg += f"\n실현손익 {row.get('pl',0):+,}원"
-    send_telegram(msg, force=False)
 
 
-def _arcpro_notify_failure(evt, reason, urgent=False):
-    sym = evt.get('symbol','')
-    action = evt.get('action','')
-    if action == 'PARTIAL' and reason == 'SELL_WITHOUT_POSITION':
-        title = 'ℹ️ 반익 신호 수신 — 보유수량 없음'
-        urgent = False
-    elif action == 'SELL' and reason == 'SELL_WITHOUT_POSITION':
-        title = 'ℹ️ 매도 신호 수신 — 보유수량 없음'
-        urgent = False
-    elif action in {'SELL','PARTIAL'}:
-        title = '🚨 매도/반익 실패 — 확인 필요'
-    else:
-        title = '⚠️ 매수 실패 — 가상매매 미체결'
-    with LOCK:
-        st = S.get('arcpro_paper', {})
-        pos = st.get('positions', {}).get(sym, {}) if isinstance(st.get('positions',{}), dict) else {}
-        qty = int(to_float(pos.get('qty',0))) if isinstance(pos,dict) else 0
-    msg = f"{title}\n{name_of(sym)} {sym}\n신호 {action} / 사유 {reason}\n현재 보유 {qty}주"
-    send_telegram(msg, force=urgent)
-
-def _arcpro_claim_event(evt):
-    ensure_arcpro_paper_state()
-    eid = evt.get('event_id') or arcpro_event_id(evt)
-    evt['event_id'] = eid
-    with LOCK:
-        st = S['arcpro_paper']
-        ids = st.setdefault('processed_ids', [])
-        if eid in ids:
-            return False
-        ids.append(eid)
-        if len(ids) > ARC_PAPER_MAX_PROCESSED_IDS:
-            del ids[:-ARC_PAPER_MAX_PROCESSED_IDS]
-    save_state()
-    return True
 
 
-def _arcpro_commission(gross):
-    # Toss domestic-stock docs: won fractions are truncated.
-    return int(max(0.0, to_float(gross, 0)) * ARC_PAPER_KRX_COMMISSION_PCT / 100.0)
 
 
-def _arcpro_sell_tax(gross):
-    return int(max(0.0, to_float(gross, 0)) * ARC_PAPER_SELL_TAX_PCT / 100.0)
 
 
-def _arcpro_symbol_block_reason(sym):
-    st = ensure_arcpro_paper_state()
-    block = st.get('blocked_symbols', {}).get(sym) if isinstance(st.get('blocked_symbols'), dict) else None
-    if not isinstance(block, dict):
-        return ''
-    if to_float(block.get('until_epoch', 0), 0) <= time.time():
-        with LOCK:
-            st.get('blocked_symbols', {}).pop(sym, None)
-        return ''
-    return str(block.get('reason','') or 'SELL_FAILURE')
 
 
-def _arcpro_set_symbol_block(sym, reason, seconds=None):
-    st = ensure_arcpro_paper_state()
-    with LOCK:
-        st.setdefault('blocked_symbols', {})[sym] = {'reason': reason, 'until_epoch': time.time() + max(10, int(seconds or ARC_TRANSIENT_BLOCK_SEC)), 'time': now_text()}
 
 
-def _arcpro_clear_symbol_block(sym):
-    st = ensure_arcpro_paper_state()
-    with LOCK:
-        st.setdefault('blocked_symbols', {}).pop(sym, None)
 
 
-def _arcpro_buy(evt, is_add=False):
-    sym = evt['symbol']
-    ensure_arcpro_paper_state()
-    update_arcpro_paper_asset(False)
-    with LOCK:
-        st = S['arcpro_paper']
-        if st.get('paused_new_buys'):
-            return (False, 'NEW_BUYS_PAUSED_AFTER_CRITICAL_SELL_FAILURE', None)
-        block_reason = _arcpro_symbol_block_reason(sym)
-        if block_reason:
-            return (False, f'SYMBOL_BLOCKED_AFTER_SELL_FAILURE:{block_reason}', None)
-        pos = st.get('positions', {}).get(sym)
-        if is_add and not isinstance(pos, dict):
-            return (False, 'ADD_WITHOUT_POSITION', None)
-        if (not is_add) and isinstance(pos, dict) and int(to_float(pos.get('qty',0))) > 0:
-            return (False, 'BUY_ALREADY_POSITIONED_USE_ADD', None)
-    prep_ok, prep_reason = _arcpro_prepare_trade_market_data(sym)
-    if not prep_ok:
-        return (False, prep_reason, None)
-    update_arcpro_paper_asset(False)
-    with LOCK:
-        st = S['arcpro_paper']
-        pos = st.get('positions', {}).get(sym)
-        cash = int(to_float(st.get('cash', 0)))
-        equity = max(1, int(to_float(st.get('asset', cash))))
-        reserve = int(equity * ARC_PAPER_RESERVE_RATIO)
-        spendable = max(0, cash - reserve)
-        if is_add:
-            cur_qty = int(to_float(pos.get('qty',0)))
-            cur_value = cur_qty * _arcpro_mark_price(sym, pos)
-            cap_gap = max(0, int(equity * ARC_PAPER_ADD_MAX_RATIO - cur_value))
-            budget = min(spendable, int(equity * ARC_PAPER_ADD_STEP_RATIO), cap_gap)
-        else:
-            budget = min(spendable, int(equity * ARC_PAPER_BUY_TARGET_RATIO))
-    if budget <= 0:
-        return (False, 'NO_AVAILABLE_BUDGET', None)
-    fee_rate = ARC_PAPER_KRX_COMMISSION_PCT / 100.0
-    fill = simulated_orderbook_fill(sym, 'BUY', max_cash=budget / (1.0 + fee_rate))
-    if not fill.get('ok'):
-        return (False, fill.get('reason','BUY_FILL_FAILED'), None)
-    qty = int(fill.get('qty',0)); price = to_float(fill.get('avg_price',0)); gross = int(round(to_float(fill.get('gross',0))))
-    fee = _arcpro_commission(gross); total = gross + fee
-    if qty <= 0 or price <= 0:
-        return (False, 'INVALID_BUY_FILL', None)
-    with LOCK:
-        st = S['arcpro_paper']
-        cash_now = int(to_float(st.get('cash',0)))
-        if total > cash_now:
-            return (False, 'CASH_CHANGED_BEFORE_COMMIT', None)
-        old = st.get('positions', {}).get(sym)
-        if isinstance(old, dict):
-            old_qty = int(to_float(old.get('qty',0))); old_cost = int(to_float(old.get('entry_total_cost', old_qty * to_float(old.get('avg',0)))))
-            cycle_id = str(old.get('cycle_id','') or evt.get('event_id',''))
-        else:
-            old_qty = 0; old_cost = 0; cycle_id = str(evt.get('event_id',''))
-        new_qty = old_qty + qty; new_cost = old_cost + total
-        st['cash'] = cash_now - total
-        old_gross = old_qty * to_float(old.get('avg',0)) if isinstance(old,dict) else 0
-        st.setdefault('positions', {})[sym] = {'qty': new_qty, 'avg': (old_gross + gross) / max(1,new_qty),
-            'entry_total_cost': new_cost, 'last_buy_at': now_text(), 'last_signal': evt.get('action',''), 'cycle_id': cycle_id}
-        st['last_action'] = f"{now_short()} {evt.get('action')} {name_of(sym)} {qty}주"
-    evt['_cycle_id'] = cycle_id
-    row = _arcpro_write_trade(evt.get('action','BUY'), evt, price, qty, fee, 0, 'FILLED', 'ARCPRO_SIGNAL', sell_tax=0)
-    return (True, 'OK', row)
 
-def _arcpro_sell(evt, partial=False):
-    sym = evt['symbol']
-    ensure_arcpro_paper_state()
-    with LOCK:
-        st = S['arcpro_paper']
-        pos = st.get('positions', {}).get(sym)
-        if not isinstance(pos, dict) or int(to_float(pos.get('qty',0))) <= 0:
-            return (False, 'SELL_WITHOUT_POSITION', None)
-        old_qty = int(to_float(pos.get('qty',0)))
-        avg = to_float(pos.get('avg',0))
-        old_cost = int(to_float(pos.get('entry_total_cost', old_qty * avg)))
-        cycle_id = str(pos.get('cycle_id','') or evt.get('event_id',''))
-    prep_ok, prep_reason = _arcpro_prepare_trade_market_data(sym)
-    if not prep_ok:
-        return (False, prep_reason, None)
-    target_qty = max(1, int(old_qty * ARC_PAPER_PARTIAL_RATIO)) if partial else old_qty
-    fill = simulated_orderbook_fill(sym, 'SELL', qty=target_qty)
-    if not fill.get('ok'):
-        return (False, fill.get('reason','SELL_FILL_FAILED'), None)
-    sold = int(fill.get('qty',0)); price = to_float(fill.get('avg_price',0)); gross = int(round(to_float(fill.get('gross',0))))
-    fee = _arcpro_commission(gross); sell_tax = _arcpro_sell_tax(gross); net = gross - fee - sell_tax
-    if sold <= 0 or price <= 0:
-        return (False, 'INVALID_SELL_FILL', None)
-    cost_part = int(round(old_cost * sold / max(1, old_qty)))
-    pl = net - cost_part
-    remain = old_qty - sold
-    with LOCK:
-        st = S['arcpro_paper']
-        current = st.get('positions', {}).get(sym)
-        if not isinstance(current, dict) or int(to_float(current.get('qty',0))) != old_qty:
-            return (False, 'POSITION_CHANGED_BEFORE_COMMIT', None)
-        st['cash'] = int(to_float(st.get('cash',0))) + net
-        st['realized_pl'] = int(to_float(st.get('realized_pl',0))) + pl
-        if remain <= 0:
-            st['positions'].pop(sym, None)
-        else:
-            current['qty'] = remain
-            current['entry_total_cost'] = max(0, old_cost - cost_part)
-            current['last_sell_at'] = now_text()
-        st['last_action'] = f"{now_short()} {evt.get('action')} {name_of(sym)} {sold}주"
-        incomplete = sold < target_qty
-        if evt.get('action') == 'SELL' and (remain > 0 or incomplete):
-            st['paused_new_buys'] = True
-            st['failed_sell'] = {'symbol': sym, 'remaining_qty': remain, 'reason': 'PARTIAL_LIQUIDITY', 'time': now_text(), 'critical': True}
-        elif evt.get('action') == 'SELL' and remain <= 0:
-            if isinstance(st.get('failed_sell'), dict) and st['failed_sell'].get('symbol') == sym:
-                st['failed_sell'] = None
-            if not st.get('failed_sell'):
-                st['paused_new_buys'] = False
-    _arcpro_clear_symbol_block(sym)
-    evt['_cycle_id'] = cycle_id
-    status = 'FILLED' if sold == target_qty else 'PARTIAL_FILL'
-    row = _arcpro_write_trade(evt.get('action','SELL'), evt, price, sold, fee, pl, status, 'ARCPRO_SIGNAL', sell_tax=sell_tax)
-    if sold < target_qty:
-        return (False, 'PARTIAL_LIQUIDITY', row)
-    return (True, 'OK', row)
 
-def arcpro_signal_snapshot_path():
-    return os.path.join(day_dir(), f'arcpro_signal_snapshots_{today()}.csv')
+
+
 
 
 def _pct_move(cur, old):
@@ -9624,99 +6502,16 @@ def _read_recent_csv(path, limit=120):
         return []
 
 
-def _market_recent_return(market, n=5):
-    rows = _read_recent_csv(candle_1m_path(market), max(40, n + 2))
-    vals = [to_float(r.get('close', 0)) for r in rows if to_float(r.get('close', 0)) > 0]
-    if len(vals) <= n:
-        return 0.0
-    return _pct_move(vals[-1], vals[-1-n])
 
 
-def capture_arcpro_signal_snapshot(evt):
-    """추가 API 호출 없이 이미 수집한 1분봉/호가/체결 캐시로 신호 순간을 라벨링한다."""
-    sym = str(evt.get('symbol','')).strip()
-    event_id = evt.get('event_id') or arcpro_event_id(evt)
-    candle_rows = _read_recent_csv(candle_1m_path(sym), ARC_PATTERN_CANDLE_COUNT)
-    candles = []
-    for r in candle_rows:
-        candles.append({'timestamp': r.get('timestamp',''), 'open': to_float(r.get('open',0)), 'high': to_float(r.get('high',0)), 'low': to_float(r.get('low',0)), 'close': to_float(r.get('close',0)), 'volume': to_float(r.get('volume',0))})
-    trade_rows = _read_recent_csv(trades_path(sym), 50)
-    trades = [{'timestamp':r.get('timestamp',''), 'price':to_float(r.get('price',0)), 'volume':to_float(r.get('volume',0))} for r in trade_rows]
-    ob = S.setdefault('market_data_capture', {}).get('latest_orderbook', {}).get(sym, {})
-    asks = ob.get('asks', []) if isinstance(ob, dict) and isinstance(ob.get('asks', []), list) else []
-    bids = ob.get('bids', []) if isinstance(ob, dict) and isinstance(ob.get('bids', []), list) else []
-    closes = [to_float(x.get('close',0)) for x in candles if to_float(x.get('close',0)) > 0]
-    vols = [to_float(x.get('volume',0)) for x in candles]
-    cur = to_float(S.setdefault('prices', {}).get(sym, 0)) or (closes[-1] if closes else to_float(evt.get('price',0)))
-    def old_close(n): return closes[-1-n] if len(closes) > n else 0
-    highs = [to_float(x.get('high',0)) for x in candles if to_float(x.get('high',0)) > 0]
-    lows = [to_float(x.get('low',0)) for x in candles if to_float(x.get('low',0)) > 0]
-    session_high = max(highs or [0]); session_low = min(lows or [0])
-    pos_pct = round((cur-session_low)/(session_high-session_low)*100.0,4) if session_high > session_low > 0 else 0.0
-    vol_now = vols[-1] if vols else 0
-    def vavg(n):
-        vals = vols[-(n+1):-1] if len(vols) > 1 else []
-        vals = vals[-n:]
-        return sum(vals)/len(vals) if vals else 0
-    ask_total = sum(to_float(x.get('volume',0)) for x in asks if isinstance(x,dict))
-    bid_total = sum(to_float(x.get('volume',0)) for x in bids if isinstance(x,dict))
-    best_ask = to_float(ob.get('best_ask',0)) if isinstance(ob,dict) else 0
-    best_bid = to_float(ob.get('best_bid',0)) if isinstance(ob,dict) else 0
-    spread = best_ask-best_bid if best_ask and best_bid else 0
-    buy_value = sell_value = 0.0
-    for t in trades[-20:]:
-        p=to_float(t.get('price',0)); v=to_float(t.get('volume',0)); value=p*v
-        if p >= best_ask > 0: buy_value += value
-        elif p <= best_bid and best_bid > 0: sell_value += value
-    flow_total = buy_value + sell_value
-    row = {
-        'saved_at': now_text(), 'received_at': evt.get('received_at',''), 'signal_time': evt.get('signal_time',''),
-        'event_id': event_id, 'cycle_id': evt.get('_cycle_id',''), 'symbol': sym, 'name': name_of(sym), 'action': evt.get('action',''),
-        'signal_price': round(to_float(evt.get('price',0)),4), 'toss_price': round(cur,4),
-        'price_timestamp': S.setdefault('market_data_capture', {}).get('price_timestamp', {}).get(sym,''),
-        'price_age_sec': round(data_age_seconds(S.setdefault('market_data_capture', {}).get('price_timestamp', {}).get(sym,'')),3),
-        'orderbook_timestamp': ob.get('timestamp','') if isinstance(ob,dict) else '', 'orderbook_age_sec': round(data_age_seconds(ob.get('timestamp','')) if isinstance(ob,dict) else 1e9,3),
-        'ret_1m_pct': _pct_move(cur, old_close(1)), 'ret_3m_pct': _pct_move(cur, old_close(3)),
-        'ret_5m_pct': _pct_move(cur, old_close(5)), 'ret_10m_pct': _pct_move(cur, old_close(10)), 'ret_30m_pct': _pct_move(cur, old_close(30)),
-        'volume_now': round(vol_now,4), 'volume_avg_prev5': round(vavg(5),4), 'volume_avg_prev10': round(vavg(10),4), 'volume_avg_prev20': round(vavg(20),4),
-        'volume_ratio_prev5': round(vol_now/vavg(5),6) if vavg(5)>0 else 0,
-        'range_high': round(session_high,4), 'range_low': round(session_low,4), 'range_position_pct': pos_pct,
-        'best_ask': round(best_ask,4), 'best_bid': round(best_bid,4), 'spread': round(spread,4), 'spread_pct': round(spread/cur*100.0,6) if cur>0 and spread else 0,
-        'ask_total_volume': round(ask_total,4), 'bid_total_volume': round(bid_total,4), 'bid_ask_ratio': round(bid_total/ask_total,6) if ask_total>0 else 0,
-        'recent_buy_value': round(buy_value,2), 'recent_sell_value': round(sell_value,2), 'recent_buy_ratio': round(buy_value/flow_total,6) if flow_total>0 else 0,
-        'kospi_ret_5m_pct': _market_recent_return('KOSPI',5), 'kosdaq_ret_5m_pct': _market_recent_return('KOSDAQ',5),
-        'bars_json': json.dumps(candles[-30:], ensure_ascii=False, separators=(',',':')),
-        'asks_json': json.dumps(asks[:10], ensure_ascii=False, separators=(',',':')),
-        'bids_json': json.dumps(bids[:10], ensure_ascii=False, separators=(',',':')),
-        'trades_json': json.dumps(trades[-20:], ensure_ascii=False, separators=(',',':'))
-    }
-    write_row(arcpro_signal_snapshot_path(), list(row.keys()), row)
-    return row
 
 
 def arcpro_signal_outcome_path():
     return os.path.join(day_dir(), f'arcpro_signal_outcomes_{today()}.csv')
 
 
-def _link_previous_arcpro_signal(evt):
-    st = ensure_arcpro_paper_state(); sym = str(evt.get('symbol',''))
-    with LOCK:
-        for tr in st.get('outcome_trackers', []):
-            if tr.get('symbol') == sym and not tr.get('next_signal_action') and tr.get('event_id') != evt.get('event_id'):
-                tr['next_signal_action'] = evt.get('action',''); tr['next_signal_time'] = evt.get('signal_time','') or evt.get('received_at','') or now_text()
 
 
-def register_arcpro_outcome_tracker(evt, snapshot=None):
-    st = ensure_arcpro_paper_state(); eid = evt.get('event_id') or arcpro_event_id(evt)
-    _link_previous_arcpro_signal(evt)
-    with LOCK:
-        if any(x.get('event_id') == eid for x in st.get('outcome_trackers', [])):
-            return
-        st.setdefault('outcome_trackers', []).append({'event_id': eid, 'cycle_id': evt.get('_cycle_id',''), 'symbol': evt.get('symbol',''), 'action': evt.get('action',''),
-            'signal_price': to_float(evt.get('price',0)), 'base_price': to_float((snapshot or {}).get('toss_price',0)) or to_float(evt.get('price',0)),
-            'start_epoch': time.time(), 'signal_time': evt.get('signal_time',''), 'received_at': evt.get('received_at',''), 'done': [], 'next_signal_action':'', 'next_signal_time':''})
-        if len(st['outcome_trackers']) > 300:
-            del st['outcome_trackers'][:-300]
 
 
 def maybe_update_arcpro_outcomes():
@@ -9752,231 +6547,11 @@ def maybe_update_arcpro_outcomes():
     if changed:
         save_state()
 
-def process_arcpro_paper_event(evt):
-    """Arc-pro 신호를 1천만원 전용 가상계좌에만 반영한다. 실주문 함수는 호출하지 않는다."""
-    try:
-        ensure_arcpro_paper_state()
-        if not _arcpro_claim_event(evt):
-            _arcpro_event_record(evt, 'DUPLICATE_IGNORED', 'DUPLICATE_SIGNAL')
-            return {'ok': True, 'duplicate': True}
-        action = evt.get('action','')
-        if action == 'BUY': ok, reason, row = _arcpro_buy(evt, False)
-        elif action == 'ADD': ok, reason, row = _arcpro_buy(evt, True)
-        elif action == 'PARTIAL': ok, reason, row = _arcpro_sell(evt, True)
-        elif action == 'SELL': ok, reason, row = _arcpro_sell(evt, False)
-        else: ok, reason, row = (False, 'INVALID_ACTION', None)
-        try:
-            snap = capture_arcpro_signal_snapshot(evt)
-            register_arcpro_outcome_tracker(evt, snap)
-        except Exception as snap_e:
-            set_error(f'Arc-pro signal snapshot/outcome error: {snap_e}')
-        if ok:
-            _arcpro_event_record(evt, 'EXECUTED', reason, {'fill_price': row.get('fill_price',0) if row else 0, 'qty': row.get('qty',0) if row else 0})
-            if row: _arcpro_notify_success(action, evt.get('symbol',''), row)
-        else:
-            _arcpro_event_record(evt, 'NOT_EXECUTED', reason, {'fill_price': row.get('fill_price',0) if row else 0, 'qty': row.get('qty',0) if row else 0})
-            transient = reason in ARC_TRANSIENT_DATA_REASONS or any(reason.startswith(x+':') for x in ARC_TRANSIENT_DATA_REASONS)
-            if action == 'SELL' and reason != 'SELL_WITHOUT_POSITION':
-                if transient:
-                    _arcpro_set_symbol_block(evt.get('symbol',''), reason, ARC_TRANSIENT_BLOCK_SEC)
-                    # transient data failure does NOT freeze unrelated symbols.
-                    _arcpro_notify_failure(evt, reason, urgent=True)
-                elif reason in ARC_CRITICAL_SELL_REASONS:
-                    with LOCK:
-                        st = S['arcpro_paper']; st['paused_new_buys'] = True
-                        pos = st.get('positions',{}).get(evt.get('symbol',''),{}) if isinstance(st.get('positions',{}),dict) else {}
-                        st['failed_sell'] = {'symbol': evt.get('symbol',''), 'remaining_qty': int(to_float(pos.get('qty',0))) if isinstance(pos,dict) else 0, 'reason': reason, 'time': now_text(), 'critical': True}
-                    save_state(); _arcpro_notify_failure(evt, reason, urgent=True)
-                else:
-                    _arcpro_set_symbol_block(evt.get('symbol',''), reason, ARC_TRANSIENT_BLOCK_SEC)
-                    _arcpro_notify_failure(evt, reason, urgent=True)
-            elif action == 'PARTIAL':
-                _arcpro_notify_failure(evt, reason, urgent=(reason != 'SELL_WITHOUT_POSITION'))
-            elif action in {'BUY','ADD'} and reason not in {'MARKET_CLOSED','OUTSIDE_KR_REGULAR','WEEKEND','HOLIDAY','OUTSIDE_REGULAR_SESSION'}:
-                _arcpro_notify_failure(evt, reason, urgent=False)
-            elif reason == 'SELL_WITHOUT_POSITION':
-                _arcpro_notify_failure(evt, reason, urgent=False)
-        save_state()
-        return {'ok': ok, 'reason': reason, 'row': row}
-    except Exception as e:
-        set_error(f'Arc-pro paper engine error: {e}')
-        _arcpro_event_record(evt, 'ENGINE_ERROR', str(e)); save_state()
-        try: _arcpro_notify_failure(evt, f'ENGINE_ERROR:{e}', urgent=evt.get('action') in {'SELL','PARTIAL'})
-        except Exception: pass
-        return {'ok': False, 'reason': f'ENGINE_ERROR:{e}'}
-
-def arcpro_status_snapshot():
-    ensure_arcpro_paper_state()
-    update_arcpro_paper_asset(False)
-    with LOCK:
-        st = S['arcpro_paper']
-        return {
-            'ok': True, 'version': OPERATING_VERSION, 'paper_only': True,
-            'real_order_enabled': bool(ENABLE_REAL_ORDER),
-            'start_cash': int(to_float(st.get('start_cash',0))), 'cash': int(to_float(st.get('cash',0))),
-            'asset': int(to_float(st.get('asset',0))), 'profit_rate': round(to_float(st.get('profit_rate',0)),6),
-            'realized_pl': int(to_float(st.get('realized_pl',0))), 'positions': json.loads(json.dumps(st.get('positions',{}))),
-            'paused_new_buys': bool(st.get('paused_new_buys')), 'failed_sell': json.loads(json.dumps(st.get('failed_sell'))), 'blocked_symbols': json.loads(json.dumps(st.get('blocked_symbols',{}))),
-            'last_action': st.get('last_action',''), 'last_event': json.loads(json.dumps(st.get('last_event',{}))),
-            'recent_events': json.loads(json.dumps(st.get('recent_events',[])[:20])),
-            'rules': {'reserve_ratio': ARC_PAPER_RESERVE_RATIO, 'buy_target_ratio': ARC_PAPER_BUY_TARGET_RATIO,
-                      'add_max_ratio': ARC_PAPER_ADD_MAX_RATIO, 'add_step_ratio': ARC_PAPER_ADD_STEP_RATIO,
-                      'partial_ratio': ARC_PAPER_PARTIAL_RATIO, 'fee_side_pct': ARC_PAPER_KRX_COMMISSION_PCT, 'sell_tax_pct': ARC_PAPER_SELL_TAX_PCT, 'arc_signal_fresh_max_sec': ARC_SIGNAL_FRESH_MAX_SEC}
-        }
 
 
-def _multi_ai_update_for_summary(ai_id):
-    """실시간 가격이 모두 있을 때만 KR PAPER 계좌를 재평가한다.
-    가격이 아직 없는 재시작/휴장 상황에서는 마지막 저장 asset을 보존한다.
-    """
-    ensure_multi_ai_states()
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        positions = dict(st.get('positions', {}))
-        prices = dict(S.get('prices', {}))
-        cash = to_float(st.get('cash', 0))
-        start = max(1.0, to_float(st.get('start_cash', MULTI_AI_START_CASH)))
-    if positions and any(to_float(prices.get(sym, 0)) <= 0 for sym in positions):
-        return False
-    asset = cash
-    for sym, pos in positions.items():
-        asset += to_float(pos.get('qty', 0)) * to_float(prices.get(sym, 0))
-    with LOCK:
-        st = S['paper_ais'][ai_id]
-        st['asset'] = int(round(asset))
-        st['profit_rate'] = round((asset / start - 1.0) * 100.0, 6)
-        peak = max(to_float(st.get('peak_asset', start)), asset)
-        st['peak_asset'] = peak
-        dd = ((asset / peak) - 1.0) * 100.0 if peak > 0 else 0.0
-        st['mdd_pct'] = min(to_float(st.get('mdd_pct', 0)), dd)
-    return True
 
 
-def paper_summary_snapshot():
-    """KR 93 + US 기존4 + US 급등4 PAPER 계좌를 한 번에 시가평가/집계한다."""
-    ensure_multi_ai_states()
-    ensure_us_semi_paper_states()
-    ensure_us_surge_states()
 
-    for ai_id in MULTI_AI_IDS:
-        try:
-            _multi_ai_update_for_summary(ai_id)
-        except Exception as e:
-            set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
-
-    for ai_id in US_SEMI_PAPER_IDS:
-        try:
-            update_us_semi_paper_asset(ai_id, save=False)
-        except Exception as e:
-            set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
-    for ai_id in US_SURGE_PAPER_IDS:
-        try:
-            _us_surge_update_asset(ai_id)
-        except Exception as e:
-            set_error(f'{ai_id} PAPER summary 평가 실패: {e}')
-
-    accounts = []
-    with LOCK:
-        for ai_id in MULTI_AI_IDS:
-            st = S['paper_ais'][ai_id]
-            trades = st.get('trades', []) if isinstance(st.get('trades', []), list) else []
-            positions = json.loads(json.dumps(st.get('positions', {})))
-            accounts.append({
-                'id': ai_id,
-                'market': 'KR',
-                'name': st.get('name', ai_id),
-                'start_cash': int(to_float(st.get('start_cash', MULTI_AI_START_CASH))),
-                'cash': int(to_float(st.get('cash', 0))),
-                'asset': int(to_float(st.get('asset', 0))),
-                'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
-                'realized_pl': int(to_float(st.get('realized_pl', 0))),
-                'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6),
-                'trade_count': len(trades),
-                'positions': positions,
-                'position_count': len(positions),
-                'last_action': st.get('last_action', ''),
-                'paper_only': True,
-            })
-
-        for ai_id in US_SEMI_PAPER_IDS:
-            st = S['us_semi_paper'][ai_id]
-            pos = json.loads(json.dumps(st.get('position')))
-            accounts.append({
-                'id': ai_id,
-                'market': 'US',
-                'name': st.get('name', ai_id),
-                'start_cash': int(to_float(st.get('start_cash', US_SEMI_START_CASH))),
-                'cash': round(to_float(st.get('cash', 0)), 4),
-                'asset': round(to_float(st.get('asset', 0)), 4),
-                'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
-                'realized_pl': round(to_float(st.get('realized_pl', 0)), 4),
-                'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6),
-                'trade_count': to_int(st.get('trade_count', 0)),
-                'closed_trade_count': len(st.get('trades', [])) if isinstance(st.get('trades', []), list) else 0,
-                'positions': {} if not pos else {str(pos.get('symbol', 'POSITION')): pos},
-                'position_count': 0 if not pos else 1,
-                'last_action': st.get('last_action', ''),
-                'paper_only': True,
-            })
-
-        for ai_id in US_SURGE_PAPER_IDS:
-            st = S['us_surge_paper'][ai_id]
-            pos = json.loads(json.dumps(st.get('position')))
-            accounts.append({
-                'id': ai_id,
-                'market': 'US',
-                'us_session': US_SURGE_SESSION_BY_ID.get(ai_id, ''),
-                'name': st.get('name', ai_id),
-                'start_cash': int(to_float(st.get('start_cash', US_SURGE_START_CASH))),
-                'cash': round(to_float(st.get('cash', 0)), 4),
-                'asset': round(to_float(st.get('asset', 0)), 4),
-                'profit_rate': round(to_float(st.get('profit_rate', 0)), 6),
-                'realized_pl': round(to_float(st.get('realized_pl', 0)), 4),
-                'mdd_pct': round(to_float(st.get('mdd_pct', 0)), 6),
-                'trade_count': to_int(st.get('trade_count', 0)),
-                'closed_trade_count': len(st.get('trades', [])) if isinstance(st.get('trades', []), list) else 0,
-                'positions': {} if not pos else {str(pos.get('symbol', 'POSITION')): pos},
-                'position_count': 0 if not pos else 1,
-                'last_action': st.get('last_action', ''),
-                'paper_only': True,
-            })
-
-    accounts.sort(key=lambda x: (to_float(x.get('profit_rate', 0)), to_float(x.get('asset', 0))), reverse=True)
-    for i, row in enumerate(accounts, 1):
-        row['rank'] = i
-
-    kr = [x for x in accounts if x['market'] == 'KR']
-    us = [x for x in accounts if x['market'] == 'US']
-
-    def _stats(rows):
-        rates = [to_float(x.get('profit_rate', 0)) for x in rows]
-        if not rates:
-            return {'count': 0, 'average_profit_rate': 0, 'best': None, 'worst': None,
-                    'positive': 0, 'negative': 0, 'zero': 0}
-        ranked = sorted(rows, key=lambda x: to_float(x.get('profit_rate', 0)), reverse=True)
-        return {
-            'count': len(rows),
-            'average_profit_rate': round(sum(rates) / len(rates), 6),
-            'best': {'id': ranked[0]['id'], 'profit_rate': ranked[0]['profit_rate']},
-            'worst': {'id': ranked[-1]['id'], 'profit_rate': ranked[-1]['profit_rate']},
-            'positive': sum(1 for r in rates if r > 0),
-            'negative': sum(1 for r in rates if r < 0),
-            'zero': sum(1 for r in rates if r == 0),
-        }
-
-    return {
-        'ok': True,
-        'version': OPERATING_VERSION,
-        'generated_at_kst': now_text(),
-        'paper_only': True,
-        'real_order_enabled': bool(ENABLE_REAL_ORDER or US_REAL_ORDER_ENABLED),
-        'account_count': len(accounts),
-        'kr': _stats(kr),
-        'us': _stats(us),
-        'overall': _stats(accounts),
-        'us_accounts': us,
-        'ranking': accounts,
-    }
 
 
 
@@ -10080,8 +6655,9 @@ async function refresh(){
         <div class="row"><span class="k">보유</span><span class="v">${posText(p)}</span></div>
         <div class="row"><span class="k">현금</span><span class="v">${fnum(r.cash,0)}원</span></div>
         <div class="row"><span class="k">총자산</span><span class="v">${fnum(r.asset,0)}원</span></div>
-        <div class="row"><span class="k">누적수익률</span><span class="v">${fnum(r.profit_rate,3)}%</span></div>
+        <div class="row"><span class="k">세전 누적수익률</span><span class="v">${fnum(r.profit_rate,3)}%</span></div>
         <div class="row"><span class="k">실현손익</span><span class="v">${fnum(r.realized_pl,0)}원</span></div>
+        <div class="row"><span class="k">세금</span><span class="v">자료 미완전 · 세후 미표시</span></div>
         <div class="row"><span class="k">MDD</span><span class="v">${fnum(r.mdd_pct,3)}%</span></div>
         <div class="row"><span class="k">거래수</span><span class="v">${fnum(r.closed_trade_count,0)}회 완료 / ${fnum(r.trade_count,0)}회 진입</span></div>
         <div class="row"><span class="k">최근동작</span><span class="v">${r.last_action||'-'}</span></div>
@@ -10167,8 +6743,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.download_file(p, os.path.basename(p), 'application/zip')
             except Exception as e:
                 return self.json_response({'ok': False, 'error': 'US_BACKUP_VERIFY_FAILED', 'detail': str(e)}, status=500)
-        if path == '/arcpro_status':
-            return self.json_response(arcpro_status_snapshot())
         if path == '/health':
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
@@ -10178,35 +6752,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        qs = parse_qs(parsed.query)
         return self.json_response({'ok': False, 'error': 'POST_DISABLED_CORE4_PAPER_ONLY'}, status=405)
-        if path != '/arcpro_webhook':
-            return self.json_response({'ok': False, 'error': 'POST_DISABLED_PAPER_ONLY'}, status=405)
-        # Secret is required in production. TradingView can place it in the webhook URL query.
-        supplied = str((qs.get('key') or [''])[0]).strip()
-        if not ARC_WEBHOOK_SECRET or supplied != ARC_WEBHOOK_SECRET:
-            return self.json_response({'ok': False, 'error': 'WEBHOOK_UNAUTHORIZED'}, status=401)
-        try:
-            length = int(self.headers.get('Content-Length', '0') or '0')
-        except Exception:
-            length = 0
-        if length <= 0 or length > ARC_WEBHOOK_MAX_BODY:
-            return self.json_response({'ok': False, 'error': 'INVALID_BODY_LENGTH'}, status=400)
-        try:
-            raw = self.rfile.read(length)
-            evt = parse_arcpro_webhook_body(raw)
-            evt['event_id'] = arcpro_event_id(evt)
-            record_arcpro_webhook(evt)
-            # TradingView에는 즉시 200을 반환하고, 가상체결은 별도 스레드에서 수행한다.
-            threading.Thread(target=process_arcpro_paper_event, args=(dict(evt),), daemon=True).start()
-            return self.json_response({'ok': True, 'paper_only': True, 'queued': True, 'event_id': evt['event_id'], 'received': evt}, status=200)
-        except ValueError as e:
-            return self.json_response({'ok': False, 'error': str(e)}, status=400)
-        except Exception as e:
-            set_error(f'Arc-pro webhook error: {e}')
-            return self.json_response({'ok': False, 'error': 'WEBHOOK_INTERNAL_ERROR'}, status=500)
 
     def download_file(self, path, filename, content_type='application/octet-stream'):
         if not os.path.isfile(path):
@@ -10330,7 +6876,6 @@ def print_core_selfcheck():
     print('version=', OPERATING_VERSION, flush=True)
     print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'ACTIVE PAPER=', len(CORE4_ACCOUNT_IDS), CORE4_ACCOUNT_IDS, flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
-    print('arcpro_paper=', True, 'start_cash=', ARC_PAPER_START_CASH, 'symbols=', sorted(ARC_ALERT_ALLOWED_SYMBOLS), flush=True)
     print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
     storage = storage_selfcheck()
     print('storage=', storage, flush=True)
@@ -10370,8 +6915,6 @@ def print_core_selfcheck():
         raise RuntimeError(f'CORE4 계좌 수 오류: {len(CORE4_ACCOUNT_IDS)}')
     if tuple(CORE4_ACCOUNT_IDS) != ('KR_SURGE','KR_SEMI','US_SOXL','US_SURGE'):
         raise RuntimeError(f'CORE4 계좌 구성 오류: {CORE4_ACCOUNT_IDS}')
-    if ENABLE_MULTI_PAPER_AI or ENABLE_PAPER_AUTO or US_SEMI_PAPER_ENABLED or US_SURGE_PAPER_ENABLED or GUIDE_PAPER_ENABLED:
-        raise RuntimeError('legacy PAPER 실행 플래그가 켜져 있습니다.')
 if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
