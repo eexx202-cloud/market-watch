@@ -1,4 +1,4 @@
-# OPERATING_V5_04_ARCPRO_FINAL_STABILIZED_PAPER_ONLY
+# OPERATING_V5_40_EXPERIMENT10_PAPER_RC1 — source V5.38, PAPER ONLY
 # V5.26: KR/US 수집 독립 워커·KR 당일 orderflow 검증·US 세션 경계/WS JSONL·Drive 완료판정 안정화. 전략 파라미터는 V5.24 그대로 유지.
 # V5.22: 한국 급등 V1 고정검증 + 실시간 호가 기반 동적 PAPER 체결/부분익절/수익보호/호가스냅샷. 실주문 OFF.
 # V5.21: V5.20 기반 - U03 SOXL -5% 장중20%/종가80% 분할스윙 + U04 시장레짐(BULL/PANIC/BEAR/CHOP) 적응형 PAPER.
@@ -29,9 +29,9 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_38_CORE4_PENDING_SESSION_FIX'
+OPERATING_VERSION = 'OPERATING_V5_40_EXPERIMENT10_PAPER_RC1'
 DATA_PAPER_BACKUP_ONLY = True
-RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'CORE4_PAPER', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
+RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'EXPERIMENT10_PAPER', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
@@ -488,7 +488,7 @@ US_METADATA_REFRESH_SEC = max(3600, int(os.environ.get('US_METADATA_REFRESH_SEC'
 US_BACKUP_DELAY_MIN = max(2, int(os.environ.get('US_BACKUP_DELAY_MIN', '5')))  # legacy compatibility; V5.17 US final backup uses extended-session close
 US_AFTER_HOURS_MINUTES = max(0, int(os.environ.get('US_AFTER_HOURS_MINUTES', '230')))  # Toss screen: regular close -> after-market close = 3h50m
 US_CYCLE_GAP_MINUTES = max(0, int(os.environ.get('US_CYCLE_GAP_MINUTES', '10')))  # after-market 08:50 -> next day-market 09:00 (DST example)
-TOSS_OPENAPI_SPEC_VERSION = 'LATEST_DOCS_2026-09-15'
+TOSS_OPENAPI_SPEC_VERSION = '1.2.24_REST_CHECKED_2026-10-11'
 TOSS_OPENAPI_SPEC_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/openapi.json'
 TOSS_OPENAPI_ASYNCAPI_URL = 'https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json'  # 공식 WebSocket source of truth
 TOSS_MARKET_DATA_TRANSPORT = 'REST_BASE_PLUS_OPTIONAL_WS_REPLAY'  # V5.25: 기존 REST 유지 + 후보종목 WS 원본녹화(가능 시), 실패 시 REST fallback.
@@ -1477,8 +1477,8 @@ def _atomic_json_write(path, data):
             except Exception:
                 pass
 
-def save_state():
-    """Persist only active CORE4 and infrastructure state."""
+def _save_state_original():
+    """Persist archived CORE4, immutable experiment snapshot, and infrastructure."""
     try:
         with LOCK:
             data = {
@@ -1488,6 +1488,7 @@ def save_state():
                 'us_surge_scan': S.get('us_surge_scan', {}),
                 'us_replay': S.get('us_replay', {}),
                 'core4_paper': S.get('core4_paper', {}),
+                'experiment10': S.get('experiment10_saved', {}),
             }
         if os.path.isfile(STATE_PATH):
             try:
@@ -1544,6 +1545,10 @@ def load_state():
             us_replay = data.get('us_replay')
             if isinstance(us_replay, dict):
                 S['us_replay'] = us_replay
+            experiment10 = data.get('experiment10')
+            if isinstance(experiment10, dict):
+                S['experiment10'] = experiment10
+                S['experiment10_saved'] = json.loads(json.dumps(experiment10))
             core4_paper = data.get('core4_paper')
             if isinstance(core4_paper, dict):
                 S['core4_paper'] = core4_paper
@@ -3965,7 +3970,7 @@ def _create_backup_zip_unlocked():
     tmp_path = os.path.join(os.path.dirname(path), f'.backup_KR_{today()}_{uuid.uuid4().hex}.tmp.zip')
     included_files = len(source_files)
     included_bytes = sum((os.path.getsize(fp) for _, fp in source_files))
-    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_symbols': ALL26_SYMBOLS, 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
+    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_symbols': ALL26_SYMBOLS, 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
     try:
         with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
             for arc, fp in source_files:
@@ -5145,6 +5150,7 @@ def _create_us_backup_zip_unlocked():
         'created_at_kst': now_text(), 'version': OPERATING_VERSION,
         'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'market': 'US',
         'session': 'REGULAR_GRADE1_PLUS_EXTENDED_SOXL_SOXS', 'trade_date': trade_date,
+        'experiment10_accounts': 10, 'experiment10_logs': True,
         'regular_start': str(S.setdefault('us_market_data_capture', {}).get('calendar', {}).get('regular_start', '')),
         'regular_end': str(S.setdefault('us_market_data_capture', {}).get('calendar', {}).get('regular_end', '')),
         'symbols': US_SYMBOLS, 'included_files': count, 'uncompressed_bytes': size,
@@ -6238,7 +6244,7 @@ def _core4_manage_us_surge():
         S['core4_paper'][aid]['watch']=dict(list(watch.items())[-80:])
         S['core4_paper'][aid]['signal']='WAIT'; S['core4_paper'][aid]['reason']='NO_VALID_PREMARKET_REBREAK'
 
-def run_core4_paper():
+def _archived_run_core4_paper():
     if not CORE4_ENABLED: return
     ensure_core4_states()
     # Persistent liquidation intent survives pending expiry/date rollover/restart.
@@ -6272,7 +6278,7 @@ def run_core4_paper():
         except Exception as e: set_error(f'{aid} asset 오류: {e}')
     save_state()
 
-def core4_summary_snapshot():
+def _archived_core4_summary_snapshot():
     ensure_core4_states()
     rows=[]
     for aid in CORE4_ACCOUNT_IDS:
@@ -6568,7 +6574,7 @@ def core4_dashboard_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CORE4 PAPER Dashboard</title>
+<title>EXPERIMENT10 PAPER Dashboard</title>
 <style>
 body{font-family:Arial,Helvetica,sans-serif;margin:18px;background:#111;color:#eee}
 h1{font-size:22px;margin:0 0 10px}
@@ -6588,7 +6594,7 @@ th:first-child,td:first-child{text-align:left}
 </style>
 </head>
 <body>
-<h1>CORE4 실시간 가상매매</h1>
+<h1>한국·미국 10전략 가상매매 실험</h1>
 <div class="small">3초 자동갱신 · PAPER ONLY · 실제 주문 없음</div>
 <div id="top" class="top"></div>
 <div id="cards" class="grid"></div>
@@ -6641,6 +6647,8 @@ async function refresh(){
         indicators=`종가 ${fnum(feat.prev_close,2)} / MA5 ${fnum(feat.ma5,2)} / RSI2 ${fnum(feat.rsi2,2)}`;
       }else{
         const parts=[];
+        if(feat.rsi2!=null) parts.push(`RSI2 ${fnum(feat.rsi2,2)}`);
+        if(feat.block_end!=null) parts.push(`60분봉 종가 ${fnum(feat.close,4)}`);
         if(feat.score!=null) parts.push(`score ${fnum(feat.score,1)}`);
         if(feat.r3!=null) parts.push(`r3 ${fnum(feat.r3,2)}%`);
         if(feat.r10!=null) parts.push(`r10 ${fnum(feat.r10,2)}%`);
@@ -6694,7 +6702,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/dashboard', '/paper_dashboard'):
             return self.html_response(core4_dashboard_html())
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 4, 'kr_paper_accounts': 2, 'us_paper_accounts': 2, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(ALL26_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 10, 'kr_paper_accounts': 5, 'us_paper_accounts': 5, 'experiment10': E10.summary(), 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -6874,7 +6882,8 @@ def acquire_single_instance_lock():
 def print_core_selfcheck():
     print('[CORE DATA/PAPER/BACKUP FROZEN]', flush=True)
     print('version=', OPERATING_VERSION, flush=True)
-    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'ACTIVE PAPER=', len(CORE4_ACCOUNT_IDS), CORE4_ACCOUNT_IDS, flush=True)
+    print('EXPERIMENT10 active=10, CORE4 archived, LIVE OFF', flush=True)
+    print('KR symbols=', len(ALL26_SYMBOLS), 'US symbols=', len(US_SYMBOLS), 'ACTIVE PAPER=', len(E10_IDS), E10_IDS, flush=True)
     print('paper_only=', PAPER_ONLY_MODE, 'real_order=', ENABLE_REAL_ORDER, 'real_auto_buy=', ENABLE_REAL_AUTO_BUY, 'real_auto_sell=', ENABLE_REAL_AUTO_SELL, 'us_real_order=', US_REAL_ORDER_ENABLED, flush=True)
     print('project_lab=', PROJECT_PAPER_LAB_ENABLED, 'monthly_target=', PROJECT_MONTHLY_TARGET_PCT, 'daily_soft_target=', PROJECT_DAILY_SOFT_TARGET_PCT, 'G_profiles=', PROJECT_G_EXIT_PROFILES, flush=True)
     storage = storage_selfcheck()
@@ -6915,6 +6924,20 @@ def print_core_selfcheck():
         raise RuntimeError(f'CORE4 계좌 수 오류: {len(CORE4_ACCOUNT_IDS)}')
     if tuple(CORE4_ACCOUNT_IDS) != ('KR_SURGE','KR_SEMI','US_SOXL','US_SURGE'):
         raise RuntimeError(f'CORE4 계좌 구성 오류: {CORE4_ACCOUNT_IDS}')
+
+# V5.40: independent forward experiment; existing CORE4 balances are archived in state.
+from e10_engine import Experiment10, IDS as E10_IDS, CONFIG as E10_CONFIG
+E10 = Experiment10(globals())
+_STATE_WRITE_LOCK = threading.RLock()
+def save_state():
+    with _STATE_WRITE_LOCK:
+        _save_state_original()
+def run_core4_paper():
+    if CORE4_ENABLED:
+        E10.start()
+def core4_summary_snapshot():
+    return E10.summary()
+
 if __name__ == '__main__':
     print_core_selfcheck()
     acquire_single_instance_lock()
