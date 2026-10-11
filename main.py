@@ -1,4 +1,4 @@
-# OPERATING_V5_40_EXPERIMENT10_PAPER_RC1 — source V5.38, PAPER ONLY
+# OPERATING_V5_41_EXPERIMENT10_PAPER_RC2 — source V5.38, PAPER ONLY
 # V5.26: KR/US 수집 독립 워커·KR 당일 orderflow 검증·US 세션 경계/WS JSONL·Drive 완료판정 안정화. 전략 파라미터는 V5.24 그대로 유지.
 # V5.22: 한국 급등 V1 고정검증 + 실시간 호가 기반 동적 PAPER 체결/부분익절/수익보호/호가스냅샷. 실주문 OFF.
 # V5.21: V5.20 기반 - U03 SOXL -5% 장중20%/종가80% 분할스윙 + U04 시장레짐(BULL/PANIC/BEAR/CHOP) 적응형 PAPER.
@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_40_EXPERIMENT10_PAPER_RC1'
+OPERATING_VERSION = 'OPERATING_V5_41_EXPERIMENT10_PAPER_RC2'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'EXPERIMENT10_PAPER', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
