@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_60_SYMBOL_1M_RECHECK'
+OPERATING_VERSION = 'OPERATING_V5_61_US_MINUTE_RECOVERY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -7300,6 +7300,59 @@ def create_minute_symbol_zip(market, sym, trade_date):
             os.remove(tmp)
     return target, count
 
+def recover_missing_us_minute_csv(sym, trade_date):
+    """Best-effort recovery using real Toss candles; never synthesize old bars.
+
+    The endpoint may only return the newest candles, so older trade dates can
+    remain unavailable. In that case the original missing-file error is kept.
+    """
+    if sym not in MINUTE_BACKUP_US:
+        return False
+    path = _minute_backup_csv('US', sym, trade_date)
+    if os.path.isfile(path) and os.path.getsize(path) > 100:
+        try:
+            if _valid_minute_rows(path, sym):
+                return True
+        except RuntimeError:
+            pass
+    code, response = api_get('/api/v1/candles', params={
+        'symbol': sym, 'interval': '1m', 'count': 200, 'adjusted': True,
+    }, timeout=10)
+    if code != 200:
+        return False
+    candles = _result_dict(response).get('candles', [])
+    if not isinstance(candles, list):
+        return False
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo('America/New_York')
+    headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol',
+               'timestamp', 'open', 'high', 'low', 'close', 'volume',
+               'estimated_trade_value', 'currency']
+    recovered = 0
+    for candle in candles:
+        if not isinstance(candle, dict):
+            continue
+        ts = str(candle.get('timestamp', ''))
+        try:
+            bar_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            if bar_dt.utcoffset() is None or bar_dt.astimezone(ny).date().isoformat() != trade_date:
+                continue
+            o, h, l, c = (float(candle[k]) for k in ('openPrice', 'highPrice', 'lowPrice', 'closePrice'))
+            if not (0 < l <= min(o, c) <= max(o, c) <= h):
+                continue
+        except (ValueError, TypeError, KeyError):
+            continue
+        write_row_unique(path, headers, {
+            'requested_at': now_kst().isoformat(), 'received_at': now_kst().isoformat(),
+            'saved_at': now_text(), 'latency_ms': 0, 'symbol': sym,
+            'timestamp': ts, 'open': o, 'high': h, 'low': l, 'close': c,
+            'volume': candle.get('volume', 0),
+            'estimated_trade_value': round(c * to_float(candle.get('volume', 0)), 4),
+            'currency': candle.get('currency', 'USD'),
+        }, ['symbol', 'timestamp'])
+        recovered += 1
+    return recovered > 0 and os.path.isfile(path)
+
 def maybe_backup_minutes_by_symbol():
     # Called by the existing main loop; only after market's collection window.
     now = now_kst()
@@ -7331,6 +7384,8 @@ def maybe_backup_minutes_by_symbol():
             continue
         MINUTE_BACKUP_LAST_ATTEMPT[key] = time.time()
         try:
+            if market == 'US' and not os.path.isfile(source_path):
+                recover_missing_us_minute_csv(sym, date)
             path, count = create_minute_symbol_zip(market, sym, date)
             if not google_drive_credentials_ready(True):
                 raise RuntimeError('Google Drive 토큰/설정 미완료')
