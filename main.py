@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_52_SIGNAL_SAFETY_FIX'
+OPERATING_VERSION = 'OPERATING_V5_60_SYMBOL_1M_RECHECK'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -468,6 +468,8 @@ WATCH = {'0193W0': '삼성전자 레버리지', '0193L0': '삼성전자 인버�
 ALL = {**MAIN, **MARKET, **WATCH}
 ALL26_SYMBOLS = list(ALL.keys())
 MARKET_DATA_CORE_SYMBOLS = ['494310']  # 상세 1분봉
+KR_BACKUP_REQUIRED_SYMBOLS = ('494310', '122630', '252670')  # 현재 활성 수집 대상
+KR_BACKUP_MINUTE_SYMBOLS = ('494310',)  # 390개 정규장 1분봉 필수
 ARCPRO_CAPTURE_SYMBOLS = []  # 급등주 전용 호가 수집 정지
 KR_PRICE_SYMBOLS = ['494310','122630','252670']
 MARKET_DATA_ORDERFLOW_SYMBOLS = ['494310']
@@ -3458,7 +3460,7 @@ def write_data_quality_audit_all26():
     """전략 실행 전 확인 가능한 26개 데이터 무결성 감사표."""
     headers = ['time', 'date', 'symbol', 'name', 'snapshot_rows', 'candle_rows', 'unique_prices', 'first_price', 'low', 'high', 'last_price', 'price_age_sec', 'orderbook_age_sec', 'trade_age_sec', 'status', 'reason']
     cap = S.setdefault('market_data_capture', {})
-    for sym in ALL26_SYMBOLS:
+    for sym in KR_BACKUP_REQUIRED_SYMBOLS:
         snap_path = symbol_path(sym)
         candle_path = candle_1m_path(sym)
         prices = []
@@ -3790,7 +3792,7 @@ def repair_kr_first_candle_during_open():
         return
     state['first_candle_repair_minute_key'] = minute_key
     failures = []
-    for sym in ALL26_SYMBOLS:
+    for sym in KR_BACKUP_MINUTE_SYMBOLS:
         existing = {_parse_iso(x.get('timestamp')) for x in _read_csv_rows(candle_1m_path(sym))}
         first_trade_candle = start + timedelta(minutes=1)
         if first_trade_candle in existing:
@@ -3888,7 +3890,7 @@ def repair_kr_required_files_before_backup():
         failures.append('MARKET_INDICATORS_MISSING')
     if not _read_csv_rows(investor_trading_path()):
         failures.append('INVESTOR_TRADING_MISSING')
-    for sym in ALL26_SYMBOLS:
+    for sym in KR_BACKUP_REQUIRED_SYMBOLS:
         if not _read_csv_rows(candle_daily_path(sym)):
             c, d = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1d', 'count': MARKET_DATA_DAILY_COUNT, 'adjusted': True}, timeout=12)
             _market_data_request_gap()
@@ -3916,7 +3918,7 @@ def repair_kr_required_files_before_backup():
             metadata = _read_csv_rows(stock_metadata_path(sym))
             if not metadata or not all((str(metadata[-1].get(k, '')) == '200' for k in ('stock_http', 'warning_http', 'limits_http'))):
                 failures.append(f'{sym}:METADATA_HTTP_{c1}_{c2}_{c3}')
-        if not _read_csv_rows(orderbook_path(sym)):
+        if sym in KR_BACKUP_MINUTE_SYMBOLS and not _read_csv_rows(orderbook_path(sym)):
             c, d = api_get('/api/v1/orderbook', params={'symbol': sym}, timeout=8)
             _market_data_request_gap()
             r = _result_dict(d)
@@ -3929,9 +3931,9 @@ def repair_kr_required_files_before_backup():
                 ba = to_float(asks[0].get('price', 0)) if asks else 0
                 bb = to_float(bids[0].get('price', 0)) if bids else 0
                 write_row_unique(orderbook_path(sym), ob_headers, {'saved_at': now_text(), 'symbol': sym, 'api_timestamp': ts, 'best_ask': ba, 'best_bid': bb, 'spread': ba - bb if ba and bb else 0, 'ask_total_volume': int(at), 'bid_total_volume': int(bt), 'bid_ask_ratio': round(bt / at, 4) if at else 0, 'asks_json': json.dumps(asks, ensure_ascii=False, separators=(',', ':')), 'bids_json': json.dumps(bids, ensure_ascii=False, separators=(',', ':'))}, ['symbol', 'api_timestamp'])
-            if not _read_csv_rows(orderbook_path(sym)):
+            if sym in KR_BACKUP_MINUTE_SYMBOLS and not _read_csv_rows(orderbook_path(sym)):
                 failures.append(f'{sym}:ORDERBOOK_HTTP_{c}')
-        if not _read_csv_rows(trades_path(sym)):
+        if sym in KR_BACKUP_MINUTE_SYMBOLS and not _read_csv_rows(trades_path(sym)):
             c, d = api_get('/api/v1/trades', params={'symbol': sym, 'count': 50}, timeout=8)
             _market_data_request_gap()
             trades = d.get('result', []) if isinstance(d, dict) else []
@@ -3940,7 +3942,7 @@ def repair_kr_required_files_before_backup():
                     if not isinstance(x, dict) or not x.get('timestamp'):
                         continue
                     write_row_unique(trades_path(sym), tr_headers, {'saved_at': now_text(), 'symbol': sym, 'timestamp': x.get('timestamp', ''), 'price': x.get('price', 0), 'volume': x.get('volume', 0), 'trade_value': round(to_float(x.get('price', 0)) * to_float(x.get('volume', 0)), 4), 'currency': x.get('currency', 'KRW')}, ['symbol', 'timestamp', 'price', 'volume'])
-            if not _read_csv_rows(trades_path(sym)):
+            if sym in KR_BACKUP_MINUTE_SYMBOLS and not _read_csv_rows(trades_path(sym)):
                 failures.append(f'{sym}:TRADES_HTTP_{c}')
     return failures
 
@@ -3954,7 +3956,8 @@ def audit_kr_grade1():
     if not start or not end:
         return {'grade': 'FAILED', 'failures': ['CALENDAR_INVALID'], 'details': {}}
     expected = int((end - start).total_seconds() // 60)
-    for sym in ALL26_SYMBOLS:
+    for sym in KR_BACKUP_REQUIRED_SYMBOLS:
+        require_minute = sym in KR_BACKUP_MINUTE_SYMBOLS
         rows = _read_csv_rows(candle_1m_path(sym))
         times = [_parse_iso(r.get('timestamp')) for r in rows]
         times = [x for x in times if x]
@@ -3964,13 +3967,13 @@ def audit_kr_grade1():
         bad_ohlcv = sum((1 for r in rows if any((str(r.get(k, '')) == '' for k in ('open', 'high', 'low', 'close', 'volume')))))
         bad_amount = sum((1 for r in rows if str(r.get('estimated_trade_value', '')) == ''))
         minute_ok = bool(len(rows) == expected and times and (times[0] == start + timedelta(minutes=1)) and (times[-1] == end) and (len(times) == len(set(times))) and (gaps == 0) and (reverse == 0) and (future == 0) and (bad_ohlcv == 0) and (bad_amount == 0))
-        if not minute_ok:
+        if require_minute and not minute_ok:
             failures.append(f'{sym}:MINUTE rows={len(rows)} gaps={gaps} duplicate={len(times) - len(set(times))} reverse={reverse} future={future} ohlcv_missing={bad_ohlcv} trade_value_missing={bad_amount}')
         orderbook_ok = bool(os.path.isfile(orderbook_path(sym)) and _read_csv_rows(orderbook_path(sym)))
-        if not orderbook_ok:
+        if require_minute and not orderbook_ok:
             failures.append(f'{sym}:ORDERBOOK')
         trades_ok = bool(os.path.isfile(trades_path(sym)) and _read_csv_rows(trades_path(sym)))
-        if not trades_ok:
+        if require_minute and not trades_ok:
             failures.append(f'{sym}:TRADES')
         snapshots = _read_csv_rows(price_snapshot_path(sym))
         snapshot_ok = bool(snapshots)
@@ -3988,8 +3991,8 @@ def audit_kr_grade1():
             failures.append(f'{sym}:METADATA')
         elif not metadata_ok:
             failures.append(f'{sym}:METADATA_HTTP')
-        ok = bool(minute_ok and orderbook_ok and trades_ok and snapshot_ok and daily_ok and metadata_ok)
-        details[sym] = {'rows': len(rows), 'first': times[0].isoformat() if times else '', 'last': times[-1].isoformat() if times else '', 'gaps': gaps, 'duplicate': len(times) - len(set(times)), 'reverse': reverse, 'future': future, 'ohlcv_missing': bad_ohlcv, 'trade_value_missing': bad_amount, 'minute_ok': minute_ok, 'orderbook_ok': orderbook_ok, 'trades_ok': trades_ok, 'snapshot_ok': snapshot_ok, 'daily_ok': daily_ok, 'metadata_ok': metadata_ok, 'ok': ok}
+        ok = bool((not require_minute or (minute_ok and orderbook_ok and trades_ok)) and snapshot_ok and daily_ok and metadata_ok)
+        details[sym] = {'rows': len(rows), 'first': times[0].isoformat() if times else '', 'last': times[-1].isoformat() if times else '', 'gaps': gaps, 'duplicate': len(times) - len(set(times)), 'reverse': reverse, 'future': future, 'ohlcv_missing': bad_ohlcv, 'trade_value_missing': bad_amount, 'minute_required': require_minute, 'minute_ok': minute_ok, 'orderbook_ok': orderbook_ok, 'trades_ok': trades_ok, 'snapshot_ok': snapshot_ok, 'daily_ok': daily_ok, 'metadata_ok': metadata_ok, 'ok': ok}
     raw_path = os.path.join(raw_market_dir('KR'), f'api_{today()}.jsonl')
     if not os.path.isfile(raw_path) or os.path.getsize(raw_path) == 0:
         failures.append('RAW_API_RESPONSES_MISSING')
@@ -4074,7 +4077,7 @@ def _create_backup_zip_unlocked():
     tmp_path = os.path.join(os.path.dirname(path), f'.backup_KR_{today()}_{uuid.uuid4().hex}.tmp.zip')
     included_files = len(source_files)
     included_bytes = sum((os.path.getsize(fp) for _, fp in source_files))
-    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': ALL26_SYMBOLS, 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
+    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_BACKUP_REQUIRED_SYMBOLS), 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
     try:
         with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
             for arc, fp in source_files:
@@ -4292,6 +4295,14 @@ def validate_backup_zip_for_drive(path):
         names = set(z.namelist())
         if 'backup_manifest.json' in names:
             return True
+        if 'minute_symbol_manifest.json' in names:
+            manifest = json.loads(z.read('minute_symbol_manifest.json').decode('utf-8'))
+            if not manifest.get('symbol') or int(manifest.get('rows', 0)) < 1:
+                raise RuntimeError('종목별 분봉 manifest 무효')
+            files = manifest.get('files', [])
+            if not files or any(f not in names for f in files):
+                raise RuntimeError('종목별 분봉 CSV 누락')
+            return True
         if 'raw_rescue_manifest.json' in names:
             try:
                 manifest = json.loads(z.read('raw_rescue_manifest.json').decode('utf-8-sig'))
@@ -4472,9 +4483,9 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
                 included_files = int(to_float(manifest.get('included_files', -1), -1))
                 if manifest_date != expected_date:
                     add_failure(f'MANIFEST_DATE_MISMATCH:{manifest_date}')
-                if manifest_count != len(ALL26_SYMBOLS):
+                if manifest_count != len(KR_BACKUP_REQUIRED_SYMBOLS):
                     add_failure(f'MANIFEST_SYMBOL_COUNT:{manifest_count}')
-                if set(manifest_symbols) != set(ALL26_SYMBOLS) or len(manifest_symbols) != len(ALL26_SYMBOLS):
+                if set(manifest_symbols) != set(KR_BACKUP_REQUIRED_SYMBOLS) or len(manifest_symbols) != len(KR_BACKUP_REQUIRED_SYMBOLS):
                     add_failure('MANIFEST_SYMBOL_LIST_MISMATCH')
                 if included_files != len(names) - 1:
                     add_failure(f'MANIFEST_INCLUDED_FILES_MISMATCH:{included_files}!={len(names) - 1}')
@@ -4496,10 +4507,11 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
             expected_times = [KST.localize(datetime.strptime(expected_date + ' 09:01', '%Y-%m-%d %H:%M')) + timedelta(minutes=i) for i in range(390)]
             expected_iso = [x.isoformat() for x in expected_times]
             passed_symbols = 0
-            for sym in ALL26_SYMBOLS:
-                candle_member = one_member(names, os.path.basename(candle_1m_path(sym)), f'{sym}:MINUTE')
-                orderbook_member = one_member(names, os.path.basename(orderbook_path(sym)), f'{sym}:ORDERBOOK')
-                trades_member = one_member(names, os.path.basename(trades_path(sym)), f'{sym}:TRADES')
+            for sym in KR_BACKUP_REQUIRED_SYMBOLS:
+                require_minute = sym in KR_BACKUP_MINUTE_SYMBOLS
+                candle_member = one_member(names, os.path.basename(candle_1m_path(sym)), f'{sym}:MINUTE') if require_minute else ''
+                orderbook_member = one_member(names, os.path.basename(orderbook_path(sym)), f'{sym}:ORDERBOOK') if require_minute else ''
+                trades_member = one_member(names, os.path.basename(trades_path(sym)), f'{sym}:TRADES') if require_minute else ''
                 snapshot_member = one_member(names, os.path.basename(price_snapshot_path(sym)), f'{sym}:SNAPSHOT')
                 daily_member = one_member(names, os.path.basename(candle_daily_path(sym)), f'{sym}:DAILY')
                 metadata_member = one_member(names, os.path.basename(stock_metadata_path(sym)), f'{sym}:METADATA')
@@ -4544,15 +4556,15 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
                 metadata_rows = _zip_read_csv(z, metadata_member)
                 metadata_http_ok = bool(metadata_rows) and all((str(metadata_rows[-1].get(k, '')) == '200' for k in ('stock_http', 'warning_http', 'limits_http')))
                 metadata_ok = metadata_http_ok and str(metadata_rows[-1].get('symbol', '')) == sym
-                sym_ok = minute_ok and orderbook_ok and trades_ok and snapshot_ok and daily_ok and metadata_ok
+                sym_ok = (not require_minute or (minute_ok and orderbook_ok and trades_ok)) and snapshot_ok and daily_ok and metadata_ok
                 if sym_ok:
                     passed_symbols += 1
                 else:
-                    if not minute_ok:
+                    if require_minute and not minute_ok:
                         add_failure(f'{sym}:MINUTE_INVALID rows={len(rows)} ts_invalid={ts_invalid} reverse={reverse} duplicate={duplicate} wrong_day={wrong_day} ohlcv={bad_ohlcv} symbol={bad_symbol} relation={bad_price_relation}')
-                    if not orderbook_ok:
+                    if require_minute and not orderbook_ok:
                         add_failure(f'{sym}:ORDERBOOK_MISSING rows={len(orderbook_rows)}')
-                    if not trades_ok:
+                    if require_minute and not trades_ok:
                         add_failure(f'{sym}:TRADES_INVALID rows={len(trade_rows)} invalid_ts={tr_invalid} reverse={tr_reverse} wrong_day={tr_wrong_day} bad={trade_bad}')
                     if not snapshot_ok:
                         add_failure(f'{sym}:SNAPSHOT_MISSING rows={len(snapshot_rows)}')
@@ -4560,7 +4572,7 @@ def inspect_downloaded_kr_backup_zip(path, expected_date=None):
                         add_failure(f'{sym}:DAILY_INVALID rows={len(daily_rows)} bad={daily_bad}')
                     if not metadata_ok:
                         add_failure(f'{sym}:METADATA_INVALID rows={len(metadata_rows)} http_ok={metadata_http_ok}')
-                details[sym] = {'ok': sym_ok, 'minute_rows': len(rows), 'first': actual_iso[0] if actual_iso else '', 'last': actual_iso[-1] if actual_iso else '', 'minute_invalid_timestamp': ts_invalid, 'minute_reverse': reverse, 'minute_duplicate': duplicate, 'minute_wrong_day': wrong_day, 'ohlcv_invalid': bad_ohlcv, 'symbol_mismatch': bad_symbol, 'ohlc_relation_invalid': bad_price_relation, 'orderbook_rows': len(orderbook_rows), 'orderbook_ok': orderbook_ok, 'trade_rows': len(trade_rows), 'trades_ok': trades_ok, 'snapshot_rows': len(snapshot_rows), 'snapshot_ok': snapshot_ok, 'daily_rows': len(daily_rows), 'daily_ok': daily_ok, 'metadata_http_ok': metadata_http_ok}
+                details[sym] = {'ok': sym_ok, 'minute_required': require_minute, 'minute_rows': len(rows), 'first': actual_iso[0] if actual_iso else '', 'last': actual_iso[-1] if actual_iso else '', 'minute_invalid_timestamp': ts_invalid, 'minute_reverse': reverse, 'minute_duplicate': duplicate, 'minute_wrong_day': wrong_day, 'ohlcv_invalid': bad_ohlcv, 'symbol_mismatch': bad_symbol, 'ohlc_relation_invalid': bad_price_relation, 'orderbook_rows': len(orderbook_rows), 'orderbook_ok': orderbook_ok, 'trade_rows': len(trade_rows), 'trades_ok': trades_ok, 'snapshot_rows': len(snapshot_rows), 'snapshot_ok': snapshot_ok, 'daily_rows': len(daily_rows), 'daily_ok': daily_ok, 'metadata_http_ok': metadata_http_ok}
             result['symbol_count'] = passed_symbols
             # V5.30: legacy PAPER 93개는 백업 필수 멤버가 아니다.
             # 시장 원본/manifest/CRC 검증만으로 GRADE_1을 판정한다.
@@ -4767,7 +4779,7 @@ def find_verified_existing_us_backup_on_drive(trade_date):
     return (None, None, checked)
 
 def _is_canonical_auto_backup_name(filename):
-    return bool(re.fullmatch(r'backup_(?:KR|US)(?:_RAW_RESCUE)?_\d{4}-\d{2}-\d{2}\.zip', str(filename or '')))
+    return bool(re.fullmatch(r'(?:backup_(?:KR|US)(?:_RAW_RESCUE)?_\d{4}-\d{2}-\d{2}|backup_1m_(?:KR_(?:494310|122630|252670)|US_(?:SOXL|SOXS))_\d{4}-\d{2}-\d{2})\.zip', str(filename or '')))
 
 
 def google_drive_resumable_upload(path):
@@ -5576,7 +5588,7 @@ def maybe_send_daily_backup():
             send_telegram(f'🇰🇷 한국시장 백업 생성/검증 실패\n날짜: {trade_date}\n오류: {err_text}\nGRADE 성공본은 교체하지 않음' + rescue_note + drive_rescue_note + '\n자동 재시도는 계속하지만 같은 거래일의 실패 알림은 더 이상 반복하지 않습니다.', force=True)
         return
     final_grade = S.setdefault('market_data_capture', {}).get('final_grade', 'FAILED')
-    caption = f'🇰🇷 한국시장 데이터 백업 {final_grade}\n날짜: {trade_date}\n시간: {now_short()}\n한국 동일조건 수집 종목: {len(ALL26_SYMBOLS)}개\n미국 데이터: 미포함\n다운로드 링크: {url}'
+    caption = f'🇰🇷 한국시장 데이터 백업 {final_grade}\n날짜: {trade_date}\n시간: {now_short()}\n한국 동일조건 수집 종목: {len(KR_BACKUP_REQUIRED_SYMBOLS)}개\n미국 데이터: 미포함\n다운로드 링크: {url}'
     with LOCK:
         current = completed_map.get(trade_date, {})
         if not isinstance(current, dict):
@@ -6492,6 +6504,7 @@ def loop():
                 set_error(f'PROJECT 저장공간 관리 오류: {e}')
             try:
                 maybe_send_us_backup()
+                maybe_backup_minutes_by_symbol()
             except Exception as e:
                 set_error(f'미국 백업 오류: {e}')
             ensure_token()
@@ -7023,7 +7036,7 @@ def print_core_selfcheck():
     if not GOOGLE_DRIVE_FINAL_IMMUTABLE:
         raise RuntimeError('검증 완료 FINAL 불변 잠금이 꺼져 있습니다.')
     if tuple(KR_PRICE_SYMBOLS) != tuple(MANUAL_CONFIG['collection']['KR_daily']):
-        raise RuntimeError(f'KR 종목 수 오류: {len(ALL26_SYMBOLS)}')
+        raise RuntimeError(f'KR 종목 수 오류: {len(KR_BACKUP_REQUIRED_SYMBOLS)}')
     if tuple(US_SYMBOLS) != tuple(MANUAL_CONFIG['collection']['US_1m']):
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
     if len(CORE4_ACCOUNT_IDS) != 4:
@@ -7144,7 +7157,7 @@ def load_manual_config(path):
         raise ValueError('검증되지 않은 매매 신호를 활성화할 수 없습니다.')
     if cfg.get('raw_archive') != 'PRESERVE_EXISTING':
         raise ValueError('원본 보존 설정이 필요합니다.')
-    expected = {'KR_1m': ['494310'], 'KR_daily': ['494310','122630','252670'],
+    expected = {'KR_1m': ['494310','122630','252670'], 'KR_daily': ['494310','122630','252670'],
                 'US_1m': ['SOXL','SOXS'], 'US_daily': ['SOXL','SOXS'],
                 'US_sessions': ['DAY','PREMARKET','REGULAR','AFTERMARKET']}
     col = cfg.get('collection')
@@ -7178,7 +7191,7 @@ def apply_manual_config(cfg):
 
 # Embedded validated settings for single-file deployment.
 def load_manual_config_embedded():
-    cfg = json.loads('{"order_execution": false, "simulation": false, "surge_scanner": false, "signal_status": "BLOCKED_UNTIL_PATTERN_MODEL_VALIDATED", "raw_archive": "PRESERVE_EXISTING", "collection": {"KR_1m": ["494310"], "KR_daily": ["494310", "122630", "252670"], "US_1m": ["SOXL", "SOXS"], "US_daily": ["SOXL", "SOXS"], "US_sessions": ["DAY", "PREMARKET", "REGULAR", "AFTERMARKET"]}, "alert_mode": "OBSERVATION_UNVALIDATED_WITH_EXPLICIT_LABEL"}')
+    cfg = json.loads('{"order_execution": false, "simulation": false, "surge_scanner": false, "signal_status": "BLOCKED_UNTIL_PATTERN_MODEL_VALIDATED", "raw_archive": "PRESERVE_EXISTING", "collection": {"KR_1m": ["494310", "122630", "252670"], "KR_daily": ["494310", "122630", "252670"], "US_1m": ["SOXL", "SOXS"], "US_daily": ["SOXL", "SOXS"], "US_sessions": ["DAY", "PREMARKET", "REGULAR", "AFTERMARKET"]}, "alert_mode": "OBSERVATION_UNVALIDATED_WITH_EXPLICIT_LABEL"}')
     return validate_manual_config_embedded(cfg)
 
 def validate_manual_config_embedded(cfg):
@@ -7189,6 +7202,147 @@ def validate_manual_config_embedded(cfg):
     if cfg.get("signal_status") != "BLOCKED_UNTIL_PATTERN_MODEL_VALIDATED" or cfg.get("raw_archive") != "PRESERVE_EXISTING":
         raise ValueError("Unexpected signal or archive config")
     return cfg
+
+# V5.58: independent per-symbol minute backups. Existing RAW/full ZIP unchanged.
+MINUTE_BACKUP_KR = ('494310', '122630', '252670')
+MINUTE_BACKUP_US = ('SOXL', 'SOXS')
+MINUTE_BACKUP_LAST_ATTEMPT = {}
+
+def _minute_backup_file(market, sym, trade_date):
+    root = os.path.join(BACKUP_ROOT, 'MINUTE_BY_SYMBOL', market, sym)
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, f'backup_1m_{market}_{sym}_{trade_date}.zip')
+
+def _minute_backup_csv(market, sym, trade_date):
+    if market == 'KR':
+        return os.path.join(LOG_ROOT, trade_date, 'market_data', f'candles_1m_{sym}_{trade_date}.csv')
+    return os.path.join(LOG_ROOT, 'US', trade_date, 'market_data', f'candles_1m_{sym}_{trade_date}.csv')
+
+def _valid_minute_rows(csv_path, sym):
+    if not os.path.isfile(csv_path):
+        raise RuntimeError('분봉 CSV가 없습니다: ' + csv_path)
+    with open(csv_path, newline='', encoding='utf-8-sig') as f:
+        records = list(csv.DictReader(f))
+    good = []
+    seen = set()
+    for r in records:
+        ts = str(r.get('timestamp', '')).strip()
+        if str(r.get('symbol', '')).upper() != sym or not ts:
+            continue
+        if ts in seen:
+            continue
+        try:
+            o,h,l,c = (float(r[k]) for k in ('open', 'high', 'low', 'close'))
+            if not (0 < l <= min(o,c) <= max(o,c) <= h):
+                continue
+        except (KeyError, ValueError, TypeError):
+            continue
+        seen.add(ts)
+        good.append(r)
+    if not good:
+        raise RuntimeError(f'{sym}: 유효한 1분봉이 0개여서 백업하지 않습니다.')
+    return len(good)
+
+def create_minute_symbol_zip(market, sym, trade_date):
+    market = str(market).upper()
+    allowed = MINUTE_BACKUP_KR if market == 'KR' else MINUTE_BACKUP_US if market == 'US' else ()
+    if sym not in allowed or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', trade_date):
+        raise ValueError('허용되지 않은 종목/거래일')
+    source = _minute_backup_csv(market, sym, trade_date)
+    count = _valid_minute_rows(source, sym)
+    target = _minute_backup_file(market, sym, trade_date)
+    # Rebuild when collected source has changed; never lock a partial early ZIP.
+    tmp = target + '.' + uuid.uuid4().hex + '.tmp'
+    filename = os.path.basename(source)
+    manifest = {'type': 'SYMBOL_1M', 'market': market, 'symbol': sym,
+                'trade_date': trade_date, 'rows': count, 'files': [filename],
+                'source': 'COLLECTED_CSV_NO_SYNTHETIC_BARS',
+                'note': 'US: raw timestamps preserve DAY/PREMARKET/REGULAR/AFTERMARKET; missing sessions are not fabricated.'}
+    try:
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            z.write(source, arcname=filename)
+            if market == 'US':
+                # Preserve collected raw rows; organize separate CSVs using timezone-aware ET.
+                from zoneinfo import ZoneInfo
+                with open(source, newline='', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    fields = reader.fieldnames or []
+                    buckets = {k: [] for k in ('DAY','PREMARKET','REGULAR','AFTERMARKET')}
+                    for row in reader:
+                        try:
+                            dt = datetime.fromisoformat(str(row.get('timestamp','')).replace('Z','+00:00'))
+                            if dt.utcoffset() is None:
+                                continue  # unknown timezone; original CSV is still retained
+                            local = dt.astimezone(ZoneInfo('America/New_York'))
+                            t = local.hour * 60 + local.minute
+                            session = ('PREMARKET' if 240 <= t < 570 else
+                                       'REGULAR' if 570 <= t < 960 else
+                                       'AFTERMARKET' if 960 <= t < 1200 else 'DAY')
+                            buckets[session].append(row)
+                        except (ValueError, TypeError):
+                            continue
+                for session, rows in buckets.items():
+                    if not rows:
+                        continue
+                    data = io.StringIO()
+                    writer = csv.DictWriter(data, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    part_name = f'{sym}_{trade_date}_{session}_1m.csv'
+                    z.writestr(part_name, data.getvalue())
+                    manifest['files'].append(part_name)
+                manifest['session_rows'] = {k: len(v) for k,v in buckets.items()}
+            z.writestr('minute_symbol_manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+        validate_backup_zip_for_drive(tmp)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return target, count
+
+def maybe_backup_minutes_by_symbol():
+    # Called by the existing main loop; only after market's collection window.
+    now = now_kst()
+    if not GOOGLE_DRIVE_UPLOAD_ENABLED:
+        return
+    kr_date = today()
+    jobs = []
+    if now.weekday() < 5 and (now.hour, now.minute) >= (15, 40):
+        day_open, _, _ = kr_backup_day_status(force=False)
+        if day_open:
+            jobs += [('KR', sym, kr_date) for sym in MINUTE_BACKUP_KR]
+    try:
+        ready, _, checked_date, *_ = us_backup_ready_status()
+        if ready and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(checked_date or '')):
+            jobs += [('US', sym, checked_date) for sym in MINUTE_BACKUP_US]
+    except Exception as exc:
+        set_error('1분봉 US 백업 시각검사 실패: ' + str(exc)[:200])
+    state = S.setdefault('minute_symbol_backup', {})
+    for market, sym, date in jobs:
+        key = market + ':' + sym + ':' + date
+        source_path = _minute_backup_csv(market, sym, date)
+        # A verified upload is current only while the source bytes remain unchanged.
+        source_hash = file_md5(source_path) if os.path.isfile(source_path) else ''
+        previous = state.get(key, {})
+        if (source_hash and previous.get('drive_verified')
+                and previous.get('source_md5') == source_hash):
+            continue
+        if time.time() - MINUTE_BACKUP_LAST_ATTEMPT.get(key, 0) < 1800:
+            continue
+        MINUTE_BACKUP_LAST_ATTEMPT[key] = time.time()
+        try:
+            path, count = create_minute_symbol_zip(market, sym, date)
+            if not google_drive_credentials_ready(True):
+                raise RuntimeError('Google Drive 토큰/설정 미완료')
+            meta = google_drive_resumable_upload(path)
+            state[key] = {'drive_verified': bool(meta.get('id')), 'rows': count,
+                          'file': os.path.basename(path), 'file_id': meta.get('id', ''),
+                          'source_md5': source_hash, 'uploaded_at': now_text()}
+            save_state()
+        except Exception as exc:
+            state[key] = {'drive_verified': False, 'error': str(exc)[:300], 'at': now_text()}
+            set_error('종목별 1분봉 백업 ' + key + ': ' + str(exc)[:240])
+            save_state()
 
 if __name__ == '__main__':
     MANUAL_CONFIG_PATH = os.environ.get('MANUAL_CONFIG_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'manual_config.json'))
