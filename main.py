@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_61_US_MINUTE_RECOVERY'
+OPERATING_VERSION = 'OPERATING_V5_62_US_MINUTE_DIAGNOSTICS'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -7319,10 +7319,10 @@ def recover_missing_us_minute_csv(sym, trade_date):
         'symbol': sym, 'interval': '1m', 'count': 200, 'adjusted': True,
     }, timeout=10)
     if code != 200:
-        return False
+        raise RuntimeError(f'Toss US 1분봉 재조회 실패: {sym} HTTP={code}; 날짜={trade_date}')
     candles = _result_dict(response).get('candles', [])
     if not isinstance(candles, list):
-        return False
+        raise RuntimeError(f'Toss US 1분봉 응답 형식 오류: {sym}; 날짜={trade_date}')
     from zoneinfo import ZoneInfo
     ny = ZoneInfo('America/New_York')
     headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol',
@@ -7351,7 +7351,14 @@ def recover_missing_us_minute_csv(sym, trade_date):
             'currency': candle.get('currency', 'USD'),
         }, ['symbol', 'timestamp'])
         recovered += 1
-    return recovered > 0 and os.path.isfile(path)
+    if recovered == 0:
+        dates = []
+        for c in candles:
+            if isinstance(c, dict) and c.get('timestamp'):
+                dates.append(str(c['timestamp'])[:10])
+        shown = sorted(set(dates))
+        raise RuntimeError(f'{sym} {trade_date} 1분봉 재조회 0개; API 반환 {len(candles)}개; 반환 UTC 날짜={shown[:6]}; 과거 분봉은 API 제공 범위 밖일 수 있음')
+    return os.path.isfile(path)
 
 def maybe_backup_minutes_by_symbol():
     # Called by the existing main loop; only after market's collection window.
@@ -7392,7 +7399,7 @@ def maybe_backup_minutes_by_symbol():
             meta = google_drive_resumable_upload(path)
             state[key] = {'drive_verified': bool(meta.get('id')), 'rows': count,
                           'file': os.path.basename(path), 'file_id': meta.get('id', ''),
-                          'source_md5': source_hash, 'uploaded_at': now_text()}
+                          'source_md5': file_md5(source_path), 'uploaded_at': now_text()}
             save_state()
         except Exception as exc:
             state[key] = {'drive_verified': False, 'error': str(exc)[:300], 'at': now_text()}
