@@ -16,6 +16,7 @@ import uuid
 import threading
 import zipfile
 import io
+import hmac
 import tempfile
 import shutil
 try:
@@ -29,12 +30,13 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_62_US_MINUTE_DIAGNOSTICS'
+OPERATING_VERSION = 'OPERATING_V5_64_ONDEMAND_INVESTOR_FLOW'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
+MANUAL_SNAPSHOT_TOKEN = os.environ.get('MANUAL_SNAPSHOT_TOKEN', '').strip()
 APP_URL = os.environ.get('APP_URL', 'https://market-watch-6zgo.onrender.com').rstrip('/')
 CLIENT_ID = os.environ.get('TOSS_CLIENT_ID', '').strip()
 CLIENT_SECRET = os.environ.get('TOSS_CLIENT_SECRET', '').strip()
@@ -434,7 +436,9 @@ PROJECT_G_EXIT_PROFILES = {
 ENABLE_TOSS_MARKET_DATA_CAPTURE = os.environ.get('ENABLE_TOSS_MARKET_DATA_CAPTURE', 'true').lower() == 'true'
 MARKET_DATA_CANDLE_SEC = int(os.environ.get('MARKET_DATA_CANDLE_SEC', '60'))
 MARKET_DATA_ORDERFLOW_SEC = int(os.environ.get('MARKET_DATA_ORDERFLOW_SEC', '30'))
-MARKET_DATA_INVESTOR_SEC = int(os.environ.get('MARKET_DATA_INVESTOR_SEC', '300'))
+MARKET_DATA_INVESTOR_SEC = max(60, int(os.environ.get('MARKET_DATA_INVESTOR_SEC', '300')))
+# 세 ETF 수급. 확장이 필요하면 KR_INVESTOR_SYMBOLS를 쉼표로 지정한다.
+KR_INVESTOR_SYMBOLS = tuple(dict.fromkeys(x.strip() for x in os.environ.get('KR_INVESTOR_SYMBOLS', '494310,122630,252670').split(',') if re.fullmatch(r'\d{6}', x.strip())))
 MARKET_DATA_CANDLE_COUNT = int(os.environ.get('MARKET_DATA_CANDLE_COUNT', '3'))
 MARKET_DATA_TRADE_COUNT = int(os.environ.get('MARKET_DATA_TRADE_COUNT', '20'))
 # 데이터 보존 경로. 운영 기본은 영구스토리지 강제다.
@@ -500,7 +504,7 @@ KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.en
 KR_TARGETED_BACKFILL_RETRIES = max(1, min(8, int(os.environ.get('KR_TARGETED_BACKFILL_RETRIES', '5'))))
 ENABLE_RAW_API_CAPTURE = os.environ.get('ENABLE_RAW_API_CAPTURE', 'true').lower() == 'true'  # FIX 2026-10-16: backup requires api_*.jsonl; preserve raw capture unless explicitly disabled
 RAW_API_MAX_BODY_CHARS = int(os.environ.get('RAW_API_MAX_BODY_CHARS', '2000000'))
-RATE_MIN_GAP_SEC = {'MARKET_DATA': max(0.2, float(os.environ.get('RATE_GAP_MARKET_DATA', '0.45'))), 'MARKET_DATA_CHART': max(0.25, float(os.environ.get('RATE_GAP_MARKET_DATA_CHART', '0.40'))), 'MARKET_INFO': max(0.34, float(os.environ.get('RATE_GAP_MARKET_INFO', '0.36'))), 'STOCK': max(0.2, float(os.environ.get('RATE_GAP_STOCK', '0.22'))), 'RANKING': max(0.2, float(os.environ.get('RATE_GAP_RANKING', '0.22'))), 'MARKET_INDICATOR_PRICE': max(0.1, float(os.environ.get('RATE_GAP_MARKET_INDICATOR_PRICE', '0.12'))), 'MARKET_INDICATOR': max(0.1, float(os.environ.get('RATE_GAP_MARKET_INDICATOR', '0.12'))), 'MARKET_INDICATOR_CHART': max(0.2, float(os.environ.get('RATE_GAP_MARKET_INDICATOR_CHART', '0.22'))), 'OTHER': max(0.2, float(os.environ.get('RATE_GAP_OTHER', '0.22')))}
+RATE_MIN_GAP_SEC = {'MARKET_DATA': max(0.2, float(os.environ.get('RATE_GAP_MARKET_DATA', '0.45'))), 'MARKET_DATA_CHART': max(0.25, float(os.environ.get('RATE_GAP_MARKET_DATA_CHART', '0.40'))), 'MARKET_INFO': max(0.34, float(os.environ.get('RATE_GAP_MARKET_INFO', '0.36'))), 'STOCK': max(0.2, float(os.environ.get('RATE_GAP_STOCK', '0.22'))), 'STOCK_TRADING_TREND': max(0.5, float(os.environ.get('RATE_GAP_STOCK_TRADING_TREND', '0.60'))), 'RANKING': max(0.2, float(os.environ.get('RATE_GAP_RANKING', '0.22'))), 'MARKET_INDICATOR_PRICE': max(0.1, float(os.environ.get('RATE_GAP_MARKET_INDICATOR_PRICE', '0.12'))), 'MARKET_INDICATOR': max(0.1, float(os.environ.get('RATE_GAP_MARKET_INDICATOR', '0.12'))), 'MARKET_INDICATOR_CHART': max(0.2, float(os.environ.get('RATE_GAP_MARKET_INDICATOR_CHART', '0.22'))), 'OTHER': max(0.2, float(os.environ.get('RATE_GAP_OTHER', '0.22')))}
 RATE_GROUP_BY_PATH = {'/api/v1/prices': 'MARKET_DATA', '/api/v1/orderbook': 'MARKET_DATA', '/api/v1/trades': 'MARKET_DATA', '/api/v1/price-limits': 'MARKET_DATA', '/api/v1/candles': 'MARKET_DATA_CHART', '/api/v1/stocks': 'STOCK', '/api/v1/rankings': 'RANKING', '/api/v1/market-calendar/KR': 'MARKET_INFO', '/api/v1/market-calendar/US': 'MARKET_INFO', '/api/v1/exchange-rate': 'MARKET_INFO', '/api/v1/market-indicators/prices': 'MARKET_INDICATOR_PRICE'}
 
 def _rate_group_for_path(path):
@@ -509,7 +513,7 @@ def _rate_group_for_path(path):
     if p in RATE_GROUP_BY_PATH:
         return RATE_GROUP_BY_PATH[p]
     if p.startswith('/api/v1/stocks/'):
-        return 'STOCK'
+        return 'STOCK_TRADING_TREND' if p.endswith('/investor-trading') else 'STOCK'
     if p.startswith('/api/v1/market-indicators/'):
         if p.endswith('/candles'):
             return 'MARKET_INDICATOR_CHART'
@@ -988,6 +992,12 @@ def market_indicator_path():
 
 def investor_trading_path():
     return os.path.join(market_data_dir(), f'investor_trading_{today()}.csv')
+
+def stock_investor_trading_path():
+    return os.path.join(market_data_dir(), f'stock_investor_trading_{today()}.csv')
+
+def investor_collection_status_path():
+    return os.path.join(market_data_dir(), f'investor_collection_status_{today()}.json')
 
 def candle_daily_path(sym):
     return os.path.join(market_data_dir(), f'candles_1d_{sym}.csv')
@@ -3494,39 +3504,119 @@ def write_data_quality_audit_all26():
         status = 'OK' if not reasons else '|'.join(reasons)
         write_row(data_quality_audit_path(), headers, {'time': now_text(), 'date': today(), 'symbol': sym, 'name': name_of(sym), 'snapshot_rows': snapshot_rows, 'candle_rows': candle_rows, 'unique_prices': len(set(prices)), 'first_price': prices[0] if prices else 0, 'low': min(prices) if prices else 0, 'high': max(prices) if prices else 0, 'last_price': prices[-1] if prices else 0, 'price_age_sec': round(price_age, 1), 'orderbook_age_sec': round(ob_age, 1), 'trade_age_sec': round(tr_age, 1), 'status': status, 'reason': ','.join(reasons)})
 
+def _non_null_int(value):
+    # Do NOT turn missing investor figures into 0: a 0 is a real measurement.
+    if value is None or str(value).strip() == '':
+        return ''
+    try:
+        return int(str(value).replace(',', ''))
+    except (ValueError, TypeError):
+        return ''
+
+
+def _flow_triplet(record, group, unit):
+    obj = record.get(group)
+    if not isinstance(obj, dict):
+        return ('', '', '')
+    prefix = 'Volume' if unit == 'shares' else 'Amount'
+    buy = _non_null_int(obj.get('buy' + prefix))
+    sell = _non_null_int(obj.get('sell' + prefix))
+    net = _non_null_int(obj.get('netBuy' + prefix))
+    if net == '' and buy != '' and sell != '':
+        net = buy - sell
+    return (buy, sell, net)
+
+
 def capture_market_investor_data():
+    """Append intraday source observations; preserve nulls and API update timestamps.
+
+    Whole-market flows are KRW amounts (KRX); stock flows are share volumes
+    (KRX+NXT).  These numbers are not interchangeable.
+    """
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
         return
+    queried_at = now_text()
+    status = {'saved_at': queried_at, 'status': 'ATTEMPTED', 'market': {}, 'stock': {},
+              'market_unit': 'KRW', 'stock_unit': 'shares',
+              'stock_symbols': list(KR_INVESTOR_SYMBOLS)}
     price_headers = ['saved_at', 'symbol', 'timestamp', 'last_price']
     code, data = api_get('/api/v1/market-indicators/prices', params={'symbols': 'KOSPI,KOSDAQ'}, timeout=8)
+    status['market_prices_http'] = code
     if code == 200:
         result = data.get('result', []) if isinstance(data, dict) else []
         for item in result if isinstance(result, list) else []:
-            if not isinstance(item, dict):
-                continue
-            write_row(market_indicator_path(), price_headers, {'saved_at': now_text(), 'symbol': item.get('symbol', ''), 'timestamp': item.get('timestamp', ''), 'last_price': item.get('lastPrice', 0)})
-    headers = ['saved_at', 'market', 'date', 'updated_at', 'individual_buy', 'individual_sell', 'individual_net', 'foreigner_buy', 'foreigner_sell', 'foreigner_net', 'institution_buy', 'institution_sell', 'institution_net', 'other_corp_buy', 'other_corp_sell', 'other_corp_net', 'institution_breakdown_json']
-    for market in ['KOSPI', 'KOSDAQ']:
-        code, data = api_get(f'/api/v1/market-indicators/{market}/investor-trading', params={'interval': '1d', 'count': 1}, timeout=10)
-        if code != 200:
+            if isinstance(item, dict):
+                write_row(market_indicator_path(), price_headers,
+                          {'saved_at': now_text(), 'symbol': item.get('symbol', ''),
+                           'timestamp': item.get('timestamp') or '',
+                           'last_price': item.get('lastPrice') if item.get('lastPrice') is not None else ''})
+    market_headers = ['saved_at', 'market', 'date', 'updated_at', 'individual_buy', 'individual_sell',
+                      'individual_net', 'foreigner_buy', 'foreigner_sell', 'foreigner_net',
+                      'institution_buy', 'institution_sell', 'institution_net', 'other_corp_buy',
+                      'other_corp_sell', 'other_corp_net', 'institution_breakdown_json']
+    for market in ('KOSPI', 'KOSDAQ'):
+        code, data = api_get(f'/api/v1/market-indicators/{market}/investor-trading',
+                             params={'interval': '1d', 'count': 1}, timeout=10)
+        recs = _result_dict(data).get('records', []) if code == 200 else []
+        r = recs[0] if recs and isinstance(recs[0], dict) else None
+        status['market'][market] = {'http_status': code, 'record_available': bool(r),
+                                    'updated_at': r.get('updatedAt', '') if r else '',
+                                    'record_date': r.get('date', '') if r else '',
+                                    'is_today': bool(r and r.get('date') == today())}
+        if not r:
             continue
-        result = _result_dict(data)
-        records = result.get('records', []) if isinstance(result, dict) else []
-        if not records or not isinstance(records[0], dict):
+        ib, ins, inet = _flow_triplet(r, 'individual', 'KRW')
+        fb, fs, fnet = _flow_triplet(r, 'foreigner', 'KRW')
+        ab, ass, anet = _flow_triplet(r, 'institution', 'KRW')
+        ob, osell, onet = _flow_triplet(r, 'otherCorporation', 'KRW')
+        breakdown = r.get('institution', {})
+        breakdown = breakdown.get('breakdown') if isinstance(breakdown, dict) else None
+        write_row(investor_trading_path(), market_headers,
+                  {'saved_at': now_text(), 'market': market, 'date': r.get('date', ''),
+                   'updated_at': r.get('updatedAt') or '', 'individual_buy': ib,
+                   'individual_sell': ins, 'individual_net': inet, 'foreigner_buy': fb,
+                   'foreigner_sell': fs, 'foreigner_net': fnet, 'institution_buy': ab,
+                   'institution_sell': ass, 'institution_net': anet, 'other_corp_buy': ob,
+                   'other_corp_sell': osell, 'other_corp_net': onet,
+                   'institution_breakdown_json': json.dumps(breakdown, ensure_ascii=False) if breakdown is not None else ''})
+    stock_headers = ['saved_at', 'symbol', 'date', 'updated_at',
+                     'individual_buy_volume', 'individual_sell_volume', 'individual_net_volume',
+                     'foreigner_buy_volume', 'foreigner_sell_volume', 'foreigner_net_volume',
+                     'institution_buy_volume', 'institution_sell_volume', 'institution_net_volume',
+                     'other_corp_buy_volume', 'other_corp_sell_volume', 'other_corp_net_volume',
+                     'institution_breakdown_json', 'unit', 'completeness']
+    for sym in KR_INVESTOR_SYMBOLS:
+        code, data = api_get(f'/api/v1/stocks/{sym}/investor-trading', params={'count': 1}, timeout=10)
+        recs = _result_dict(data).get('records', []) if code == 200 else []
+        r = recs[0] if recs and isinstance(recs[0], dict) else None
+        status['stock'][sym] = {'http_status': code, 'record_available': bool(r),
+                                'updated_at': r.get('updatedAt', '') if r else '',
+                                'record_date': r.get('date', '') if r else '',
+                                'is_today': bool(r and r.get('date') == today()),
+                                'individual_available': isinstance(r.get('individual'), dict) if r else False}
+        if not r:
             continue
-        r = records[0]
-
-        def amounts(key):
-            obj = r.get(key, {}) if isinstance(r.get(key, {}), dict) else {}
-            buy = to_int(obj.get('buyAmount', 0))
-            sell = to_int(obj.get('sellAmount', 0))
-            return (buy, sell, buy - sell)
-        ib, isell, inet = amounts('individual')
-        fb, fs, fnet = amounts('foreigner')
-        nb, ns, nnet = amounts('institution')
-        ob, osell, onet = amounts('otherCorporation')
-        inst = r.get('institution', {}) if isinstance(r.get('institution', {}), dict) else {}
-        write_row(investor_trading_path(), headers, {'saved_at': now_text(), 'market': market, 'date': r.get('date', ''), 'updated_at': r.get('updatedAt', ''), 'individual_buy': ib, 'individual_sell': isell, 'individual_net': inet, 'foreigner_buy': fb, 'foreigner_sell': fs, 'foreigner_net': fnet, 'institution_buy': nb, 'institution_sell': ns, 'institution_net': nnet, 'other_corp_buy': ob, 'other_corp_sell': osell, 'other_corp_net': onet, 'institution_breakdown_json': json.dumps(inst.get('breakdown', {}), ensure_ascii=False, separators=(',', ':'))})
+        ib, ins, inet = _flow_triplet(r, 'individual', 'shares')
+        fb, fs, fnet = _flow_triplet(r, 'foreigner', 'shares')
+        ab, ass, anet = _flow_triplet(r, 'institution', 'shares')
+        ob, osell, onet = _flow_triplet(r, 'otherCorporation', 'shares')
+        inst = r.get('institution')
+        breakdown = inst.get('breakdown') if isinstance(inst, dict) else None
+        write_row(stock_investor_trading_path(), stock_headers,
+                  {'saved_at': now_text(), 'symbol': sym, 'date': r.get('date', ''),
+                   'updated_at': r.get('updatedAt') or '', 'individual_buy_volume': ib,
+                   'individual_sell_volume': ins, 'individual_net_volume': inet,
+                   'foreigner_buy_volume': fb, 'foreigner_sell_volume': fs,
+                   'foreigner_net_volume': fnet, 'institution_buy_volume': ab,
+                   'institution_sell_volume': ass, 'institution_net_volume': anet,
+                   'other_corp_buy_volume': ob, 'other_corp_sell_volume': osell,
+                   'other_corp_net_volume': onet,
+                   'institution_breakdown_json': json.dumps(breakdown, ensure_ascii=False) if breakdown is not None else '',
+                   'unit': 'shares',
+                   'completeness': 'PARTIAL_INDIVIDUAL_UNAVAILABLE' if ib == '' else 'PERSONAL_VOLUME_AVAILABLE'})
+    # File lives under the same day folder; point-in-time snapshots automatically include it.
+    _atomic_json_write(investor_collection_status_path(), status)
+    return status
 
 def maybe_capture_toss_market_data():
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
@@ -4094,6 +4184,106 @@ def _create_backup_zip_unlocked():
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+# V5.63: 클릭 시점에 디스크에 이미 저장된 실제 원본만 임시 스냅샷 ZIP으로 제공.
+# 최종 장 마감 GRADE_1 백업 및 Google Drive 정식 백업을 절대 교체하지 않는다.
+def _on_demand_source_day(market, requested_date=''):
+    market = str(market).upper()
+    if market not in ('KR', 'US'):
+        raise ValueError('UNKNOWN_MARKET')
+    if requested_date and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', requested_date):
+        raise ValueError('DATE_MUST_BE_YYYY-MM-DD')
+    root = LOG_ROOT if market == 'KR' else os.path.join(LOG_ROOT, 'US')
+    if requested_date:
+        day = requested_date
+        base = os.path.join(root, day)
+        if not os.path.isdir(base):
+            raise FileNotFoundError(market + ':' + day + ':NO_SAVED_DATA')
+        return day, base
+    # Today first, then latest existing day. A holiday or pre-open request remains possible.
+    days = []
+    if os.path.isdir(root):
+        for item in os.scandir(root):
+            if item.is_dir(follow_symlinks=False) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', item.name):
+                days.append(item.name)
+    days.sort(reverse=True)
+    for day in days:
+        base = os.path.join(root, day)
+        candidates = _kr_backup_source_files(base) if market == 'KR' else _us_backup_source_files(base)
+        if any(os.path.getsize(fp) > 0 for _, fp in candidates if os.path.isfile(fp)):
+            return day, base
+    raise FileNotFoundError(market + ':NO_SAVED_DATA')
+
+
+def create_on_demand_snapshot(markets=('KR',), requested_date=''):
+    """No API calls, backfill, grading, Drive upload or canonical backup overwrites.
+    A fresh request creates a unique temporary ZIP that must be deleted after HTTP response.
+    """
+    if not markets or any(m not in ('KR','US') for m in markets):
+        raise ValueError('UNKNOWN_MARKET')
+    captured_at = now_kst()
+    bundles=[]
+    for market in markets:
+        day, base = _on_demand_source_day(market, requested_date)
+        sources = _kr_backup_source_files(base) if market == 'KR' else _us_backup_source_files(base)
+        sources=[(rel,fp) for rel,fp in sources if os.path.isfile(fp) and os.path.getsize(fp)>0]
+        if not sources:
+            raise FileNotFoundError(market+':'+day+':EMPTY_SAVED_DATA')
+        bundles.append((market, day, sources))
+    workdir = os.path.join(LOG_ROOT, '_temp_downloads')
+    os.makedirs(workdir, exist_ok=True)
+    # Temporary file: no accumulating ZIP backups or changes to official backups.
+    fd, tmppath = tempfile.mkstemp(prefix='snapshot_', suffix='.zip', dir=workdir)
+    os.close(fd)
+    manifest = {
+        'kind':'MANUAL_POINT_IN_TIME_SNAPSHOT',
+        'version':OPERATING_VERSION,
+        'requested_at_kst':captured_at.isoformat(),
+        'data_complete':False,
+        'grade':'UNVERIFIED_PARTIAL',
+        'description':'ZIP contains only data already collected at request time; missing/incomplete minute bars remain missing. Not a finalized close backup.',
+        'new_market_data_requested':False,
+        'official_close_backup_modified':False,
+        'markets':[],
+    }
+    try:
+        with zipfile.ZipFile(tmppath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=3,allowZip64=True) as z:
+            for market,day,sources in bundles:
+                included=[]
+                for rel,fp in sources:
+                    # protect against symlinks into credentials or secret files
+                    if os.path.islink(fp):
+                        continue
+                    try:
+                        with open(fp,'rb') as src, z.open(f'{market}/{day}/{rel}','w',force_zip64=True) as dst:
+                            shutil.copyfileobj(src,dst,length=1024*1024)
+                        included.append(rel)
+                    except FileNotFoundError:
+                        # A writer may rotate a file while this request is running.
+                        raise RuntimeError('SNAPSHOT_SOURCE_CHANGED_RETRY')
+                manifest_entry = {'market':market,'data_date':day,'included_files':len(included),'file_names':included}
+                if market == 'KR':
+                    wanted = [f'market_data/market_indicators_{day}.csv',
+                              f'market_data/investor_trading_{day}.csv',
+                              f'market_data/stock_investor_trading_{day}.csv',
+                              f'market_data/investor_collection_status_{day}.json']
+                    manifest_entry['required_market_data_files'] = {
+                        name: ('COLLECTED' if name in included else 'NOT_COLLECTED') for name in wanted}
+                    manifest_entry['investor_units'] = {'market': 'KRW', 'stock': 'shares'}
+                    manifest_entry['stock_investor_symbols'] = list(KR_INVESTOR_SYMBOLS)
+                manifest['markets'].append(manifest_entry)
+            z.writestr('snapshot_manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
+        with zipfile.ZipFile(tmppath,'r') as z:
+            bad=z.testzip()
+            if bad:
+                raise RuntimeError('SNAPSHOT_CRC_FAILED:'+bad)
+        label='BOTH' if len(markets)==2 else markets[0]
+        name=f'manual_snapshot_{label}_{captured_at.strftime("%Y%m%d_%H%M%S")}_KST.zip'
+        return tmppath,name,manifest
+    except Exception:
+        try: os.remove(tmppath)
+        except OSError: pass
+        raise
 
 def create_backup_zip(preserve_raw=True):
     """한국 백업 공통 진입점. 휴장일에는 ZIP/RAW_RESCUE를 만들지 않는다.
@@ -6819,7 +7009,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/dashboard', '/paper_dashboard'):
             return self.html_response(core4_dashboard_html())
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 0, 'kr_paper_accounts': 0, 'us_paper_accounts': 0, 'experiment10': {'active': False}, 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 0, 'kr_paper_accounts': 0, 'us_paper_accounts': 0, 'experiment10': {'active': False}, 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'intraday_stock_investor_symbols': list(KR_INVESTOR_SYMBOLS), 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -6844,6 +7034,37 @@ class Handler(BaseHTTPRequestHandler):
             return self.download_file(p, os.path.basename(p), 'application/zip')
         if path == '/archives':
             return self.json_response({'ok': True, 'archives': backup_archive_index()})
+        # 수시 다운로드: 오전 9:38을 포함, 어느 시점이든 이미 수집된 데이터만 전달.
+        # 기본 /download_snapshot 은 KR; US, BOTH 및 날짜 지정 가능.
+        if path == '/download_snapshot':
+            market = (qs.get('market') or ['kr'])[0].lower()
+            date_arg = (qs.get('date') or [''])[0]
+            if market not in ('kr','us','both'):
+                return self.json_response({'ok':False,'error':'MARKET_MUST_BE_KR_US_OR_BOTH'},status=400)
+            if date_arg and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_arg):
+                return self.json_response({'ok':False,'error':'DATE_MUST_BE_YYYY-MM-DD'},status=400)
+            if not MANUAL_SNAPSHOT_TOKEN:
+                return self.json_response({'ok':False,'error':'MANUAL_SNAPSHOT_TOKEN_NOT_CONFIGURED'},status=503)
+            user_key = (qs.get('key') or [''])[0]
+            auth = self.headers.get('Authorization', '')
+            if auth.startswith('Bearer '):
+                user_key = auth[len('Bearer '):].strip()
+            if not hmac.compare_digest(user_key, MANUAL_SNAPSHOT_TOKEN):
+                return self.json_response({'ok':False,'error':'SNAPSHOT_ACCESS_DENIED'},status=403)
+            markets = ('KR','US') if market == 'both' else (market.upper(),)
+            try:
+                tmp, filename, manifest = create_on_demand_snapshot(markets, date_arg)
+                try:
+                    self.send_header_cache_control_for_snapshot = True
+                    return self.download_file(tmp, filename, 'application/zip')
+                finally:
+                    self.send_header_cache_control_for_snapshot = False
+                    try: os.remove(tmp)
+                    except OSError: pass
+            except FileNotFoundError as e:
+                return self.json_response({'ok':False,'error':'SAVED_DATA_NOT_FOUND','detail':str(e)},status=404)
+            except Exception as e:
+                return self.json_response({'ok':False,'error':'SNAPSHOT_FAILED','detail':str(e)[:300]},status=500)
         if path == '/download_backup':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -6874,7 +7095,7 @@ class Handler(BaseHTTPRequestHandler):
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
         if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + Drive 백업 / 가격패턴 매수·매도 관찰 알림 연결(미검증) · <a href='/manual-status'>운영 상태</a></p><p>KR {len(KR_PRICE_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER 실행 OFF</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + Drive 백업 / 가격패턴 매수·매도 관찰 알림 연결(미검증) · <a href='/manual-status'>운영 상태</a></p><p>KR {len(KR_PRICE_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER 실행 OFF</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_snapshot?market=kr'>한국 수시 ZIP(인증 필요)</a> | <a href='/download_snapshot?market=us'>미국 수시 ZIP</a> | <a href='/download_snapshot?market=both'>한미 통합 수시 ZIP</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
         self.send_response(404)
         self.end_headers()
 
@@ -6889,6 +7110,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(os.path.getsize(path)))
+        if getattr(self, 'send_header_cache_control_for_snapshot', False):
+            self.send_header('Cache-Control', 'no-store, private')
+            self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Disposition', f"attachment; filename*=UTF-8''{quote(filename)}")
         self.end_headers()
         with open(path, 'rb') as f:
