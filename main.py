@@ -30,7 +30,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_67_KR_US_520099_ANYTIME'
+OPERATING_VERSION = 'OPERATING_V5_67_KR_US_520099_HOME_RESTORED'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -7188,6 +7188,38 @@ setInterval(refresh,3000);
 </html>"""
 
 
+def main_home_html():
+    """V5.67 restore: retain all original home links; download form lives at /downloads."""
+    version = html.escape(OPERATING_VERSION)
+    kr_count = len(KR_PRICE_SYMBOLS)
+    us_count = len(US_SYMBOLS)
+    real_orders = 'ON' if ENABLE_REAL_ORDER else 'OFF'
+    auto_buy = 'ON' if ENABLE_REAL_AUTO_BUY else 'OFF'
+    auto_sell = 'ON' if ENABLE_REAL_AUTO_SELL else 'OFF'
+    return f"""<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Market Watch 운영 홈</title>
+<style>
+body{{font:16px/1.5 system-ui,sans-serif;max-width:900px;margin:32px auto;padding:0 16px;color:#192434}}
+a{{color:#14539b}} .menu a{{display:inline-block;margin:0 13px 8px 0}}
+.notice{{background:#eef4fb;border:1px solid #d2dfeb;border-radius:9px;padding:13px;margin:18px 0}}
+.notice a{{font-weight:bold}} .subtitle{{color:#4e5b68}}
+</style></head><body>
+<h2>{version}</h2>
+<p>운영: KR/US 데이터 수집 + Drive 백업 / 가격패턴 매수·매도 관찰 알림 연결(미검증) · <a href='/manual-status'>운영 상태</a></p>
+<p>KR {kr_count}종목(+520099 옵션) / US {us_count}종목 / PAPER 실행 OFF</p>
+<p>실주문: {real_orders} / 자동매수: {auto_buy} / 자동매도: {auto_sell}</p>
+<div class='notice'><strong>한국·미국 24시간 수시 다운로드</strong>
+<p class='subtitle'>기존 화면과 정식 백업은 그대로 유지하며, 최신 수집 시도 후 임시 ZIP만 제공합니다.</p>
+<a href='/downloads'>한국·미국 ZIP 다운로드 화면 열기</a></div>
+<p class='menu'><a href='/dashboard'>기존 대시보드</a> | <a href='/paper_dashboard'>PAPER 대시보드</a> | <a href='/manual-status'>운영 상태</a></p>
+<p class='menu'><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> |
+<a href='/downloads'>한국 수시 ZIP(인증 필요)</a> | <a href='/downloads'>미국 수시 ZIP</a> |
+<a href='/downloads'>한미 통합 수시 ZIP</a> | <a href='/download_backup'>한국 ZIP</a> |
+<a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> |
+<a href='/google/oauth/start'>Drive 재승인</a></p>
+</body></html>"""
+
+
 def snapshot_download_html():
     configured = bool(MANUAL_SNAPSHOT_TOKEN)
     tip = ("인증 비밀번호는 Render 환경변수 MANUAL_SNAPSHOT_TOKEN과 일치해야 합니다."
@@ -7296,7 +7328,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/health':
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
-        if path in ('/', '/downloads'):
+        if path == '/':
+            return self.html_response(main_home_html())
+        if path == '/downloads':
             return self.html_response(snapshot_download_html())
         self.send_response(404)
         self.end_headers()
