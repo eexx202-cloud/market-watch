@@ -16,7 +16,6 @@ import uuid
 import threading
 import zipfile
 import io
-import hmac
 import tempfile
 import shutil
 try:
@@ -30,13 +29,12 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_67_KR_US_520099_HOME_RESTORED'
+OPERATING_VERSION = 'OPERATING_V5_67_KR_US_520099_ONE_CLICK_NO_KEY'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
-MANUAL_SNAPSHOT_TOKEN = os.environ.get('MANUAL_SNAPSHOT_TOKEN', '').strip()
 # V5.67: 장중 사용자 요청을 받은 경우에만 원본 수집을 한 번 더 시도한다.
 # API 제한과 서버 디스크 보호를 위해 재요청 간격 및 최대 원본 용량을 제한한다.
 SNAPSHOT_REFRESH_COOLDOWN_SEC = max(30, int(os.environ.get('SNAPSHOT_REFRESH_COOLDOWN_SEC', '60')))
@@ -7202,18 +7200,23 @@ def main_home_html():
 body{{font:16px/1.5 system-ui,sans-serif;max-width:900px;margin:32px auto;padding:0 16px;color:#192434}}
 a{{color:#14539b}} .menu a{{display:inline-block;margin:0 13px 8px 0}}
 .notice{{background:#eef4fb;border:1px solid #d2dfeb;border-radius:9px;padding:13px;margin:18px 0}}
-.notice a{{font-weight:bold}} .subtitle{{color:#4e5b68}}
+.notice a{{font-weight:bold}} .subtitle{{color:#4e5b68}} .quick-downloads{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}} .quick-downloads form{{margin:0}} .quick-downloads button{{background:#175296;color:#fff;border:0;border-radius:7px;padding:12px 15px;cursor:pointer;font:inherit}}
 </style></head><body>
 <h2>{version}</h2>
 <p>운영: KR/US 데이터 수집 + Drive 백업 / 가격패턴 매수·매도 관찰 알림 연결(미검증) · <a href='/manual-status'>운영 상태</a></p>
 <p>KR {kr_count}종목(+520099 옵션) / US {us_count}종목 / PAPER 실행 OFF</p>
 <p>실주문: {real_orders} / 자동매수: {auto_buy} / 자동매도: {auto_sell}</p>
-<div class='notice'><strong>한국·미국 24시간 수시 다운로드</strong>
-<p class='subtitle'>기존 화면과 정식 백업은 그대로 유지하며, 최신 수집 시도 후 임시 ZIP만 제공합니다.</p>
-<a href='/downloads'>한국·미국 ZIP 다운로드 화면 열기</a></div>
+<div class='notice'><strong>한국·미국 24시간 수시 다운로드 · 인증키 없음</strong>
+<p class='subtitle'>버튼을 누르면 최신 수집을 시도한 뒤 서버에 저장된 실제 데이터를 ZIP으로 내려받습니다. 기존 정식 백업은 변경하지 않습니다.</p>
+<div class='quick-downloads'>
+<form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='kr'><input type='hidden' name='refresh' value='1'><button type='submit'>한국 ZIP 바로받기</button></form>
+<form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='us'><input type='hidden' name='refresh' value='1'><button type='submit'>미국 ZIP 바로받기</button></form>
+<form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='both'><input type='hidden' name='refresh' value='1'><button type='submit'>한국+미국 ZIP 바로받기</button></form>
+</div>
+<a href='/downloads'>날짜 선택 등 상세 다운로드</a></div>
 <p class='menu'><a href='/dashboard'>기존 대시보드</a> | <a href='/paper_dashboard'>PAPER 대시보드</a> | <a href='/manual-status'>운영 상태</a></p>
 <p class='menu'><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> |
-<a href='/downloads'>한국 수시 ZIP(인증 필요)</a> | <a href='/downloads'>미국 수시 ZIP</a> |
+<a href='/downloads'>한국 수시 ZIP</a> | <a href='/downloads'>미국 수시 ZIP</a> |
 <a href='/downloads'>한미 통합 수시 ZIP</a> | <a href='/download_backup'>한국 ZIP</a> |
 <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> |
 <a href='/google/oauth/start'>Drive 재승인</a></p>
@@ -7221,35 +7224,37 @@ a{{color:#14539b}} .menu a{{display:inline-block;margin:0 13px 8px 0}}
 
 
 def snapshot_download_html():
-    configured = bool(MANUAL_SNAPSHOT_TOKEN)
-    tip = ("인증 비밀번호는 Render 환경변수 MANUAL_SNAPSHOT_TOKEN과 일치해야 합니다."
-           if configured else "서버에 MANUAL_SNAPSHOT_TOKEN 환경변수가 아직 설정되지 않았습니다.")
-    options = """<option value='kr'>한국 (KR)</option><option value='us'>미국 (US)</option><option value='both'>한국 + 미국 통합</option>"""
+    """No password or API key needed for snapshot downloads; market-data-only public endpoint."""
     return f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Market Watch 수시 다운로드</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:750px;margin:35px auto;padding:0 20px;color:#182330}}
-form{{border:1px solid #cfd8e3;border-radius:12px;padding:20px;background:#f9fbfe}}
+form{{margin:0}}.quick-downloads{{display:grid;gap:10px;margin:22px 0}}
+button{{background:#164e91;color:white;border:0;border-radius:8px;padding:15px;font:inherit;cursor:pointer;width:100%}}
+button:hover{{background:#0c3970}}
+details{{border:1px solid #cfd8e3;border-radius:12px;padding:18px;background:#f9fbfe}}
 label{{display:block;margin:14px 0 5px;font-weight:600}}
-input,select,button{{font:inherit;box-sizing:border-box;padding:10px;width:100%}}
-button{{background:#164e91;color:white;border:0;border-radius:8px;margin-top:16px;cursor:pointer}}
+input,select{{font:inherit;box-sizing:border-box;padding:10px;width:100%}}
 small{{color:#556273}}a{{color:#1352a3}}</style></head><body>
 <h2>{html.escape(OPERATING_VERSION)}</h2><h3>한국·미국 24시간 수시 다운로드</h3>
-<p>장중 최신 수집을 시도하고, 실제 서버에 저장된 파일을 임시 ZIP으로 내려받습니다.
-장 마감 정식 백업과 Google Drive 파일은 건드리지 않습니다.</p>
-<p>한국: 494310 · 122630 · 252670 · 520099(미래에셋 인버스 2X 반도체 ETN, 추가). 미국: SOXL · SOXS.</p>
-<p>접속·다운로드 요청은 24시간 가능하지만, 주말·휴장·장외에는 저장된 마지막 데이터를 제공하며, 서버 중지나 데이터 미저장 시 다운로드할 수 없습니다. 새 ETN의 Toss API 지원은 실서버에서 검증해야 합니다.</p>
+<p>별도 인증키 없이 아래 버튼을 누르면 ZIP 다운로드가 시작됩니다. 장중에는 최신 API 데이터 수집을 시도한 후 실제로 저장된 파일을 제공하며, 장외에는 마지막 저장 파일을 제공합니다.</p>
+<p>한국: 494310 · 122630 · 252670 · 520099(미래에셋 인버스 2X 반도체 ETN, 선택 수집). 미국: SOXL · SOXS.</p>
+<div class='quick-downloads'>
+<form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='kr'><input type='hidden' name='refresh' value='1'><button type='submit'>🇰🇷 한국 ZIP 바로 다운로드</button></form>
+<form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='us'><input type='hidden' name='refresh' value='1'><button type='submit'>🇺🇸 미국 ZIP 바로 다운로드</button></form>
+<form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='both'><input type='hidden' name='refresh' value='1'><button type='submit'>한국 + 미국 통합 ZIP 바로 다운로드</button></form>
+</div>
+<details><summary>날짜별 다운로드 / 수집 재요청 설정</summary>
 <form method='POST' action='/download_snapshot'>
-<label for='key'>다운로드 인증키</label><input id='key' name='key' type='password' required autocomplete='off'>
-<label for='market'>대상 시장</label><select id='market' name='market'>{options}</select>
+<label for='market'>대상 시장</label><select id='market' name='market'><option value='kr'>한국 (KR)</option><option value='us'>미국 (US)</option><option value='both'>한국 + 미국 통합</option></select>
 <label for='date'>거래일 (비우면 최신 저장일)</label><input id='date' name='date' type='text' placeholder='YYYY-MM-DD · 선택 사항' pattern='[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'>
 <label><input name='refresh' type='checkbox' value='1' checked style='width:auto'> 장중 최신 API 데이터 재요청</label>
-<small>장외·휴장일에는 마지막 저장 원본을 내려받습니다. 거래일을 지정하면 API 재요청 없이 해당 날짜를 사용합니다.</small>
-<button type='submit'>ZIP 다운로드</button></form>
-<p><small>{html.escape(tip)} API 자체가 지연되거나 제한되면 파일은 최신 체결시세를 보장하지 않습니다.</small></p>
-<p><a href='/selfcheck'>수집 상태 점검</a> · <a href='/archives'>정식 백업 목록</a></p>
+<p><small>거래일을 지정하면 해당 날짜의 저장 파일만 ZIP으로 묶습니다.</small></p>
+<button type='submit'>선택한 자료 ZIP 다운로드</button></form>
+</details>
+<p><small>수집이 아직 되지 않은 종목·시간대의 데이터는 포함되지 않습니다. 520099의 실제 Toss API 수집 성공 여부는 별도 확인이 필요합니다. 이 서버가 공개되어 있으면 다른 방문자도 다운로드할 수 있습니다.</small></p>
+<p><a href='/'>기존 운영 홈</a> · <a href='/selfcheck'>수집 상태 점검</a> · <a href='/archives'>정식 백업 목록</a></p>
 </body></html>"""
-
 
 class Handler(BaseHTTPRequestHandler):
 
@@ -7296,7 +7301,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.download_file(p, os.path.basename(p), 'application/zip')
         if path == '/archives':
             return self.json_response({'ok': True, 'archives': backup_archive_index()})
-        # GET은 기존 클라이언트의 Bearer 인증 호환용. 브라우저에서는 POST 폼 이용.
+        # GET URL로도 인증키 없이 다운로드 가능하며, 기본 UI는 POST 버튼 사용.
         if path == '/download_snapshot':
             return self.handle_snapshot_download(qs)
         if path == '/download_backup':
@@ -7336,7 +7341,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        # 주문/매매 POST는 계속 차단하고, 인증된 ZIP 다운로드 폼만 허용한다.
+        # 주문/매매 POST는 계속 차단하고, 데이터 ZIP 다운로드 폼만 허용한다.
         if urlparse(self.path).path != '/download_snapshot':
             return self.json_response({'ok': False, 'error': 'POST_DISABLED_CORE4_PAPER_ONLY'}, status=405)
         try:
@@ -7354,15 +7359,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.handle_snapshot_download(form)
 
     def handle_snapshot_download(self, qs):
-        if not MANUAL_SNAPSHOT_TOKEN:
-            return self.json_response({'ok': False, 'error': 'MANUAL_SNAPSHOT_TOKEN_NOT_CONFIGURED'}, status=503)
-        user_key = (qs.get('key') or [''])[0]
-        auth = self.headers.get('Authorization', '')
-        if auth.startswith('Bearer '):
-            user_key = auth[len('Bearer '):].strip()
-        if not hmac.compare_digest(str(user_key), MANUAL_SNAPSHOT_TOKEN):
-            return self.json_response({'ok': False, 'error': 'SNAPSHOT_ACCESS_DENIED'}, status=403)
-
+        # 공개 다운로드: 별도 인증키 입력이 필요하지 않습니다.
+        # 동시 작업 차단·API 재수집 쿨다운·ZIP 최대 크기 제한은 그대로 유지합니다.
         market = (qs.get('market') or ['kr'])[0].lower()
         date_arg = (qs.get('date') or [''])[0]
         if market not in ('kr', 'us', 'both'):
