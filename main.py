@@ -30,13 +30,18 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_64_ONDEMAND_INVESTOR_FLOW'
+OPERATING_VERSION = 'OPERATING_V5_67_KR_US_520099_ANYTIME'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
 BASE = os.environ.get('TOSS_BASE', 'https://openapi.tossinvest.com').rstrip('/')
 PORT = int(os.environ.get('PORT', '10000'))
 MANUAL_SNAPSHOT_TOKEN = os.environ.get('MANUAL_SNAPSHOT_TOKEN', '').strip()
+# V5.67: 장중 사용자 요청을 받은 경우에만 원본 수집을 한 번 더 시도한다.
+# API 제한과 서버 디스크 보호를 위해 재요청 간격 및 최대 원본 용량을 제한한다.
+SNAPSHOT_REFRESH_COOLDOWN_SEC = max(30, int(os.environ.get('SNAPSHOT_REFRESH_COOLDOWN_SEC', '60')))
+SNAPSHOT_REFRESH_LOCK_TIMEOUT_SEC = max(3, int(os.environ.get('SNAPSHOT_REFRESH_LOCK_TIMEOUT_SEC', '30')))
+SNAPSHOT_MAX_SOURCE_BYTES = max(50, int(os.environ.get('SNAPSHOT_MAX_SOURCE_MB', '1200'))) * 1024 * 1024
 APP_URL = os.environ.get('APP_URL', 'https://market-watch-6zgo.onrender.com').rstrip('/')
 CLIENT_ID = os.environ.get('TOSS_CLIENT_ID', '').strip()
 CLIENT_SECRET = os.environ.get('TOSS_CLIENT_SECRET', '').strip()
@@ -423,6 +428,11 @@ KR_DATA_THREAD = None
 US_DATA_THREAD = None
 KR_DATA_WORKER_HEARTBEAT_TS = 0.0
 US_DATA_WORKER_HEARTBEAT_TS = 0.0
+# HTTP 요청과 KR/US 정규 워커가 같은 파일/API 수집기를 동시에 실행하지 않도록 막는다.
+KR_CAPTURE_LOCK = threading.Lock()
+US_CAPTURE_LOCK = threading.Lock()
+SNAPSHOT_DOWNLOAD_LOCK = threading.Lock()
+SNAPSHOT_REFRESH_LAST = {'KR': 0.0, 'US': 0.0}
 
 # 같은 진입후보를 서로 다른 청산법으로 비교한다.
 PROJECT_G_EXIT_PROFILES = {
@@ -468,19 +478,22 @@ INSTANCE_LOCK_HANDLE = None
 
 MAIN = {'0193T0': '하이닉스 레버리지', '0197X0': '하이닉스 인버스', '000660': 'SK하이닉스'}
 MARKET = {'122630': 'KODEX 레버리지', '252670': 'KODEX 인버스2X', '069500': 'KODEX 200', '233740': '코스닥150 레버리지', '251340': '코스닥150 인버스', '229200': 'KODEX 코스닥150'}
-WATCH = {'0193W0': '삼성전자 레버리지', '0193L0': '삼성전자 인버스', '005930': '삼성전자', '494310': '반도체 레버리지', '488080': 'TIGER 반도체TOP10', '469150': 'AI반도체', '0100K0': '방산 레버리지', '0080Y0': '조선 레버리지', '462330': '2차전지 레버리지', '0177X0': '로봇 휴머노이드', '445290': '로봇액티브', '433500': '원자력', '487240': 'AI전력인프라', '418660': '나스닥100 레버리지', '465610': '미국빅테크TOP7', '225040': 'S&P500 레버리지', '0127R0': 'AI클라우드'}
+WATCH = {'0193W0': '삼성전자 레버리지', '0193L0': '삼성전자 인버스', '005930': '삼성전자', '494310': '반도체 레버리지', '488080': 'TIGER 반도체TOP10', '469150': 'AI반도체', '0100K0': '방산 레버리지', '0080Y0': '조선 레버리지', '462330': '2차전지 레버리지', '0177X0': '로봇 휴머노이드', '445290': '로봇액티브', '433500': '원자력', '487240': 'AI전력인프라', '418660': '나스닥100 레버리지', '465610': '미국빅테크TOP7', '225040': 'S&P500 레버리지', '0127R0': 'AI클라우드', '520099': '미래에셋 인버스 2X 반도체 ETN'}
 ALL = {**MAIN, **MARKET, **WATCH}
 ALL26_SYMBOLS = list(ALL.keys())
-MARKET_DATA_CORE_SYMBOLS = ['494310']  # 상세 1분봉
-KR_BACKUP_REQUIRED_SYMBOLS = ('494310', '122630', '252670')  # 현재 활성 수집 대상
-KR_BACKUP_MINUTE_SYMBOLS = ('494310',)  # 390개 정규장 1분봉 필수
+MARKET_DATA_CORE_SYMBOLS = ['494310','122630','252670']  # 기존 최종백업 필수 3종목
+KR_BACKUP_REQUIRED_SYMBOLS = ('494310', '122630', '252670')  # 기존 GRADE_1 필수 종목; ETN은 선택 수집으로 분리
+KR_BACKUP_MINUTE_SYMBOLS = ('494310',)  # 기존 390개 정규장 1분봉 필수 (ETN API 미지원 시 최종백업 차단 방지)
+KR_ETN_SYMBOL = '520099'  # KRX 단축코드 Q520099; API 심볼 형식은 실서버에서 확인 필요
+KR_OPTIONAL_MINUTE_SYMBOLS = ['520099']  # 수시 ZIP 원본에 포함; 별도 GRADE_1 요건 아님
+KR_ETN_API_SYMBOL_LAST_GOOD = ''  # Toss API 인증 후 정상 응답을 받은 표기를 기억
 ARCPRO_CAPTURE_SYMBOLS = []  # 급등주 전용 호가 수집 정지
-KR_PRICE_SYMBOLS = ['494310','122630','252670']
-MARKET_DATA_ORDERFLOW_SYMBOLS = ['494310']
+KR_PRICE_SYMBOLS = ['494310','122630','252670','520099']
+MARKET_DATA_ORDERFLOW_SYMBOLS = ['494310','122630','252670','520099']
 ARCPRO_ORDERFLOW_SEC = max(20, int(os.environ.get('ARCPRO_ORDERFLOW_SEC', '30')))
 CORE_ORDERFLOW_SEC = max(60, int(os.environ.get('CORE_ORDERFLOW_SEC', '180')))
-MARKET_DATA_DAILY_SYMBOLS = ['494310','122630','252670']
-MARKET_DATA_METADATA_SYMBOLS = ['494310','122630','252670']
+MARKET_DATA_DAILY_SYMBOLS = ['494310','122630','252670','520099']
+MARKET_DATA_METADATA_SYMBOLS = ['494310','122630','252670','520099']
 MARKET_DATA_DAILY_REFRESH_SEC = int(os.environ.get('MARKET_DATA_DAILY_REFRESH_SEC', '1800'))
 MARKET_DATA_METADATA_REFRESH_SEC = int(os.environ.get('MARKET_DATA_METADATA_REFRESH_SEC', '21600'))
 MARKET_DATA_AUDIT_SEC = int(os.environ.get('MARKET_DATA_AUDIT_SEC', '300'))
@@ -1831,7 +1844,9 @@ def first_list(data):
     return []
 
 def load_prices():
-    code, data = api_get('/api/v1/prices', params={'symbols': ','.join(KR_PRICE_SYMBOLS)}, timeout=15)
+    # The optional ETN is fetched separately; do not risk rejecting the legacy batch.
+    required_symbols = [x for x in KR_PRICE_SYMBOLS if x != KR_ETN_SYMBOL]
+    code, data = api_get('/api/v1/prices', params={'symbols': ','.join(required_symbols)}, timeout=15)
     if code != 200:
         set_status('현재가 오류')
         return False
@@ -2796,16 +2811,74 @@ def _market_data_request_gap():
     if MARKET_DATA_REQUEST_GAP_SEC > 0:
         time.sleep(MARKET_DATA_REQUEST_GAP_SEC)
 
+def _kr_etn_api_get(path, params=None, timeout=10):
+    """Best-effort Mirae Asset semiconductor inverse ETN market-data request.
+
+    KRX short-code: Q520099; issuer numeric code: 520099.
+    Toss symbol convention is not verified for this ETN. Try both representations
+    without making up bars or changing the three established KR data sources.
+    """
+    global KR_ETN_API_SYMBOL_LAST_GOOD
+    p = dict(params or {})
+    aliases = list(dict.fromkeys((KR_ETN_API_SYMBOL_LAST_GOOD, '520099', 'Q520099')))
+    aliases = [x for x in aliases if x]
+    first_response = None
+    for alias in aliases:
+        call_params = dict(p)
+        for k in ('symbol', 'symbols'):
+            if k in call_params:
+                call_params[k] = alias
+        call_path = path.replace('/520099/', '/' + alias + '/')
+        code, data = api_get(call_path, params=call_params or None, timeout=timeout)
+        if first_response is None:
+            first_response = (code, data)
+        # A 200 with no matching result or candles is not proof that an ETN was found.
+        valid = code == 200
+        res = data.get('result', None) if isinstance(data, dict) else None
+        if valid and path == '/api/v1/prices':
+            valid = isinstance(res, list) and any(
+                isinstance(item, dict) and str(item.get('symbol', '')).upper() in ('520099','Q520099')
+                and to_float(item.get('lastPrice', item.get('price', item.get('currentPrice', 0)))) > 0
+                for item in res)
+        elif valid and path == '/api/v1/candles':
+            valid = bool(_result_dict(data).get('candles', []))
+        elif valid and path == '/api/v1/trades':
+            valid = isinstance(res, list) and bool(res)
+        if valid:
+            KR_ETN_API_SYMBOL_LAST_GOOD = alias
+            if path == '/api/v1/prices' and isinstance(data, dict):
+                data = dict(data)
+                data['result'] = [dict(item, symbol='520099') if isinstance(item, dict)
+                                  and str(item.get('symbol', '')).upper() in ('520099','Q520099')
+                                  else item for item in res]
+            return code, data
+        # If this market-data endpoint returned 200 but no new executions,
+        # preserve that response rather than report a fake successful trade.
+    S.setdefault('market_data_capture', {})['optional_520099_last_error'] = (
+        'ETN_LOOKUP_FAILED_OR_EMPTY; tried 520099 / Q520099; real API support unverified')
+    return first_response if first_response is not None else (404, {})
+
+
 def capture_kr_prices_all26():
     """한 번의 /prices 요청으로 기존 26종목 + Arc-pro 5종목의 최신가격/타임스탬프를 함께 갱신한다."""
     requested = now_kst()
     started = time.time()
-    code, data = api_get('/api/v1/prices', params={'symbols': ','.join(KR_PRICE_SYMBOLS)}, timeout=10)
-    received = now_kst()
-    latency = round((time.time() - started) * 1000, 3)
+    # Existing ETFs are queried independently from the optional ETN: an unsupported
+    # ETN must not prevent their prices/mandatory backups from being collected.
+    required_symbols = [x for x in KR_PRICE_SYMBOLS if x != KR_ETN_SYMBOL]
+    code, data = api_get('/api/v1/prices', params={'symbols': ','.join(required_symbols)}, timeout=10)
     if code != 200:
         return (False, [f'PRICES_HTTP_{code}'])
     result = data.get('result', []) if isinstance(data, dict) else []
+    if not isinstance(result, list):
+        result = []
+    if KR_ETN_SYMBOL in KR_PRICE_SYMBOLS:
+        etn_code, etn_data = _kr_etn_api_get('/api/v1/prices', params={'symbols': KR_ETN_SYMBOL}, timeout=8)
+        etn_result = etn_data.get('result', []) if isinstance(etn_data, dict) else []
+        if etn_code == 200 and isinstance(etn_result, list):
+            result = list(result) + list(etn_result)
+    received = now_kst()
+    latency = round((time.time() - started) * 1000, 3)
     seen = set()
     headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'last_price', 'currency']
     with LOCK:
@@ -2813,6 +2886,8 @@ def capture_kr_prices_all26():
             if not isinstance(item, dict):
                 continue
             sym = str(item.get('symbol', ''))
+            if sym == 'Q520099':
+                sym = '520099'
             if sym not in KR_PRICE_SYMBOLS:
                 continue
             price = to_float(item.get('lastPrice', item.get('price', item.get('currentPrice', 0))))
@@ -2832,7 +2907,10 @@ def capture_kr_prices_all26():
             S.setdefault('low', {})[sym] = min(to_float(S.get('low', {}).get(sym, price)) or price, price)
             write_row(price_snapshot_path(sym), headers, {'requested_at': requested.isoformat(), 'received_at': received.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': ts, 'last_price': price, 'currency': item.get('currency', 'KRW')})
     missing = [s for s in KR_PRICE_SYMBOLS if s not in seen]
-    return (not missing, [f'{s}:PRICE_MISSING' for s in missing])
+    # Absence of optional new ETN is reported but cannot block existing GRADE_1 backup.
+    S.setdefault('market_data_capture', {})['optional_520099_price_collected'] = KR_ETN_SYMBOL in seen
+    required_missing = [x for x in missing if x != KR_ETN_SYMBOL]
+    return (not required_missing, [f'{s}:PRICE_MISSING' for s in missing])
 
 def capture_candles_1m():
     if not ENABLE_TOSS_MARKET_DATA_CAPTURE:
@@ -2852,8 +2930,9 @@ def capture_candles_1m():
             row = {'saved_at': now_text(), 'symbol': sym, 'timestamp': ts, 'open': c.get('openPrice', 0), 'high': c.get('highPrice', 0), 'low': c.get('lowPrice', 0), 'close': c.get('closePrice', 0), 'volume': c.get('volume', 0), 'estimated_trade_value': round(to_float(c.get('closePrice', 0)) * to_float(c.get('volume', 0)), 4), 'currency': c.get('currency', currency_default)}
             if write_row_unique(path, headers, row, ['symbol', 'timestamp']):
                 state.setdefault('last_candle_minute', {})[sym] = f'{sym}:{ts}'
-    for sym in MARKET_DATA_CORE_SYMBOLS:
-        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': max(1, min(200, MARKET_DATA_CANDLE_COUNT)), 'adjusted': True}, timeout=10)
+    for sym in list(dict.fromkeys(MARKET_DATA_CORE_SYMBOLS + KR_OPTIONAL_MINUTE_SYMBOLS)):
+        getter = _kr_etn_api_get if sym == KR_ETN_SYMBOL else api_get
+        code, data = getter('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': max(1, min(200, MARKET_DATA_CANDLE_COUNT)), 'adjusted': True}, timeout=10)
         if code == 200:
             result = _result_dict(data)
             save_candles(sym, result.get('candles', []), 'KRW')
@@ -2879,7 +2958,9 @@ def capture_orderbook_and_trades(symbols=None):
     state = S.setdefault('market_data_capture', {})
     cal = state.get('calendar', {})
     expected_date = str(cal.get('date', '') or today())
-    symbols = list(dict.fromkeys(symbols or MARKET_DATA_ORDERFLOW_SYMBOLS))
+    symbols = list(dict.fromkeys(MARKET_DATA_ORDERFLOW_SYMBOLS if symbols is None else symbols))
+    if not symbols:
+        return {'ok': True, 'reason': 'NO_SYMBOLS', 'symbols': 0}
     ob_headers = ['saved_at', 'symbol', 'api_timestamp', 'best_ask', 'best_bid', 'spread', 'ask_total_volume', 'bid_total_volume', 'bid_ask_ratio', 'asks_json', 'bids_json']
     tr_headers = ['saved_at', 'symbol', 'timestamp', 'price', 'volume', 'trade_value', 'currency']
     stats = {'ok': True, 'expected_date': expected_date, 'symbols': len(symbols),
@@ -2888,7 +2969,8 @@ def capture_orderbook_and_trades(symbols=None):
     state['orderflow_last_attempt_at'] = now_text()
 
     for sym in symbols:
-        code, data = api_get('/api/v1/orderbook', params={'symbol': sym}, timeout=8)
+        getter = _kr_etn_api_get if sym == KR_ETN_SYMBOL else api_get
+        code, data = getter('/api/v1/orderbook', params={'symbol': sym}, timeout=8)
         if code == 200:
             result = _result_dict(data)
             asks = result.get('asks', []) if isinstance(result.get('asks', []), list) else []
@@ -2921,7 +3003,7 @@ def capture_orderbook_and_trades(symbols=None):
         else:
             stats['http_errors'] += 1
 
-        code, data = api_get('/api/v1/trades',
+        code, data = getter('/api/v1/trades',
                              params={'symbol': sym, 'count': max(1, min(50, MARKET_DATA_TRADE_COUNT))},
                              timeout=8)
         if code != 200:
@@ -3300,7 +3382,7 @@ def _guide_fetch_completed_daily_closes(symbol, current_trade_date, count=80):
 
 
 
-def capture_us_market_data():
+def capture_us_market_data(force=False):
     """정규장=기존 US 전체, 정규장 밖 활성세션=SOXL/SOXS만 수집해 429 부담을 제한한다."""
     if not ENABLE_US_MARKET_DATA_CAPTURE:
         return
@@ -3317,7 +3399,7 @@ def capture_us_market_data():
     ob_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'api_timestamp', 'best_ask', 'best_bid', 'spread', 'ask_total_volume', 'bid_total_volume', 'asks_json', 'bids_json']
     tr_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'price', 'volume', 'trade_value', 'currency']
     price_sec = US_ORDERFLOW_SEC if session == 'REGULAR' else US_SEMI_EXTENDED_ORDERFLOW_SEC
-    if now_ts - to_float(state.get('last_price_ts', 0)) >= price_sec:
+    if force or now_ts - to_float(state.get('last_price_ts', 0)) >= price_sec:
         req = now_kst()
         t0 = time.time()
         code, data = api_get('/api/v1/prices', params={'symbols': ','.join(active_us_symbols)}, timeout=10)
@@ -3335,7 +3417,7 @@ def capture_us_market_data():
                 write_row(us_data_path('prices', sym), headers, {'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': item.get('timestamp', ''), 'last_price': item.get('lastPrice', 0), 'currency': item.get('currency', 'USD')})
         state['last_price_ts'] = now_ts
     candle_sec = US_CANDLE_SEC if session == 'REGULAR' else US_SEMI_EXTENDED_CANDLE_SEC
-    if now_ts - to_float(state.get('last_candle_ts', 0)) >= candle_sec:
+    if force or now_ts - to_float(state.get('last_candle_ts', 0)) >= candle_sec:
         for sym in active_us_symbols:
             req = now_kst()
             t0 = time.time()
@@ -3357,7 +3439,7 @@ def capture_us_market_data():
             _market_data_request_gap()
         state['last_candle_ts'] = now_ts
     orderflow_sec = US_ORDERFLOW_SEC if session == 'REGULAR' else US_SEMI_EXTENDED_ORDERFLOW_SEC
-    if now_ts - to_float(state.get('last_orderflow_ts', 0)) >= orderflow_sec:
+    if force or now_ts - to_float(state.get('last_orderflow_ts', 0)) >= orderflow_sec:
         for sym in active_us_symbols:
             req = now_kst()
             t0 = time.time()
@@ -3397,7 +3479,7 @@ def capture_us_market_data():
                     write_row_unique(us_data_path('trades', sym), tr_headers, {'requested_at': req.isoformat(), 'received_at': rec.isoformat(), 'saved_at': now_text(), 'latency_ms': latency, 'symbol': sym, 'timestamp': ts, 'price': t.get('price', 0), 'volume': t.get('volume', 0), 'trade_value': round(price * volume, 4), 'currency': t.get('currency', 'USD')}, ['symbol', 'timestamp', 'price', 'volume'])
             _market_data_request_gap()
         state['last_orderflow_ts'] = now_ts
-    if now_ts - to_float(state.get('last_metadata_ts', 0)) >= US_METADATA_REFRESH_SEC:
+    if not force and now_ts - to_float(state.get('last_metadata_ts', 0)) >= US_METADATA_REFRESH_SEC:
         daily_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'currency']
         meta_headers = ['requested_at', 'received_at', 'saved_at', 'latency_ms', 'symbol', 'stock_http', 'warning_http', 'limits_http', 'stock_json', 'warning_json', 'limits_json']
         for sym in active_us_symbols:
@@ -3432,7 +3514,8 @@ def capture_daily_candles_all26():
     """26개 전 종목 일봉을 같은 형식으로 저장한다."""
     headers = ['saved_at', 'symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'estimated_trade_value', 'currency']
     for sym in MARKET_DATA_DAILY_SYMBOLS:
-        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1d', 'count': MARKET_DATA_DAILY_COUNT, 'adjusted': True}, timeout=12)
+        getter = _kr_etn_api_get if sym == KR_ETN_SYMBOL else api_get
+        code, data = getter('/api/v1/candles', params={'symbol': sym, 'interval': '1d', 'count': MARKET_DATA_DAILY_COUNT, 'adjusted': True}, timeout=12)
         _market_data_request_gap()
         if code != 200:
             continue
@@ -3458,11 +3541,12 @@ def capture_stock_metadata_all26():
     """종목정보·경고·상하한가를 26개 모두 동일하게 수집한다."""
     headers = ['saved_at', 'symbol', 'name', 'stock_http', 'warning_http', 'limits_http', 'stock_json', 'warning_json', 'limits_json']
     for sym in MARKET_DATA_METADATA_SYMBOLS:
-        c1, d1 = api_get('/api/v1/stocks', params={'symbols': sym}, timeout=8)
+        getter = _kr_etn_api_get if sym == KR_ETN_SYMBOL else api_get
+        c1, d1 = getter('/api/v1/stocks', params={'symbols': sym}, timeout=8)
         _market_data_request_gap()
-        c2, d2 = api_get(f'/api/v1/stocks/{sym}/warnings', timeout=8)
+        c2, d2 = getter(f'/api/v1/stocks/{sym}/warnings', timeout=8)
         _market_data_request_gap()
-        c3, d3 = api_get('/api/v1/price-limits', params={'symbol': sym}, timeout=8)
+        c3, d3 = getter('/api/v1/price-limits', params={'symbol': sym}, timeout=8)
         _market_data_request_gap()
         write_row(stock_metadata_path(sym), headers, {'saved_at': now_text(), 'symbol': sym, 'name': name_of(sym), 'stock_http': c1, 'warning_http': c2, 'limits_http': c3, 'stock_json': json.dumps(d1, ensure_ascii=False, separators=(',', ':'))[:10000], 'warning_json': json.dumps(d2, ensure_ascii=False, separators=(',', ':'))[:10000], 'limits_json': json.dumps(d3, ensure_ascii=False, separators=(',', ':'))[:10000]})
 
@@ -3662,8 +3746,9 @@ def kr_market_data_worker():
         try:
             KR_DATA_WORKER_HEARTBEAT_TS = time.time()
             if not is_weekend_kst():
-                refresh_kr_market_calendar(False)
-                maybe_capture_toss_market_data()
+                with KR_CAPTURE_LOCK:
+                    refresh_kr_market_calendar(False)
+                    maybe_capture_toss_market_data()
                 run_live_candidate_alert('KR')
                 state = S.setdefault('market_data_capture', {})
                 state['worker_alive'] = True
@@ -3734,8 +3819,9 @@ def us_market_data_worker():
     while True:
         try:
             US_DATA_WORKER_HEARTBEAT_TS = time.time()
-            refresh_us_market_calendar(False)
-            capture_us_market_data()
+            with US_CAPTURE_LOCK:
+                refresh_us_market_calendar(False)
+                capture_us_market_data()
             run_live_candidate_alert('US')
             # _us_replay_dynamic_capture() retired: surge replay
             try:
@@ -3906,7 +3992,8 @@ def finalize_kr_candles_grade1():
         return (False, ['KR_CALENDAR_INVALID'])
     headers = ['saved_at', 'symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'estimated_trade_value', 'currency']
     failures = []
-    for sym in MARKET_DATA_CORE_SYMBOLS:
+    # Only original required symbols: optional 520099 may not be exposed by Toss.
+    for sym in KR_BACKUP_REQUIRED_SYMBOLS:
         collected = {}
         for row in _read_csv_rows(candle_1m_path(sym)):
             ts = str(row.get('timestamp', ''))
@@ -4167,7 +4254,7 @@ def _create_backup_zip_unlocked():
     tmp_path = os.path.join(os.path.dirname(path), f'.backup_KR_{today()}_{uuid.uuid4().hex}.tmp.zip')
     included_files = len(source_files)
     included_bytes = sum((os.path.getsize(fp) for _, fp in source_files))
-    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_BACKUP_REQUIRED_SYMBOLS), 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
+    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_PRICE_SYMBOLS), 'kr_optional_520099': {'symbol': KR_ETN_SYMBOL, 'api_symbol_last_good': KR_ETN_API_SYMBOL_LAST_GOOD, 'price_collected': S.get('market_data_capture', {}).get('optional_520099_price_collected', False)}, 'kr_symbols': list(KR_BACKUP_REQUIRED_SYMBOLS), 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
     try:
         with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
             for arc, fp in source_files:
@@ -4184,6 +4271,103 @@ def _create_backup_zip_unlocked():
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+# V5.67: 수시 다운로드 전 선택적으로 최신 API 데이터를 재요청한다.
+# 정규 워커와 동일한 수집/파일 기록함수를 재사용하며, 주문 API는 절대 호출하지 않는다.
+def refresh_snapshot_market(market):
+    market = str(market).upper()
+    if market not in ('KR', 'US'):
+        raise ValueError('UNKNOWN_MARKET')
+    result = {'market': market, 'requested_at_kst': now_kst().isoformat(),
+              'status': 'NOT_ATTEMPTED', 'api_refresh_attempted': False,
+              'data_current_guaranteed': False}
+    enabled = ENABLE_TOSS_MARKET_DATA_CAPTURE if market == 'KR' else ENABLE_US_MARKET_DATA_CAPTURE
+    if not enabled:
+        result['status'] = 'COLLECTOR_DISABLED'
+        return result
+    lock = KR_CAPTURE_LOCK if market == 'KR' else US_CAPTURE_LOCK
+    if not lock.acquire(timeout=SNAPSHOT_REFRESH_LOCK_TIMEOUT_SEC):
+        result['status'] = 'COLLECTOR_BUSY_SAVED_DATA_ONLY'
+        return result
+    try:
+        now_epoch = time.time()
+        elapsed = now_epoch - SNAPSHOT_REFRESH_LAST[market]
+        if elapsed < SNAPSHOT_REFRESH_COOLDOWN_SEC:
+            result['status'] = 'REFRESH_COOLDOWN_SAVED_DATA_ONLY'
+            result['retry_after_sec'] = round(SNAPSHOT_REFRESH_COOLDOWN_SEC - elapsed, 1)
+            return result
+        if market == 'KR':
+            if not refresh_kr_market_calendar(False):
+                result['status'] = 'KR_CALENDAR_UNAVAILABLE_SAVED_DATA_ONLY'
+                return result
+            is_open, reason = regular_market_open_now()
+            result['market_session'] = 'REGULAR' if is_open else str(reason)
+            if not is_open:
+                result['status'] = 'MARKET_CLOSED_SAVED_DATA_ONLY'
+                return result
+        else:
+            if not refresh_us_market_calendar(False):
+                result['status'] = 'US_CALENDAR_UNAVAILABLE_SAVED_DATA_ONLY'
+                return result
+            session = us_market_session_status()[0]
+            result['market_session'] = session
+            if session == 'CLOSED':
+                result['status'] = 'MARKET_CLOSED_SAVED_DATA_ONLY'
+                return result
+        SNAPSHOT_REFRESH_LAST[market] = now_epoch
+        result['api_refresh_attempted'] = True
+        if market == 'KR':
+            ok, missing = capture_kr_prices_all26()
+            result['price_response_ok'] = bool(ok)
+            result['missing_prices'] = list(missing)[:12]
+            capture_candles_1m()
+            # 호가/체결 자료는 현재 지정된 수집 종목만 대상으로 한다.
+            orderflow = capture_orderbook_and_trades(MARKET_DATA_ORDERFLOW_SYMBOLS)
+            result['orderflow'] = {k: orderflow.get(k) for k in
+                                   ('ok', 'reason', 'api_success', 'orderbook_saved', 'trades_saved')
+                                   if k in orderflow} if isinstance(orderflow, dict) else {}
+        else:
+            # 가격, 1분봉, 호가, 체결만 즉시 재수집; 일봉/메타는 기존 주기에 맡긴다.
+            capture_us_market_data(force=True)
+        result['status'] = 'REFRESH_ATTEMPTED_CHECK_TIMESTAMPS'
+        result['completed_at_kst'] = now_kst().isoformat()
+        return result
+    except Exception as exc:
+        result['status'] = 'REFRESH_ERROR_SAVED_DATA_ONLY'
+        result['error'] = str(exc)[:240]
+        return result
+    finally:
+        lock.release()
+
+
+def _snapshot_file_freshness(sources):
+    # 파일 수정 시각이지 거래소 호가 시각이 아니다. 시세의 실시간성을 보장하지 않는다.
+    def latest_for(prefix=''):
+        try:
+            mtimes = [os.path.getmtime(fp) for rel, fp in sources
+                      if (not prefix or rel.startswith('market_data/' + prefix)) and os.path.isfile(fp)]
+            return max(mtimes) if mtimes else None
+        except OSError:
+            return None
+    result = {}
+    for label, prefix in [('file', ''), ('price_file', 'prices_'), ('candle_1m_file', 'candles_1m_')]:
+        stamp = latest_for(prefix)
+        result['latest_' + label + '_modified_at_kst'] = datetime.fromtimestamp(stamp, KST).isoformat() if stamp else ''
+        result['latest_' + label + '_age_sec'] = round(max(0., time.time() - stamp), 1) if stamp else None
+    result['warning'] = 'File mtime is not an exchange price timestamp; data can be delayed.'
+    return result
+
+
+def _cleanup_stale_snapshot_files(workdir):
+    # 비정상 종료 뒤 남은 임시 다운로드 ZIP만 청소한다. 정식 백업에는 손대지 않는다.
+    cutoff = time.time() - 6 * 3600
+    for item in os.scandir(workdir):
+        try:
+            if item.name.startswith('snapshot_') and item.name.endswith('.zip') and not item.is_symlink() and item.is_file() and item.stat().st_mtime < cutoff:
+                os.remove(item.path)
+        except OSError:
+            continue
+
 
 # V5.63: 클릭 시점에 디스크에 이미 저장된 실제 원본만 임시 스냅샷 ZIP으로 제공.
 # 최종 장 마감 GRADE_1 백업 및 Google Drive 정식 백업을 절대 교체하지 않는다.
@@ -4215,7 +4399,7 @@ def _on_demand_source_day(market, requested_date=''):
     raise FileNotFoundError(market + ':NO_SAVED_DATA')
 
 
-def create_on_demand_snapshot(markets=('KR',), requested_date=''):
+def create_on_demand_snapshot(markets=('KR',), requested_date='', refresh_info=None):
     """No API calls, backfill, grading, Drive upload or canonical backup overwrites.
     A fresh request creates a unique temporary ZIP that must be deleted after HTTP response.
     """
@@ -4223,15 +4407,20 @@ def create_on_demand_snapshot(markets=('KR',), requested_date=''):
         raise ValueError('UNKNOWN_MARKET')
     captured_at = now_kst()
     bundles=[]
+    total_bytes = 0
     for market in markets:
         day, base = _on_demand_source_day(market, requested_date)
         sources = _kr_backup_source_files(base) if market == 'KR' else _us_backup_source_files(base)
         sources=[(rel,fp) for rel,fp in sources if os.path.isfile(fp) and os.path.getsize(fp)>0]
         if not sources:
             raise FileNotFoundError(market+':'+day+':EMPTY_SAVED_DATA')
+        total_bytes += sum(os.path.getsize(fp) for _, fp in sources)
+        if total_bytes > SNAPSHOT_MAX_SOURCE_BYTES:
+            raise ValueError('SNAPSHOT_SIZE_LIMIT_EXCEEDED')
         bundles.append((market, day, sources))
     workdir = os.path.join(LOG_ROOT, '_temp_downloads')
     os.makedirs(workdir, exist_ok=True)
+    _cleanup_stale_snapshot_files(workdir)
     # Temporary file: no accumulating ZIP backups or changes to official backups.
     fd, tmppath = tempfile.mkstemp(prefix='snapshot_', suffix='.zip', dir=workdir)
     os.close(fd)
@@ -4242,7 +4431,8 @@ def create_on_demand_snapshot(markets=('KR',), requested_date=''):
         'data_complete':False,
         'grade':'UNVERIFIED_PARTIAL',
         'description':'ZIP contains only data already collected at request time; missing/incomplete minute bars remain missing. Not a finalized close backup.',
-        'new_market_data_requested':False,
+        'new_market_data_requested':any(bool(x.get('api_refresh_attempted')) for x in (refresh_info or {}).values()),
+        'refresh_results':refresh_info or {},
         'official_close_backup_modified':False,
         'markets':[],
     }
@@ -4261,7 +4451,8 @@ def create_on_demand_snapshot(markets=('KR',), requested_date=''):
                     except FileNotFoundError:
                         # A writer may rotate a file while this request is running.
                         raise RuntimeError('SNAPSHOT_SOURCE_CHANGED_RETRY')
-                manifest_entry = {'market':market,'data_date':day,'included_files':len(included),'file_names':included}
+                manifest_entry = {'market':market,'data_date':day,'included_files':len(included),
+                                  'file_names':included, 'source_freshness':_snapshot_file_freshness(sources)}
                 if market == 'KR':
                     wanted = [f'market_data/market_indicators_{day}.csv',
                               f'market_data/investor_trading_{day}.csv',
@@ -4271,6 +4462,14 @@ def create_on_demand_snapshot(markets=('KR',), requested_date=''):
                         name: ('COLLECTED' if name in included else 'NOT_COLLECTED') for name in wanted}
                     manifest_entry['investor_units'] = {'market': 'KRW', 'stock': 'shares'}
                     manifest_entry['stock_investor_symbols'] = list(KR_INVESTOR_SYMBOLS)
+                    manifest_entry['optional_520099'] = {
+                        'name': '미래에셋 인버스 2X 반도체 ETN',
+                        'krx_short_code': 'Q520099',
+                        'api_symbol_verified_live': bool(KR_ETN_API_SYMBOL_LAST_GOOD),
+                        'files_included': [name for name in included if '520099' in name],
+                        'status': 'COLLECTED_FILES_ONLY' if any('520099' in name for name in included) else 'NO_SAVED_DATA',
+                        'required_for_official_final_backup': False,
+                    }
                 manifest['markets'].append(manifest_entry)
             z.writestr('snapshot_manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
         with zipfile.ZipFile(tmppath,'r') as z:
@@ -6989,6 +7188,37 @@ setInterval(refresh,3000);
 </html>"""
 
 
+def snapshot_download_html():
+    configured = bool(MANUAL_SNAPSHOT_TOKEN)
+    tip = ("인증 비밀번호는 Render 환경변수 MANUAL_SNAPSHOT_TOKEN과 일치해야 합니다."
+           if configured else "서버에 MANUAL_SNAPSHOT_TOKEN 환경변수가 아직 설정되지 않았습니다.")
+    options = """<option value='kr'>한국 (KR)</option><option value='us'>미국 (US)</option><option value='both'>한국 + 미국 통합</option>"""
+    return f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Market Watch 수시 다운로드</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:750px;margin:35px auto;padding:0 20px;color:#182330}}
+form{{border:1px solid #cfd8e3;border-radius:12px;padding:20px;background:#f9fbfe}}
+label{{display:block;margin:14px 0 5px;font-weight:600}}
+input,select,button{{font:inherit;box-sizing:border-box;padding:10px;width:100%}}
+button{{background:#164e91;color:white;border:0;border-radius:8px;margin-top:16px;cursor:pointer}}
+small{{color:#556273}}a{{color:#1352a3}}</style></head><body>
+<h2>{html.escape(OPERATING_VERSION)}</h2><h3>한국·미국 24시간 수시 다운로드</h3>
+<p>장중 최신 수집을 시도하고, 실제 서버에 저장된 파일을 임시 ZIP으로 내려받습니다.
+장 마감 정식 백업과 Google Drive 파일은 건드리지 않습니다.</p>
+<p>한국: 494310 · 122630 · 252670 · 520099(미래에셋 인버스 2X 반도체 ETN, 추가). 미국: SOXL · SOXS.</p>
+<p>접속·다운로드 요청은 24시간 가능하지만, 주말·휴장·장외에는 저장된 마지막 데이터를 제공하며, 서버 중지나 데이터 미저장 시 다운로드할 수 없습니다. 새 ETN의 Toss API 지원은 실서버에서 검증해야 합니다.</p>
+<form method='POST' action='/download_snapshot'>
+<label for='key'>다운로드 인증키</label><input id='key' name='key' type='password' required autocomplete='off'>
+<label for='market'>대상 시장</label><select id='market' name='market'>{options}</select>
+<label for='date'>거래일 (비우면 최신 저장일)</label><input id='date' name='date' type='text' placeholder='YYYY-MM-DD · 선택 사항' pattern='[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'>
+<label><input name='refresh' type='checkbox' value='1' checked style='width:auto'> 장중 최신 API 데이터 재요청</label>
+<small>장외·휴장일에는 마지막 저장 원본을 내려받습니다. 거래일을 지정하면 API 재요청 없이 해당 날짜를 사용합니다.</small>
+<button type='submit'>ZIP 다운로드</button></form>
+<p><small>{html.escape(tip)} API 자체가 지연되거나 제한되면 파일은 최신 체결시세를 보장하지 않습니다.</small></p>
+<p><a href='/selfcheck'>수집 상태 점검</a> · <a href='/archives'>정식 백업 목록</a></p>
+</body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -7009,7 +7239,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/dashboard', '/paper_dashboard'):
             return self.html_response(core4_dashboard_html())
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 0, 'kr_paper_accounts': 0, 'us_paper_accounts': 0, 'experiment10': {'active': False}, 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'intraday_stock_investor_symbols': list(KR_INVESTOR_SYMBOLS), 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_PRICE_SYMBOLS), 'kr_optional_520099': {'symbol': KR_ETN_SYMBOL, 'api_symbol_last_good': KR_ETN_API_SYMBOL_LAST_GOOD, 'price_collected': S.get('market_data_capture', {}).get('optional_520099_price_collected', False)}, 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 0, 'kr_paper_accounts': 0, 'us_paper_accounts': 0, 'experiment10': {'active': False}, 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'intraday_stock_investor_symbols': list(KR_INVESTOR_SYMBOLS), 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -7034,37 +7264,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.download_file(p, os.path.basename(p), 'application/zip')
         if path == '/archives':
             return self.json_response({'ok': True, 'archives': backup_archive_index()})
-        # 수시 다운로드: 오전 9:38을 포함, 어느 시점이든 이미 수집된 데이터만 전달.
-        # 기본 /download_snapshot 은 KR; US, BOTH 및 날짜 지정 가능.
+        # GET은 기존 클라이언트의 Bearer 인증 호환용. 브라우저에서는 POST 폼 이용.
         if path == '/download_snapshot':
-            market = (qs.get('market') or ['kr'])[0].lower()
-            date_arg = (qs.get('date') or [''])[0]
-            if market not in ('kr','us','both'):
-                return self.json_response({'ok':False,'error':'MARKET_MUST_BE_KR_US_OR_BOTH'},status=400)
-            if date_arg and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_arg):
-                return self.json_response({'ok':False,'error':'DATE_MUST_BE_YYYY-MM-DD'},status=400)
-            if not MANUAL_SNAPSHOT_TOKEN:
-                return self.json_response({'ok':False,'error':'MANUAL_SNAPSHOT_TOKEN_NOT_CONFIGURED'},status=503)
-            user_key = (qs.get('key') or [''])[0]
-            auth = self.headers.get('Authorization', '')
-            if auth.startswith('Bearer '):
-                user_key = auth[len('Bearer '):].strip()
-            if not hmac.compare_digest(user_key, MANUAL_SNAPSHOT_TOKEN):
-                return self.json_response({'ok':False,'error':'SNAPSHOT_ACCESS_DENIED'},status=403)
-            markets = ('KR','US') if market == 'both' else (market.upper(),)
-            try:
-                tmp, filename, manifest = create_on_demand_snapshot(markets, date_arg)
-                try:
-                    self.send_header_cache_control_for_snapshot = True
-                    return self.download_file(tmp, filename, 'application/zip')
-                finally:
-                    self.send_header_cache_control_for_snapshot = False
-                    try: os.remove(tmp)
-                    except OSError: pass
-            except FileNotFoundError as e:
-                return self.json_response({'ok':False,'error':'SAVED_DATA_NOT_FOUND','detail':str(e)},status=404)
-            except Exception as e:
-                return self.json_response({'ok':False,'error':'SNAPSHOT_FAILED','detail':str(e)[:300]},status=500)
+            return self.handle_snapshot_download(qs)
         if path == '/download_backup':
             day_ok, day_reason, _ = kr_backup_day_status(force=True)
             if not day_ok and day_reason == 'KR_MARKET_CLOSED':
@@ -7094,13 +7296,81 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/health':
             # Render health check 전용: 수집/ZIP/Drive 상태와 무관하게 즉시 200.
             return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'paper_only': PAPER_ONLY_MODE})
-        if path == '/':
-            return self.html_response(f"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h2>{html.escape(OPERATING_VERSION)}</h2><p>운영: KR/US 데이터 수집 + Drive 백업 / 가격패턴 매수·매도 관찰 알림 연결(미검증) · <a href='/manual-status'>운영 상태</a></p><p>KR {len(KR_PRICE_SYMBOLS)}종목 / US {len(US_SYMBOLS)}종목 / PAPER 실행 OFF</p><p>실주문: {('ON' if ENABLE_REAL_ORDER else 'OFF')} / 자동매수: {('ON' if ENABLE_REAL_AUTO_BUY else 'OFF')} / 자동매도: {('ON' if ENABLE_REAL_AUTO_SELL else 'OFF')}</p><p><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> | <a href='/download_snapshot?market=kr'>한국 수시 ZIP(인증 필요)</a> | <a href='/download_snapshot?market=us'>미국 수시 ZIP</a> | <a href='/download_snapshot?market=both'>한미 통합 수시 ZIP</a> | <a href='/download_backup'>한국 ZIP</a> | <a href='/download_us_backup'>미국 ZIP</a> | <a href='/archives'>날짜별 백업목록</a> | <a href='/google/oauth/start'>Drive 재승인</a></p></body></html>")
+        if path in ('/', '/downloads'):
+            return self.html_response(snapshot_download_html())
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
-        return self.json_response({'ok': False, 'error': 'POST_DISABLED_CORE4_PAPER_ONLY'}, status=405)
+        # 주문/매매 POST는 계속 차단하고, 인증된 ZIP 다운로드 폼만 허용한다.
+        if urlparse(self.path).path != '/download_snapshot':
+            return self.json_response({'ok': False, 'error': 'POST_DISABLED_CORE4_PAPER_ONLY'}, status=405)
+        try:
+            size = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            return self.json_response({'ok': False, 'error': 'INVALID_CONTENT_LENGTH'}, status=400)
+        if size <= 0 or size > 2048:
+            return self.json_response({'ok': False, 'error': 'FORM_BODY_SIZE_INVALID'}, status=413)
+        if self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/x-www-form-urlencoded':
+            return self.json_response({'ok': False, 'error': 'FORM_CONTENT_TYPE_REQUIRED'}, status=415)
+        try:
+            form = parse_qs(self.rfile.read(size).decode('utf-8'), keep_blank_values=True)
+        except UnicodeDecodeError:
+            return self.json_response({'ok': False, 'error': 'FORM_ENCODING_INVALID'}, status=400)
+        return self.handle_snapshot_download(form)
+
+    def handle_snapshot_download(self, qs):
+        if not MANUAL_SNAPSHOT_TOKEN:
+            return self.json_response({'ok': False, 'error': 'MANUAL_SNAPSHOT_TOKEN_NOT_CONFIGURED'}, status=503)
+        user_key = (qs.get('key') or [''])[0]
+        auth = self.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            user_key = auth[len('Bearer '):].strip()
+        if not hmac.compare_digest(str(user_key), MANUAL_SNAPSHOT_TOKEN):
+            return self.json_response({'ok': False, 'error': 'SNAPSHOT_ACCESS_DENIED'}, status=403)
+
+        market = (qs.get('market') or ['kr'])[0].lower()
+        date_arg = (qs.get('date') or [''])[0]
+        if market not in ('kr', 'us', 'both'):
+            return self.json_response({'ok': False, 'error': 'MARKET_MUST_BE_KR_US_OR_BOTH'}, status=400)
+        if date_arg and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_arg):
+            return self.json_response({'ok': False, 'error': 'DATE_MUST_BE_YYYY-MM-DD'}, status=400)
+        refresh_arg = (qs.get('refresh') or ['0'])[0].lower()
+        if refresh_arg not in ('0', '1', 'on', 'true', 'false'):
+            return self.json_response({'ok': False, 'error': 'REFRESH_MUST_BE_BOOLEAN'}, status=400)
+        refresh = refresh_arg in ('1', 'on', 'true') and not date_arg
+        markets = ('KR', 'US') if market == 'both' else (market.upper(),)
+        if not SNAPSHOT_DOWNLOAD_LOCK.acquire(blocking=False):
+            return self.json_response({'ok': False, 'error': 'ANOTHER_SNAPSHOT_IN_PROGRESS'}, status=429)
+        try:
+            refresh_info = {}
+            if refresh:
+                for m in markets:
+                    refresh_info[m] = refresh_snapshot_market(m)
+            elif date_arg:
+                refresh_info = {m: {'status': 'HISTORICAL_DATE_NO_API_REFRESH'} for m in markets}
+            tmp = None
+            try:
+                tmp, filename, _ = create_on_demand_snapshot(markets, date_arg, refresh_info=refresh_info)
+                self.send_header_cache_control_for_snapshot = True
+                return self.download_file(tmp, filename, 'application/zip')
+            finally:
+                self.send_header_cache_control_for_snapshot = False
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        except FileNotFoundError as e:
+            return self.json_response({'ok': False, 'error': 'SAVED_DATA_NOT_FOUND', 'detail': str(e)[:240]}, status=404)
+        except ValueError as e:
+            return self.json_response({'ok': False, 'error': str(e)[:100]}, status=413)
+        except (BrokenPipeError, ConnectionResetError):
+            return None  # Client cancelled the download; temporary ZIP is still deleted.
+        except Exception as e:
+            return self.json_response({'ok': False, 'error': 'SNAPSHOT_FAILED', 'detail': str(e)[:240]}, status=500)
+        finally:
+            SNAPSHOT_DOWNLOAD_LOCK.release()
 
     def download_file(self, path, filename, content_type='application/octet-stream'):
         if not os.path.isfile(path):
@@ -7259,7 +7529,7 @@ def print_core_selfcheck():
         raise RuntimeError('Google Drive 거래일당 canonical 1파일 자동백업 정책이 꺼져 있습니다.')
     if not GOOGLE_DRIVE_FINAL_IMMUTABLE:
         raise RuntimeError('검증 완료 FINAL 불변 잠금이 꺼져 있습니다.')
-    if tuple(KR_PRICE_SYMBOLS) != tuple(MANUAL_CONFIG['collection']['KR_daily']):
+    if tuple(KR_PRICE_SYMBOLS) != tuple(dict.fromkeys(MANUAL_CONFIG['collection']['KR_daily'] + [KR_ETN_SYMBOL])):
         raise RuntimeError(f'KR 종목 수 오류: {len(KR_BACKUP_REQUIRED_SYMBOLS)}')
     if tuple(US_SYMBOLS) != tuple(MANUAL_CONFIG['collection']['US_1m']):
         raise RuntimeError(f'US 종목 수 오류: {len(US_SYMBOLS)}')
@@ -7384,27 +7654,34 @@ def load_manual_config(path):
     expected = {'KR_1m': ['494310','122630','252670'], 'KR_daily': ['494310','122630','252670'],
                 'US_1m': ['SOXL','SOXS'], 'US_daily': ['SOXL','SOXS'],
                 'US_sessions': ['DAY','PREMARKET','REGULAR','AFTERMARKET']}
+    # 520099 is an additive, optional ETN. Older configs lacking it are accepted.
+    extra_optional_kr = {'520099'}
     col = cfg.get('collection')
     if not isinstance(col, dict) or set(col) != set(expected):
         raise ValueError('collection 필드가 누락되거나 지원하지 않는 필드가 있습니다.')
     for key, allowed in expected.items():
         values = col[key]
+        permitted = [set(allowed)]
+        if key in ('KR_1m', 'KR_daily'):
+            permitted.append(set(allowed) | extra_optional_kr)
         if (not isinstance(values, list) or not all(isinstance(v, str) for v in values)
-                or len(values) != len(set(values)) or set(values) != set(allowed)):
+                or len(values) != len(set(values)) or set(values) not in permitted):
             raise ValueError('지원되지 않는 수집 범위: ' + key)
     return cfg
 
 def apply_manual_config(cfg):
     global MARKET_DATA_CORE_SYMBOLS, KR_PRICE_SYMBOLS, MARKET_DATA_DAILY_SYMBOLS
-    global MARKET_DATA_METADATA_SYMBOLS, MARKET_DATA_ORDERFLOW_SYMBOLS
+    global MARKET_DATA_METADATA_SYMBOLS, MARKET_DATA_ORDERFLOW_SYMBOLS, KR_OPTIONAL_MINUTE_SYMBOLS
     global US_SYMBOLS, US_SEMI_SYMBOLS, PROJECT_PAPER_LAB_ENABLED
     global PROJECT_SCANNER_WORKER_ENABLED, US_OFFICIAL_NEWS_ENABLED, US_EARLY_RESEARCH_ENABLED
     col = cfg['collection']
-    MARKET_DATA_CORE_SYMBOLS = list(col['KR_1m'])
-    MARKET_DATA_ORDERFLOW_SYMBOLS = list(col['KR_1m'])
-    KR_PRICE_SYMBOLS = list(col['KR_daily'])
-    MARKET_DATA_DAILY_SYMBOLS = list(col['KR_daily'])
-    MARKET_DATA_METADATA_SYMBOLS = list(col['KR_daily'])
+    # Preserve current GRADE_1 requirements; capture 520099 as independent optional data.
+    MARKET_DATA_CORE_SYMBOLS = [x for x in col['KR_1m'] if x != KR_ETN_SYMBOL]
+    KR_OPTIONAL_MINUTE_SYMBOLS = [KR_ETN_SYMBOL]
+    MARKET_DATA_ORDERFLOW_SYMBOLS = list(dict.fromkeys(col['KR_1m'] + [KR_ETN_SYMBOL]))
+    KR_PRICE_SYMBOLS = list(dict.fromkeys(col['KR_daily'] + [KR_ETN_SYMBOL]))
+    MARKET_DATA_DAILY_SYMBOLS = list(KR_PRICE_SYMBOLS)
+    MARKET_DATA_METADATA_SYMBOLS = list(KR_PRICE_SYMBOLS)
     US_SYMBOLS = list(col['US_1m'])
     US_SEMI_SYMBOLS = tuple(col['US_1m'])
     PROJECT_PAPER_LAB_ENABLED = False
@@ -7415,7 +7692,7 @@ def apply_manual_config(cfg):
 
 # Embedded validated settings for single-file deployment.
 def load_manual_config_embedded():
-    cfg = json.loads('{"order_execution": false, "simulation": false, "surge_scanner": false, "signal_status": "BLOCKED_UNTIL_PATTERN_MODEL_VALIDATED", "raw_archive": "PRESERVE_EXISTING", "collection": {"KR_1m": ["494310", "122630", "252670"], "KR_daily": ["494310", "122630", "252670"], "US_1m": ["SOXL", "SOXS"], "US_daily": ["SOXL", "SOXS"], "US_sessions": ["DAY", "PREMARKET", "REGULAR", "AFTERMARKET"]}, "alert_mode": "OBSERVATION_UNVALIDATED_WITH_EXPLICIT_LABEL"}')
+    cfg = json.loads('{"order_execution": false, "simulation": false, "surge_scanner": false, "signal_status": "BLOCKED_UNTIL_PATTERN_MODEL_VALIDATED", "raw_archive": "PRESERVE_EXISTING", "collection": {"KR_1m": ["494310", "122630", "252670", "520099"], "KR_daily": ["494310", "122630", "252670", "520099"], "US_1m": ["SOXL", "SOXS"], "US_daily": ["SOXL", "SOXS"], "US_sessions": ["DAY", "PREMARKET", "REGULAR", "AFTERMARKET"]}, "alert_mode": "OBSERVATION_UNVALIDATED_WITH_EXPLICIT_LABEL"}')
     return validate_manual_config_embedded(cfg)
 
 def validate_manual_config_embedded(cfg):
