@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_67_520099_KR_BACKUP_MANIFEST_FIXED'
+OPERATING_VERSION = 'OPERATING_V5_67_520099_OPTIONAL_1M_REPAIR'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -513,6 +513,11 @@ MARKET_MODE = 'KR_US_MANUAL_ALERT_ONLY'
 KR_FIRST_CANDLE_REPAIR_START_MIN = max(2, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_START_MIN', '2')))
 KR_FIRST_CANDLE_REPAIR_END_MIN = max(KR_FIRST_CANDLE_REPAIR_START_MIN, int(os.environ.get('KR_FIRST_CANDLE_REPAIR_END_MIN', '15')))
 KR_TARGETED_BACKFILL_RETRIES = max(1, min(8, int(os.environ.get('KR_TARGETED_BACKFILL_RETRIES', '5'))))
+# Additional ETN repair is bounded and never alters the required three-symbol GRADE_1 policy.
+KR_ETN_REPAIR_MAX_TARGETS = max(1, min(40, int(os.environ.get('KR_ETN_REPAIR_MAX_TARGETS', '15'))))
+KR_ETN_REPAIR_HTTP_COOLDOWN_SEC = max(300, int(os.environ.get('KR_ETN_REPAIR_HTTP_COOLDOWN_SEC', '900')))
+KR_ETN_REPAIR_HTTP_LOCK = threading.Lock()
+KR_ETN_REPAIR_HTTP_LAST = [0.0]
 ENABLE_RAW_API_CAPTURE = os.environ.get('ENABLE_RAW_API_CAPTURE', 'true').lower() == 'true'  # FIX 2026-10-16: backup requires api_*.jsonl; preserve raw capture unless explicitly disabled
 RAW_API_MAX_BODY_CHARS = int(os.environ.get('RAW_API_MAX_BODY_CHARS', '2000000'))
 RATE_MIN_GAP_SEC = {'MARKET_DATA': max(0.2, float(os.environ.get('RATE_GAP_MARKET_DATA', '0.45'))), 'MARKET_DATA_CHART': max(0.25, float(os.environ.get('RATE_GAP_MARKET_DATA_CHART', '0.40'))), 'MARKET_INFO': max(0.34, float(os.environ.get('RATE_GAP_MARKET_INFO', '0.36'))), 'STOCK': max(0.2, float(os.environ.get('RATE_GAP_STOCK', '0.22'))), 'STOCK_TRADING_TREND': max(0.5, float(os.environ.get('RATE_GAP_STOCK_TRADING_TREND', '0.60'))), 'RANKING': max(0.2, float(os.environ.get('RATE_GAP_RANKING', '0.22'))), 'MARKET_INDICATOR_PRICE': max(0.1, float(os.environ.get('RATE_GAP_MARKET_INDICATOR_PRICE', '0.12'))), 'MARKET_INDICATOR': max(0.1, float(os.environ.get('RATE_GAP_MARKET_INDICATOR', '0.12'))), 'MARKET_INDICATOR_CHART': max(0.2, float(os.environ.get('RATE_GAP_MARKET_INDICATOR_CHART', '0.22'))), 'OTHER': max(0.2, float(os.environ.get('RATE_GAP_OTHER', '0.22')))}
@@ -3909,15 +3914,17 @@ def _kr_candle_csv_row(sym, candle):
     volume = to_float(candle.get('volume', 0))
     return {'saved_at': now_text(), 'symbol': sym, 'timestamp': str(candle.get('timestamp', '')), 'open': candle.get('openPrice', 0), 'high': candle.get('highPrice', 0), 'low': candle.get('lowPrice', 0), 'close': candle.get('closePrice', 0), 'volume': candle.get('volume', 0), 'estimated_trade_value': round(close * volume, 4), 'currency': candle.get('currency', 'KRW')}
 
-def _fetch_kr_candle_at(sym, target, cal):
+def _fetch_kr_candle_at(sym, target, cal, max_attempts=None):
     """
     토스 공식 Open API 1.2.9의 before는 inclusive다.
     before=target을 그대로 사용하고, 정확히 target과 일치하는 봉만 저장한다.
     """
     attempts = []
-    for attempt in range(1, KR_TARGETED_BACKFILL_RETRIES + 1):
+    retries = KR_TARGETED_BACKFILL_RETRIES if max_attempts is None else max(1, min(3, int(max_attempts)))
+    getter = _kr_etn_api_get if sym == KR_ETN_SYMBOL else api_get
+    for attempt in range(1, retries + 1):
         before_iso = target.isoformat()
-        code, data = api_get('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': 3, 'before': before_iso, 'adjusted': True}, timeout=12)
+        code, data = getter('/api/v1/candles', params={'symbol': sym, 'interval': '1m', 'count': 3, 'before': before_iso, 'adjusted': True}, timeout=12)
         result = _result_dict(data)
         candles = result.get('candles', []) if isinstance(result, dict) else []
         returned = [str(item.get('timestamp', '')) for item in candles if isinstance(item, dict)]
@@ -3931,6 +3938,10 @@ def _fetch_kr_candle_at(sym, target, cal):
                 if not _completed_kr_trading_candle(candle.get('timestamp'), cal.get('date'), cal.get('regular_start'), cal.get('regular_end')):
                     continue
                 return (_kr_candle_csv_row(sym, candle), attempts)
+        # The shared API layer already handles 429 retries and server Retry-After.
+        # An optional ETN repair must not produce another request burst.
+        if sym == KR_ETN_SYMBOL and code in (401, 403, 429):
+            break
         time.sleep(min(0.8 * attempt, 4.0))
         _market_data_request_gap()
     return (None, attempts)
@@ -4048,6 +4059,61 @@ def finalize_kr_candles_grade1():
         if len(rows) != expected or not rows or _parse_iso(rows[0]['timestamp']) != start + timedelta(minutes=1) or (_parse_iso(rows[-1]['timestamp']) != end):
             failures.append(f'{sym}:CANDLES_{len(rows)}')
     return (not failures, failures)
+
+def repair_kr_optional_etn_minutes(max_targets=None):
+    """Recover only observed missing *completed* regular-session 1m bars for 520099.
+
+    No synthetic candles, no overwrite of a verified final ZIP/Drive object. The
+    current trading date alone is supported because historical API retention is
+    unknown. Errors are reported independently of required KR GRADE_1 checks.
+    """
+    state = S.setdefault('market_data_capture', {})
+    cal = state.get('calendar', {})
+    day = str(cal.get('date', '') or '')
+    start = _parse_iso(cal.get('regular_start'))
+    end = _parse_iso(cal.get('regular_end'))
+    if not (day == today() and start and end and end <= now_kst()):
+        return {'ok': False, 'status': 'WAIT_CLOSE_OR_CALENDAR', 'date': day,
+                'reason': 'Only current completed KR regular session is repairable'}
+    path = candle_1m_path(KR_ETN_SYMBOL)
+    existing = _read_csv_rows(path)
+    expected = _kr_expected_candle_times(start, end)
+    known = {_parse_iso(r.get('timestamp')) for r in existing
+             if str(r.get('symbol')) == KR_ETN_SYMBOL and _parse_iso(r.get('timestamp'))}
+    missing = [t for t in expected if t not in known]
+    requested = missing[:max(1, min(KR_ETN_REPAIR_MAX_TARGETS, int(max_targets or KR_ETN_REPAIR_MAX_TARGETS)))]
+    found = []
+    errors = []
+    for target in requested:
+        row, attempts = _fetch_kr_candle_at(KR_ETN_SYMBOL, target, cal, max_attempts=2)
+        if row:
+            found.append(row)
+        else:
+            errors.append({'timestamp': target.isoformat(),
+                           'http_codes': [a.get('http') for a in attempts]})
+        # Avoid further calls when the API has explicitly throttled or rejected us.
+        if attempts and any(a.get('http') in (401, 403, 429) for a in attempts):
+            break
+        _market_data_request_gap()
+    if found:
+        _merge_kr_candle_rows(KR_ETN_SYMBOL, found)
+    rows = _read_csv_rows(path)
+    present = {_parse_iso(r.get('timestamp')) for r in rows if _parse_iso(r.get('timestamp'))}
+    remaining = [t.isoformat() for t in expected if t not in present]
+    report = {
+        'ok': not remaining, 'status': 'COMPLETE' if not remaining else 'PARTIAL_MISSING',
+        'date': day, 'symbol': KR_ETN_SYMBOL, 'checked_at': now_text(),
+        'expected_minutes': len(expected), 'stored_minutes': len(expected) - len(remaining),
+        'recovered_now': len(found), 'missing_minutes': remaining,
+        'request_count': len(requested), 'errors': errors,
+        'verified_official_backup_unchanged': True,
+        'source': 'TOSS_CANDLES_REAL_API_ONLY_NO_SYNTHETIC_FILL',
+    }
+    state['optional_520099_repair'] = report
+    report_file = os.path.join(market_data_dir(), f'optional_520099_minute_repair_{day}.json')
+    _atomic_json_write(report_file, report)
+    return report
+
 
 def repair_kr_required_files_before_backup():
     """백업 직전 26종목 필수 파일을 재조회한다. 기존 정상 파일은 실패 시 보존한다."""
@@ -4236,6 +4302,13 @@ def _create_backup_zip_unlocked():
         if auth_failed:
             break
         time.sleep(min(grade1_pass * 2, 5))
+    # Optional ETN is checked once, with bounded requests. Never downgrade
+    # required three-symbol GRADE_1 because this ETN has missing candles.
+    try:
+        quality['optional_520099_repair'] = repair_kr_optional_etn_minutes()
+    except Exception as optional_exc:
+        quality['optional_520099_repair'] = {'ok': False, 'status': 'ERROR',
+                                           'error': str(optional_exc)[:300]}
     quality['repair_failures'] = repair_failures
     quality['backfill_ok'] = backfill_ok
     quality['backfill_failures'] = backfill_failures
@@ -7214,6 +7287,9 @@ a{{color:#14539b}} .menu a{{display:inline-block;margin:0 13px 8px 0}}
 <form method='POST' action='/download_snapshot'><input type='hidden' name='market' value='both'><input type='hidden' name='refresh' value='1'><button type='submit'>한국+미국 ZIP 바로받기</button></form>
 </div>
 <a href='/downloads'>날짜 선택 등 상세 다운로드</a></div>
+<div class='notice'><strong>520099 1분봉 누락 검사/재조회</strong>
+<form method='POST' action='/repair_520099'><input type='hidden' name='repair' value='1'><button type='submit'>오늘 520099 누락분 재조회</button></form>
+<p class='subtitle'>장 마감 후 누락된 원본 1분봉만 조회합니다. 기존 정식 백업은 변경하지 않습니다.</p></div>
 <p class='menu'><a href='/dashboard'>기존 대시보드</a> | <a href='/paper_dashboard'>PAPER 대시보드</a> | <a href='/manual-status'>운영 상태</a></p>
 <p class='menu'><a href='/selfcheck'>selfcheck</a> | <a href='/rescue_today'>오늘 KR 원본 구조백업</a> |
 <a href='/downloads'>한국 수시 ZIP</a> | <a href='/downloads'>미국 수시 ZIP</a> |
@@ -7276,7 +7352,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/dashboard', '/paper_dashboard'):
             return self.html_response(core4_dashboard_html())
         if path in ('/selfcheck', '/configcheck'):
-            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_PRICE_SYMBOLS), 'kr_optional_520099': {'symbol': KR_ETN_SYMBOL, 'api_symbol_last_good': KR_ETN_API_SYMBOL_LAST_GOOD, 'price_collected': S.get('market_data_capture', {}).get('optional_520099_price_collected', False)}, 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 0, 'kr_paper_accounts': 0, 'us_paper_accounts': 0, 'experiment10': {'active': False}, 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'intraday_stock_investor_symbols': list(KR_INVESTOR_SYMBOLS), 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
+            return self.json_response({'ok': True, 'version': OPERATING_VERSION, 'market_mode': MARKET_MODE, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'us_real_order_enabled': US_REAL_ORDER_ENABLED, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'kr_collector_enabled': ENABLE_TOSS_MARKET_DATA_CAPTURE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_PRICE_SYMBOLS), 'kr_optional_520099': {'symbol': KR_ETN_SYMBOL, 'api_symbol_last_good': KR_ETN_API_SYMBOL_LAST_GOOD, 'price_collected': S.get('market_data_capture', {}).get('optional_520099_price_collected', False), 'minute_repair': S.get('market_data_capture', {}).get('optional_520099_repair', {})}, 'kr_data_worker_alive': bool(KR_DATA_THREAD and KR_DATA_THREAD.is_alive()), 'kr_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - KR_DATA_WORKER_HEARTBEAT_TS), 1) if KR_DATA_WORKER_HEARTBEAT_TS else None, 'us_collector_enabled': ENABLE_US_MARKET_DATA_CAPTURE, 'us_symbol_count': len(US_SYMBOLS), 'us_data_worker_alive': bool(US_DATA_THREAD and US_DATA_THREAD.is_alive()), 'us_data_worker_heartbeat_age_sec': round(max(0.0, time.time() - US_DATA_WORKER_HEARTBEAT_TS), 1) if US_DATA_WORKER_HEARTBEAT_TS else None, 'paper_auto': CORE4_ENABLED, 'paper_accounts': 0, 'kr_paper_accounts': 0, 'us_paper_accounts': 0, 'experiment10': {'active': False}, 'core4_execution': False, 'legacy_paper_execution': False, 'legacy_paper_history_archived': True, 'paper_start_cash_each': CORE4_START_CASH, 'core4_paper': S.get('core4_paper', {}), 'project_lab_enabled': PROJECT_PAPER_LAB_ENABLED, 'toss_market_data_transport': TOSS_MARKET_DATA_TRANSPORT, 'toss_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'intraday_stock_investor_symbols': list(KR_INVESTOR_SYMBOLS), 'project_session': _project_session_label(), 'project_scanner_alive': bool(PROJECT_SCANNER_THREAD and PROJECT_SCANNER_THREAD.is_alive()), 'project_scanner_heartbeat_age_sec': round(max(0.0, time.time() - PROJECT_SCANNER_HEARTBEAT_TS), 1) if PROJECT_SCANNER_HEARTBEAT_TS else None, 'project_monthly_target_pct': PROJECT_MONTHLY_TARGET_PCT, 'project_daily_soft_target_pct': PROJECT_DAILY_SOFT_TARGET_PCT, 'project_exit_profiles': PROJECT_G_EXIT_PROFILES, 'project_storage': _project_state().get('storage', {}), 'project_last_report': _project_state().get('last_report', {}), 'project_last_report_path': _project_state().get('last_report_path', ''), 'google_drive_upload_enabled': GOOGLE_DRIVE_UPLOAD_ENABLED, 'google_drive_ready': google_drive_credentials_ready(require_refresh=True), 'google_drive_canonical_one_file': GOOGLE_DRIVE_CANONICAL_ONE_FILE, 'google_drive_allow_update_canonical': GOOGLE_DRIVE_ALLOW_UPDATE, 'google_drive_allow_delete': GOOGLE_DRIVE_ALLOW_DELETE, 'google_drive_final_immutable': GOOGLE_DRIVE_FINAL_IMMUTABLE, 'google_drive_refresh_token_source': 'ENV' if GOOGLE_DRIVE_REFRESH_TOKEN else ('PERSISTENT_FILE' if google_drive_refresh_token_value() else 'MISSING'), 'archives': {k: len(v) for k, v in backup_archive_index().items()}, 'google_drive_state': dict(S.get('google_drive', {})), 'storage': storage_selfcheck(), 'kr_capture': S.get('market_data_capture', {}), 'us_capture': S.get('us_market_data_capture', {}), 'us_replay': S.get('us_replay', {}), 'last_error': S.get('last_error', '')})
         if path in ('/paper_summary', '/paper_results'):
             try:
                 return self.json_response(paper_summary_snapshot())
@@ -7341,6 +7417,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if urlparse(self.path).path == '/repair_520099':
+            # Public one-click endpoint is strictly limited to the optional ETN,
+            # only after the current KR close, and rate-limited server-side.
+            if not KR_ETN_REPAIR_HTTP_LOCK.acquire(blocking=False):
+                return self.json_response({'ok': False, 'error': 'REPAIR_ALREADY_RUNNING'}, status=429)
+            try:
+                elapsed = time.monotonic() - KR_ETN_REPAIR_HTTP_LAST[0]
+                if KR_ETN_REPAIR_HTTP_LAST[0] and elapsed < KR_ETN_REPAIR_HTTP_COOLDOWN_SEC:
+                    return self.json_response({'ok': False, 'error': 'REPAIR_COOLDOWN',
+                                               'retry_after_sec': int(KR_ETN_REPAIR_HTTP_COOLDOWN_SEC - elapsed)}, status=429)
+                if not KR_CAPTURE_LOCK.acquire(blocking=False):
+                    return self.json_response({'ok': False, 'error': 'KR_COLLECTOR_BUSY'}, status=429)
+                try:
+                    KR_ETN_REPAIR_HTTP_LAST[0] = time.monotonic()
+                    refresh_kr_market_calendar(False)
+                    report = repair_kr_optional_etn_minutes()
+                finally:
+                    KR_CAPTURE_LOCK.release()
+                return self.json_response(report, status=200 if report.get('ok') else 207)
+            except Exception as exc:
+                return self.json_response({'ok': False, 'error': 'REPAIR_FAILED',
+                                           'detail': str(exc)[:250]}, status=500)
+            finally:
+                KR_ETN_REPAIR_HTTP_LOCK.release()
         # 주문/매매 POST는 계속 차단하고, 데이터 ZIP 다운로드 폼만 허용한다.
         if urlparse(self.path).path != '/download_snapshot':
             return self.json_response({'ok': False, 'error': 'POST_DISABLED_CORE4_PAPER_ONLY'}, status=405)
