@@ -29,7 +29,7 @@ import re
 from collections import defaultdict
 import requests
 import pytz
-OPERATING_VERSION = 'OPERATING_V5_67_KR_US_520099_ONE_CLICK_NO_KEY'
+OPERATING_VERSION = 'OPERATING_V5_67_520099_KR_BACKUP_MANIFEST_FIXED'
 DATA_PAPER_BACKUP_ONLY = True
 RUNTIME_SCOPE = ('KR_DATA', 'US_DATA', 'RAW_BACKUP', 'DRIVE_BACKUP', 'SELFCHECK')
 KST = pytz.timezone('Asia/Seoul')
@@ -4252,7 +4252,7 @@ def _create_backup_zip_unlocked():
     tmp_path = os.path.join(os.path.dirname(path), f'.backup_KR_{today()}_{uuid.uuid4().hex}.tmp.zip')
     included_files = len(source_files)
     included_bytes = sum((os.path.getsize(fp) for _, fp in source_files))
-    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_symbols': list(KR_PRICE_SYMBOLS), 'kr_optional_520099': {'symbol': KR_ETN_SYMBOL, 'api_symbol_last_good': KR_ETN_API_SYMBOL_LAST_GOOD, 'price_collected': S.get('market_data_capture', {}).get('optional_520099_price_collected', False)}, 'kr_symbols': list(KR_BACKUP_REQUIRED_SYMBOLS), 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
+    manifest = {'created_at_kst': now_text(), 'version': OPERATING_VERSION, 'toss_openapi_spec_version': TOSS_OPENAPI_SPEC_VERSION, 'toss_openapi_spec_url': TOSS_OPENAPI_SPEC_URL, 'kr_log_date': today(), 'included_files': included_files, 'uncompressed_bytes': included_bytes, 'market_mode': MARKET_MODE, 'kr_symbol_count': len(KR_BACKUP_REQUIRED_SYMBOLS), 'kr_symbols': list(KR_BACKUP_REQUIRED_SYMBOLS), 'kr_collected_symbol_count': len(KR_PRICE_SYMBOLS), 'kr_collected_symbols': list(KR_PRICE_SYMBOLS), 'kr_optional_520099': {'symbol': KR_ETN_SYMBOL, 'api_symbol_last_good': KR_ETN_API_SYMBOL_LAST_GOOD, 'price_collected': S.get('market_data_capture', {}).get('optional_520099_price_collected', False)}, 'us_data_included': False, 'data_quality_grade': quality.get('grade'), 'data_quality_failures': quality.get('failures', [])[:100], 'paper_account_files': 0, 'active_core4_accounts': len(CORE4_ACCOUNT_IDS), 'core4_execution': False, 'experiment10_accounts': 10, 'paper_only_mode': PAPER_ONLY_MODE, 'real_order_enabled': ENABLE_REAL_ORDER, 'real_auto_buy': ENABLE_REAL_AUTO_BUY, 'real_auto_sell': ENABLE_REAL_AUTO_SELL, 'nested_zip_excluded': True, 'drive_verify_excluded': True}
     try:
         with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
             for arc, fp in source_files:
